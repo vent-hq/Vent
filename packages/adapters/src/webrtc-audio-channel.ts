@@ -248,6 +248,11 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
   // detailed rationale. Defaults null (no lock); first track to exceed the
   // amplitude threshold becomes primary, others are dropped.
   private primaryAgentTrackSid: string | null = null;
+  // Guards startReadingTrack against being called twice for the same track —
+  // can happen when both the pre-existing-participants fast-path and the
+  // TrackSubscribed listener fire for the same publication. Two AudioStream
+  // readers on one track compete for frames and corrupt the receive path.
+  private startedTrackSids = new Set<string>();
   private static readonly PRIMARY_TRACK_MEAN_ABS_THRESHOLD = 100;
   private rxLastAssistantItemAt: number | null = null;
   private rxLastAgentStateAt: number | null = null;
@@ -346,6 +351,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     this.livekitMetricTimings = [];
     this.livekitMetricTimingIndexBySpeechId.clear();
     this.toolCallFingerprints.clear();
+    this.startedTrackSids.clear();
 
     // ── Tool call capture via DataChannel ──────────────────────
     this.room.on(
@@ -475,6 +481,29 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
       this.handleRoomDisconnected(reason);
     });
 
+    // ── Subscribe to remote audio tracks ──────────────────────
+    // Attached BEFORE the `await publishTrack` below so we don't lose the
+    // agent's TrackSubscribed event during that async window. Prior placement
+    // (after publishTrack + the pre-existing-participants fast-path) created a
+    // race where the agent could publish during the await with no listener
+    // attached, the event would be dropped, and the receive path would never
+    // start reading the track — manifesting as an empty transcript on the
+    // second of two parallel calls.
+    this.room.on(
+      RoomEvent.TrackSubscribed,
+      (track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant) => {
+        if (participant.kind === ParticipantKind.AGENT && !this.agentIdentity) {
+          this.agentIdentity = participant.identity;
+        }
+        if (pub.kind === TrackKind.KIND_AUDIO) {
+          console.log(
+            `[livekit] TrackSubscribed audio participant=${participant.identity} kind=${participant.kind} trackSid=${pub.sid}`
+          );
+          this.startReadingTrack(track, participant.identity, participant.kind);
+        }
+      }
+    );
+
     // ── Audio source for publishing ───────────────────────────
     this.audioSource = new AudioSource(this.livekitSampleRate, 1);
     this.localTrack = LocalAudioTrack.createAudioTrack(
@@ -512,22 +541,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
         }
       }
     }
-
-    // Subscribe to new remote audio tracks
-    this.room.on(
-      RoomEvent.TrackSubscribed,
-      (track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant) => {
-        if (participant.kind === ParticipantKind.AGENT && !this.agentIdentity) {
-          this.agentIdentity = participant.identity;
-        }
-        if (pub.kind === TrackKind.KIND_AUDIO) {
-          console.log(
-            `[livekit] TrackSubscribed audio participant=${participant.identity} kind=${participant.kind} trackSid=${pub.sid}`
-          );
-          this.startReadingTrack(track, participant.identity, participant.kind);
-        }
-      }
-    );
 
     // Wait for the agent's audio track to be published/subscribed — matches
     // the canonical pattern used by Retell/ElevenLabs/Pipecat LiveKit
@@ -1123,6 +1136,12 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     participantKind?: ParticipantKind,
   ): void {
     const who = `participant=${participantIdentity ?? "?"} kind=${participantKind ?? "?"}`;
+    const sid = (track as { sid?: string }).sid ?? null;
+    if (sid && this.startedTrackSids.has(sid)) {
+      console.log(`[livekit] startReadingTrack skipped (already started) ${who} sid=${sid}`);
+      return;
+    }
+    if (sid) this.startedTrackSids.add(sid);
     console.log(`[livekit] startReadingTrack ${who}`);
     this.rxTracks++;
     const stream = new AudioStream(track, this.livekitSampleRate, 1);
