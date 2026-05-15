@@ -136,3 +136,8 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 | `ci`       | CI configuration changes                                 |
 | `style`    | Formatting only (no logic change)                        |
 | `revert`   | Revert a prior commit                                    |
+
+## Project Rules
+
+- **PRODUCTION-ONLY fixes. No localhost.** Test against deployed services, not local dev servers.
+- **Don't worry about backward compatibility.** Early-stage project — break things if it leads to a cleaner result.
