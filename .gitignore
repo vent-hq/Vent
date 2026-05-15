@@ -10,3 +10,6 @@ coverage/
 .context/
 tasks/
 __pycache__/
+
+# Playwright MCP debug output (snapshots, console logs)
+.playwright-mcp/
