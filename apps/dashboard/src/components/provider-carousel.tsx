@@ -20,8 +20,8 @@ const providers: Provider[] = [
 
 export function ProviderCarousel() {
   return (
-    <div className="pt-6 space-y-2">
-      <p className="text-[11px] text-muted-foreground/50 uppercase tracking-widest">
+    <div className="space-y-4 text-center text-foreground/80" style={{ fontFamily: "var(--font-heading)", fontWeight: 400 }}>
+      <p className="text-[11px] uppercase tracking-widest">
         Works with
       </p>
 
@@ -35,7 +35,7 @@ export function ProviderCarousel() {
           {providers.map((provider) => (
             <div
               key={provider.name}
-              className="flex items-center gap-3 text-muted-foreground/60 shrink-0"
+              className="flex items-center gap-3 shrink-0"
             >
               <Image
                 src={provider.icon}
@@ -44,7 +44,7 @@ export function ProviderCarousel() {
                 height={24}
                 className="rounded-sm"
               />
-              <span className="text-[15px] font-medium tracking-tight whitespace-nowrap">
+              <span className="text-[15px] tracking-tight whitespace-nowrap">
                 {provider.name}
               </span>
             </div>
@@ -52,7 +52,7 @@ export function ProviderCarousel() {
         </Marquee>
       </div>
 
-      <p className="text-[11px] text-muted-foreground/50 uppercase tracking-widest">
+      <p className="text-[11px] uppercase tracking-widest">
         + custom endpoint or localhost
       </p>
     </div>

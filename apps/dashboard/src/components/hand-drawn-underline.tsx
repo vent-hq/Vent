@@ -6,7 +6,8 @@ export function HandDrawnUnderline() {
       viewBox="0 0 200 10"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
-      className="absolute -bottom-1 -left-[2%] w-[104%] h-[10px]"
+      // Sits just under the baseline, crossing the "g" descender; the em term scales with the headline size.
+      className="absolute -z-10 top-[calc(100%+0.0375em-10.9px)] -left-[2%] w-[104%] h-[10px]"
       preserveAspectRatio="none"
     >
       <path

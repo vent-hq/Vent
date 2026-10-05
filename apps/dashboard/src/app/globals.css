@@ -49,6 +49,11 @@
   * {
     @apply border-border;
   }
+  /* No rubber-band overscroll: it pulls the page away from the fixed background and exposes a bare strip */
+  html,
+  body {
+    overscroll-behavior-y: none;
+  }
   body {
     @apply bg-background text-foreground antialiased;
   }

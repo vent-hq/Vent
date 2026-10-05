@@ -55,7 +55,7 @@ export function AgentCarousel() {
   }, []);
 
   return (
-    <div className="flex items-center gap-2 text-sm text-foreground" style={{ fontFamily: "var(--font-heading)", fontWeight: 300 }}>
+    <div className="flex items-center gap-2 text-sm text-foreground whitespace-nowrap" style={{ fontFamily: "var(--font-heading)", fontWeight: 300 }}>
       <span className="tracking-[0.15em] text-xs">Install Vent CLI for</span>
       <span className="inline-flex items-center gap-1.5 min-w-[120px]">
         <span className="relative w-4 h-4">
@@ -69,15 +69,15 @@ export function AgentCarousel() {
             </span>
           ))}
         </span>
-        <span className="relative h-5 overflow-hidden">
+        {/* All names share one grid cell so the line is always as wide as the longest name */}
+        <span className="grid h-5 overflow-hidden">
           {agents.map((agent, i) => (
             <span
               key={agent.name}
-              className="block leading-5 font-medium text-foreground/80 transition-all duration-300"
+              className="[grid-area:1/1] leading-5 font-medium text-foreground/80 transition-all duration-300"
               style={{
                 opacity: i === activeIndex ? 1 : 0,
                 transform: `translateY(${i === activeIndex ? 0 : 8}px)`,
-                position: i === activeIndex ? "relative" : "absolute",
               }}
             >
               {agent.name}
