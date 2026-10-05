@@ -13,3 +13,4 @@ __pycache__/
 
 # Playwright MCP debug output (snapshots, console logs)
 .playwright-mcp/
+.vercel
