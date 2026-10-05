@@ -6,7 +6,10 @@ export function HandDrawnUnderline() {
       viewBox="0 0 200 10"
       fill="none"
       xmlns="http://www.w3.org/2000/svg"
-      className="absolute -bottom-1 -left-[2%] w-[104%] h-[10px]"
+      // Space Grotesk's "g" descends 0.2em below the baseline, and the box bottom sits 0.1625em below it
+      // (measured). The stroke's top is 3.4px into this SVG, so this puts it 7.5px (2.5 strokes)
+      // above the bottom of the descender: box bottom + (0.2 − 0.1625)em − 7.5px − 3.4px.
+      className="absolute -z-10 top-[calc(100%+0.0375em-10.9px)] -left-[2%] w-[104%] h-[10px]"
       preserveAspectRatio="none"
     >
       <path

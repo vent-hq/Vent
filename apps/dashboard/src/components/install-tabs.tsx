@@ -49,7 +49,6 @@ export function InstallTabs() {
   const [agentIndex, setAgentIndex] = useState(0);
 
   const copyText = tab === "agent" ? AGENT_PROMPT : TERMINAL_COMMAND;
-  const displayText = tab === "agent" ? AGENT_DISPLAY : TERMINAL_COMMAND;
 
   useEffect(() => {
     const interval = setInterval(() => {
@@ -67,7 +66,7 @@ export function InstallTabs() {
   const currentAgent = agents[agentIndex];
 
   return (
-    <div className="w-fit max-w-xl">
+    <div className="w-full max-w-xl">
       {/* Tabs row */}
       <div className="flex items-end gap-0">
         {/* Terminal tab */}
@@ -116,7 +115,15 @@ export function InstallTabs() {
         style={{ fontFamily: "var(--font-heading)", borderRadius: 0 }}
       >
         <span className="text-muted-foreground/50 select-none">&gt;</span>
-        <span className="text-foreground/80 flex-1">{displayText}</span>
+        {/*
+          Both labels share one grid cell so switching tabs never resizes (and re-centers) the box.
+          They stay on one line and truncate, so on narrow screens the longer label can't wrap and
+          make the box two lines tall.
+        */}
+        <span className="grid min-w-0 flex-1 text-foreground/80" style={{ fontWeight: 400 }}>
+          <span className={`[grid-area:1/1] truncate ${tab === "terminal" ? "" : "invisible"}`}>{TERMINAL_COMMAND}</span>
+          <span className={`[grid-area:1/1] truncate ${tab === "agent" ? "" : "invisible"}`}>{AGENT_DISPLAY}</span>
+        </span>
         {copied ? (
           <Check className="h-4 w-4 text-emerald-500 shrink-0" />
         ) : (

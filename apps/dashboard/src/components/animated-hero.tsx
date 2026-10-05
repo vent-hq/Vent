@@ -14,52 +14,52 @@ type AnimatedHeroProps = {
 export function AnimatedHero({ headline, description, cta, providers, demo }: AnimatedHeroProps) {
   return (
     <>
-      {/* Headline — fades in first, underline triggers via CSS delay */}
-      <motion.div
-        className="pt-24 lg:pt-32 pb-1 lg:pb-2"
-        initial={{ opacity: 0, y: 10 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.4, ease: "easeOut" }}
-      >
-        {headline}
-      </motion.div>
+      {/* Centered intro: headline, description, install command */}
+      <div className="flex flex-col items-center pt-20 lg:pt-24">
+        {/* Headline — fades in first together with the CTA; underline triggers via CSS delay */}
+        <motion.div
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, ease: "easeOut" }}
+        >
+          {headline}
+        </motion.div>
 
-      {/* Two-column: left content, right demo */}
-      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8 lg:gap-12 items-start pb-8">
-        {/* Left side — Content */}
-        <div className="space-y-5">
-          {/* Description */}
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.35, ease: "easeOut", delay: 0.65 }}
-          >
-            {description}
-          </motion.div>
+        {/* Description — follows once the headline and CTA have landed */}
+        <motion.div
+          className="mt-6"
+          initial={{ opacity: 0, y: 8 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.35, ease: "easeOut", delay: 0.5 }}
+        >
+          {description}
+        </motion.div>
 
-          {/* CTA (command + agent carousel) */}
-          <motion.div
-            className="space-y-4 pt-10"
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.35, ease: "easeOut", delay: 0.95 }}
-          >
-            {cta}
-          </motion.div>
+        {/* CTA (command + agent carousel) — same timing as the headline */}
+        <motion.div
+          className="mt-10 flex justify-center"
+          initial={{ opacity: 0, y: 10 }}
+          animate={{ opacity: 1, y: 0 }}
+          transition={{ duration: 0.4, ease: "easeOut" }}
+        >
+          {cta}
+        </motion.div>
+      </div>
 
-          {/* Provider carousel */}
-          <motion.div
-            initial={{ opacity: 0, y: 8 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ duration: 0.35, ease: "easeOut", delay: 1.2 }}
-          >
-            {providers}
-          </motion.div>
-        </div>
-
-        {/* Right side — Demo (not animated) */}
+      {/* Demo (not animated) */}
+      <div className="mt-16 lg:mt-20 mx-auto w-full max-w-[1200px]">
         {demo}
       </div>
+
+      {/* Provider carousel */}
+      <motion.div
+        className="mt-16 lg:mt-20 pb-24 mx-auto w-full max-w-3xl"
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.35, ease: "easeOut", delay: 0.8 }}
+      >
+        {providers}
+      </motion.div>
     </>
   );
 }
