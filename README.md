@@ -27,7 +27,7 @@ Vent is a CLI for coding agents that lets them place calls and evaluate voice ag
 
 When your coding agent runs `vent-hq run`, Vent places a real call to your voice agent, measures the entire call from inside, and returns a structured result. Most voice eval tools probe from outside; Vent runs inside. Think of it as a CLI version of Hamming, Roark, or Coval.
 
-Under the hood, a Claude Haiku 4.5 caller LLM drives the conversation, speaking via Deepgram Aura-2 over WebSocket or WebRTC. Vent listens through a vendored TEN VAD WASM module (no external service call) and Deepgram nova-3 STT across seven languages. Everything that happened inside the call comes back — transcript, audio quality, latency at every layer (percentiles + per-turn TTS/STT/LLM breakdown), every tool and MCP call, every transfer, pathway and flow decisions, agent state transitions, provider warnings, cost and usage, debug URLs, and the recording — as structured JSON in `.vent/runs/` with the audio at S3/R2 as a signed URL.
+Under the hood, a Claude Haiku 4.5 caller LLM drives the conversation, speaking via Deepgram Aura-2 over WebSocket or WebRTC. Vent listens through a vendored TEN VAD WASM module (no external service call) and Deepgram nova-3 STT across seven languages. Everything that happened inside the call comes back — transcript, audio quality, latency at every layer (percentiles + per-turn TTS/STT/LLM breakdown), every tool and MCP call, every transfer, pathway and flow decisions, agent state transitions, provider warnings, cost and usage, debug URLs, and the recording — as structured JSON in `.vent/runs/` with the audio in Tigris (S3-compatible storage), accessible through a signed URL.
 
 ### Install
 
