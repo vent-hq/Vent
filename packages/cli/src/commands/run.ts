@@ -5,7 +5,7 @@ import { streamRunEvents } from "../lib/sse.js";
 import { printEvent, printError, printInfo, printSummary, printWarn } from "../lib/output.js";
 import { loadAccessToken } from "../lib/config.js";
 import { saveRunHistory } from "../lib/run-history.js";
-import { resolveRemotePlatformConfig } from "../lib/platform-connections.js";
+import { resolveRemotePlatformConfig } from "../lib/platform-config.js";
 import type { SSEEvent } from "../lib/sse.js";
 
 const isTTY = process.stdout.isTTY;
