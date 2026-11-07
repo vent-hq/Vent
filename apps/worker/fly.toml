@@ -11,7 +11,7 @@ kill_timeout = "5m"
 
 [env]
   NODE_ENV = "production"
-  WORKER_TOTAL_CONCURRENCY = "45"
+  WORKER_TOTAL_CONCURRENCY = "2"
   API_URL = "http://vent-api.internal:3000"
   API_PUBLIC_URL = "https://api.venthq.dev"
   RUNNER_LISTEN_PORT = "8443"
@@ -37,6 +37,6 @@ kill_timeout = "5m"
   path = "/metrics"
 
 [[vm]]
-  memory = "4096mb"
-  cpu_kind = "performance"
+  memory = "1024mb"
+  cpu_kind = "shared"
   cpus = 1

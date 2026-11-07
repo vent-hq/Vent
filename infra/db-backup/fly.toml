@@ -1,0 +1,25 @@
+# Daily scheduled Machine; stops after uploading a backup.
+# Tigris rule vent-backups-30d expires only database-backups/vent/ objects.
+app = "vent-db-backup"
+primary_region = "iad"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  PGHOST = "vent-db.internal"
+  PGDATABASE = "vent"
+  PGUSER = "postgres"
+  AWS_ENDPOINT_URL = "https://t3.storage.dev"
+  AWS_DEFAULT_REGION = "auto"
+  AWS_REQUEST_CHECKSUM_CALCULATION = "when_required"
+  AWS_RESPONSE_CHECKSUM_VALIDATION = "when_required"
+  BACKUP_DESTINATION = "s3://vent-recordings-vent213/database-backups/vent"
+
+[experimental]
+  cmd = ["python3", "/usr/local/bin/backup.py"]
+
+[[vm]]
+  memory = "256mb"
+  cpu_kind = "shared"
+  cpus = 1
