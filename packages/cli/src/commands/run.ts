@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import type { PlatformConfig } from "@vent/shared";
 import { apiFetch, ApiError, ensurePlatformConnection } from "../lib/api.js";
 import { streamRunEvents } from "../lib/sse.js";
-import { printEvent, printError, printInfo, printSummary, printWarn, debug } from "../lib/output.js";
+import { printEvent, printError, printInfo, printSummary, printWarn } from "../lib/output.js";
 import { loadAccessToken } from "../lib/config.js";
 import { saveRunHistory } from "../lib/run-history.js";
 import { resolveRemotePlatformConfig } from "../lib/platform-connections.js";
@@ -18,26 +18,21 @@ interface RunArgs {
 }
 
 export async function runCommand(args: RunArgs): Promise<number> {
-  debug(`start args=${JSON.stringify({ file: args.file, session: args.session })}`);
-
   // 1. Resolve Vent access token
   const accessToken = await loadAccessToken();
   if (!accessToken) {
     printError("No Vent access token found. Set VENT_ACCESS_TOKEN, run `npx vent-hq login`, or pass --access-token.");
     return 2;
   }
-  debug(`access-token resolved (${accessToken.slice(0, 8)}…)`);
 
   // 2. Parse suite file and extract call
   let config: unknown;
   try {
-    debug(`reading suite file: ${args.file}`);
     const raw = await fs.readFile(args.file, "utf-8");
     const suite = JSON.parse(raw) as {
       connection?: unknown;
       calls?: Record<string, unknown>;
     };
-    debug(`suite parsed — keys: ${Object.keys(suite).join(", ")}`);
 
     if (!suite.connection) {
       printError("Suite file must have a `connection` object.");
@@ -64,7 +59,6 @@ export async function runCommand(args: RunArgs): Promise<number> {
       return 2;
     }
 
-    debug(`selected call: ${callName}`);
     const call = { ...(suite.calls[callName] as Record<string, unknown>), name: callName };
     config = { connection: suite.connection, call };
   } catch (err) {
@@ -102,7 +96,6 @@ export async function runCommand(args: RunArgs): Promise<number> {
   }
 
   // 3. Submit run
-  debug("submitting run to API…");
   printInfo("Submitting run…");
   let submitResult: {
     run_id: string;
@@ -122,12 +115,8 @@ export async function runCommand(args: RunArgs): Promise<number> {
     if (!configConnection.connection) return;
 
     if (resolvedRemotePlatform) {
-      debug(`ensuring saved ${resolvedRemotePlatform.provider} connection…`);
       const ensured = await ensurePlatformConnection(currentAccessToken, resolvedRemotePlatform);
       configConnection.connection.platform_connection_id = ensured.platform_connection_id;
-      debug(
-        `saved connection ready id=${ensured.platform_connection_id} created=${ensured.created} updated=${ensured.updated}`,
-      );
     }
 
     if ("platform" in configConnection.connection) {
@@ -144,14 +133,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
         agent_session_id: args.session,
       }),
     });
-    debug(`API response status: ${res.status}`);
     return res.json() as Promise<typeof submitResult>;
   }
 
   try {
     submitResult = await submitPrepared(activeAccessToken);
   } catch (err) {
-    debug(`submit error: ${(err as Error).message}`);
     if (err instanceof ApiError && err.status === 401) {
       printError("Access token rejected. Run `npx vent-hq login` to re-authenticate.");
       return 1;
@@ -162,15 +149,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
 
   const { run_id } = submitResult;
   if (!run_id) {
-    debug(`no run_id in response: ${JSON.stringify(submitResult)}`);
     printError("Server returned no run_id. Response: " + JSON.stringify(submitResult));
     return 2;
   }
-  debug(`run created: ${run_id} status=${submitResult.status}`);
   printInfo(`Run ${run_id} created.`);
 
   // 4. Stream results
-  debug(`connecting to SSE stream for run ${run_id}…`);
   printInfo(`Streaming results for run ${run_id}…`);
   const abortController = new AbortController();
   let exitCode = 0;
@@ -188,15 +172,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
   // handshake completes, leaving the worker running and the platform billing.
   let stopPromise: Promise<unknown> | null = null;
   const onSignal = () => {
-    debug("received SIGINT/SIGTERM — requesting cancel and aborting stream");
     if (!stopRequested) {
       stopRequested = true;
       stopPromise = apiFetch(`/runs/${run_id}/stop`, activeAccessToken, {
         method: "POST",
         signal: AbortSignal.timeout(5_000),
-      }).catch((err: unknown) => {
-        debug(`stop POST failed: ${(err as Error).message}`);
-      });
+      }).catch(() => {});
     }
     abortController.abort();
   };
@@ -204,16 +185,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
   process.on("SIGTERM", onSignal);
 
   try {
-    let eventCount = 0;
     for await (const event of streamRunEvents(run_id, activeAccessToken, abortController.signal)) {
-      eventCount++;
       const meta = (event.metadata_json ?? {}) as Record<string, unknown>;
-      debug(`event #${eventCount}: type=${event.event_type} meta_keys=[${Object.keys(meta).join(",")}] message="${event.message ?? ""}"`);
       printEvent(event);
 
       if (event.event_type === "call_completed") {
         callResults.push(event);
-        debug(`call_completed: name=${meta.call_name} status=${meta.status} duration=${meta.duration_ms}ms completed=${meta.completed}/${meta.total}`);
       }
 
       if (event.event_type === "run_complete") {
@@ -229,7 +206,6 @@ export async function runCommand(args: RunArgs): Promise<number> {
           return callStatus === "error";
         });
         exitCode = anyCallErrored ? 1 : 0;
-        debug(`run_complete: anyCallErrored=${anyCallErrored} exitCode=${exitCode}`);
       }
 
       if (event.event_type === "error") {
@@ -237,14 +213,10 @@ export async function runCommand(args: RunArgs): Promise<number> {
         exitCode = 2;
       }
     }
-    debug(`SSE stream ended — received ${eventCount} events total`);
   } catch (err) {
     if ((err as Error).name !== "AbortError") {
-      debug(`stream error: ${(err as Error).message}`);
       printError(`Stream error: ${(err as Error).message}`);
       exitCode = 2;
-    } else {
-      debug("stream aborted (user signal)");
     }
   } finally {
     process.off("SIGINT", onSignal);
@@ -252,15 +224,13 @@ export async function runCommand(args: RunArgs): Promise<number> {
   }
 
   // 5. Print summary
-  debug(`summary: callResults=${callResults.length} runComplete=${!!runCompleteData} exitCode=${exitCode}`);
   if (runCompleteData) {
     let rawRunDetails: Record<string, unknown> | null = null;
     if (args.verbose && !isTTY) {
       try {
         const res = await apiFetch(`/runs/${run_id}`, activeAccessToken);
         rawRunDetails = (await res.json()) as Record<string, unknown>;
-      } catch (err) {
-        debug(`verbose status fetch failed: ${(err as Error).message}`);
+      } catch {
         printWarn("Verbose result fetch failed; falling back to streamed summary.");
       }
     }
@@ -283,12 +253,9 @@ export async function runCommand(args: RunArgs): Promise<number> {
   if (runCompleteData) {
     const savedPath = await saveRunHistory(run_id, callResults, runCompleteData);
     if (savedPath) {
-      debug(`run saved to ${savedPath}`);
       printInfo(`Run saved to ${savedPath}`);
     }
   }
-
-  debug(`exiting with code ${exitCode}`);
 
   // If a SIGINT/SIGTERM kicked off a stop POST, wait for it to finish
   // (or its 5s timeout to fire) before exiting. Without this `await`,

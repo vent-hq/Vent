@@ -1,6 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
 import { RelayClient, type RelayClientConfig } from "@vent/relay-client";
-import { isVerbose } from "./output.js";
 
 export interface RelayHandle {
   client: RelayClient;
@@ -29,10 +28,6 @@ export async function startAgentSession(relayConfig: {
 
   const client = new RelayClient(clientConfig);
 
-  client.on("log", (msg: unknown) => {
-    if (isVerbose()) process.stdout.write(`${msg}\n`);
-  });
-
   // 1. Connect relay WebSocket — establishes the tunnel to Vent cloud
   await client.connect();
 
@@ -47,12 +42,9 @@ export async function startAgentSession(relayConfig: {
       env,
     });
 
-    agentProcess.stdout?.on("data", (data: Buffer) => {
-      if (isVerbose()) process.stdout.write(`[agent] ${data}`);
-    });
-    agentProcess.stderr?.on("data", (data: Buffer) => {
-      if (isVerbose()) process.stdout.write(`[agent] ${data}`);
-    });
+    // Drain agent output without mixing it into the CLI's JSON response.
+    agentProcess.stdout?.resume();
+    agentProcess.stderr?.resume();
 
     agentProcess.on("error", (err) => {
       process.stdout.write(`Agent process error: ${err.message}\n`);

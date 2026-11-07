@@ -1,5 +1,6 @@
 FROM node:20-slim AS base
-RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*
+# LiveKit's native RTC library requires GLib/GIO (including on Linux ARM64).
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 RUN corepack enable
 
 FROM base AS build

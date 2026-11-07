@@ -24,9 +24,6 @@ await build({
   external: [
     ...builtinModules,
     ...builtinModules.map((m) => `node:${m}`),
-    "ws",
-    "bufferutil",
-    "utf-8-validate",
   ],
   banner: {
     js: "#!/usr/bin/env node",

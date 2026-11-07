@@ -5,6 +5,7 @@
     "build": "turbo run build",
     "changeset": "changeset",
     "dev": "turbo run dev",
+    "dev:local": "node local-scripts/dev-local.mjs",
     "lint": "turbo run lint",
     "typecheck": "turbo run typecheck",
     "clean": "turbo run clean",
@@ -14,12 +15,13 @@
     "release:publish": "changeset publish",
     "deploy:api": "fly deploy . --config apps/api/fly.toml --dockerfile apps/api/Dockerfile --remote-only",
     "deploy:worker": "fly deploy . --config apps/worker/fly.toml --dockerfile apps/worker/Dockerfile --remote-only",
-    "deploy:dashboard": "fly deploy . --config apps/dashboard/fly.toml --dockerfile apps/dashboard/Dockerfile --remote-only",
-    "deploy:all": "pnpm deploy:api && (pnpm deploy:worker & pnpm deploy:dashboard & wait)"
+    "deploy:all": "pnpm deploy:api && pnpm deploy:worker"
   },
   "devDependencies": {
     "@changesets/cli": "^2.30.0",
     "@types/node": "^20.0.0",
+    "execa": "^8.0.1",
+    "nodemon": "^3.1.14",
     "turbo": "^2.3.0",
     "typescript": "^5.7.0"
   },

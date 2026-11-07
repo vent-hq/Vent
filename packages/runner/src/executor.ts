@@ -10,6 +10,7 @@ import type {
   ConversationCallResult,
   RunAggregateV2,
 } from "@vent/shared";
+import { requireEnv } from "@vent/shared";
 import { buildArtifactUrl, createArtifactToken, createStorageClient } from "@vent/artifacts";
 import { createAudioChannel, type AudioChannelConfig } from "@vent/adapters";
 import { runConversationCall } from "./conversation/index.js";
@@ -124,12 +125,9 @@ function buildRecordingUrl(
 ): Promise<string> | string {
   // Signed-URL-only auth (S3/Twilio pattern). The HMAC token is the credential;
   // 1h TTL bounds blast radius. No dashboard sign-in required.
-  const apiBaseUrl =
-    process.env["API_PUBLIC_URL"]
-    ?? process.env["API_URL"]
-    ?? "https://vent-api.fly.dev";
   const secret = process.env["RUNNER_CALLBACK_SECRET"] ?? "";
   if (secret) {
+    const apiBaseUrl = requireEnv("API_PUBLIC_URL");
     // userId is captured in the token payload for audit logging only — it's
     // not enforced on access. May be undefined in dev / standalone runner.
     return buildArtifactUrl(apiBaseUrl, createArtifactToken(key, secret, { userId: userId ?? "anon" }));

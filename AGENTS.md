@@ -27,8 +27,7 @@ pnpm db:migrate                 # Run pending migrations against DATABASE_URL
 ```bash
 pnpm deploy:api                 # Deploy API to Fly.io
 pnpm deploy:worker              # Deploy worker to Fly.io
-pnpm deploy:dashboard           # Deploy dashboard to Fly.io
-pnpm deploy:all                 # Deploy API first, then worker + dashboard in parallel
+pnpm deploy:all                 # Deploy API, then worker
 ```
 
 ### Releases
@@ -64,7 +63,7 @@ apps/
 
 packages/
 ├── adapters/               # Voice platform adapters
-├── artifacts/              # S3/R2 artifact storage (recordings, audio)
+├── artifacts/              # S3-compatible artifact storage (recordings, audio)
 ├── cli/                    # Published CLI (vent-hq on npm)
 ├── db/                     # Drizzle ORM schema + PostgreSQL migrations
 ├── livekit/                # Published Node helper (@vent-hq/livekit on npm)
@@ -101,9 +100,8 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 
 ## Environment Variables
 - `DATABASE_URL` — PostgreSQL connection string
-- `REDIS_URL` — Redis/Upstash for BullMQ + pub/sub
+- `REDIS_URL` — Redis for BullMQ + pub/sub
 - `DASHBOARD_URL` — Frontend URL for CORS and device auth redirects
-- `NEXT_PUBLIC_API_URL` — API URL for dashboard client-side requests
 - `NEXT_PUBLIC_WORKOS_REDIRECT_URI` — WorkOS OAuth callback URL
 - `RUNNER_CALLBACK_SECRET` — HMAC secret for worker→API callbacks
 - `RUNNER_PUBLIC_HOST`, `RUNNER_LISTEN_PORT` — Public host/port for Bland webhook callbacks
@@ -113,7 +111,7 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_COOKIE_PASSWORD` — WorkOS auth
 - `PLATFORM_CONNECTIONS_MASTER_KEY` — 32-byte hex key for encrypting platform credentials (`openssl rand -hex 32`)
 - `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` — AI/voice providers
-- `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION` — Cloudflare R2
+- `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION` — Tigris (S3-compatible storage)
 
 ## Code Style
 - TypeScript strict mode, ES2022 target, Node.js >= 20

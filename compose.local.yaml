@@ -1,0 +1,83 @@
+# Start dependencies: docker compose -f compose.local.yaml up -d --wait
+# Start dependencies + API/worker with hot reload: pnpm dev:local
+# Stop:  docker compose -f compose.local.yaml down
+# Local data survives stopping; `down --volumes` resets it.
+# Credentials below are for this isolated local environment only.
+name: vent-nassau-local
+
+# Settings for the API and worker running directly in Node.js on your Mac.
+x-local-environment:
+  NODE_ENV: development
+  DATABASE_URL: postgres://vent:vent_local@127.0.0.1:${VENT_LOCAL_POSTGRES_PORT:-15432}/vent_local
+  REDIS_URL: redis://127.0.0.1:${VENT_LOCAL_REDIS_PORT:-16379}
+  S3_ENDPOINT: http://127.0.0.1:${VENT_LOCAL_STORAGE_PORT:-18333}
+  S3_BUCKET: vent-local
+  S3_REGION: us-east-1
+  S3_ACCESS_KEY_ID: vent-local
+  S3_SECRET_ACCESS_KEY: vent-local-storage-secret
+  API_HOST: 127.0.0.1
+  API_PORT: "${VENT_LOCAL_API_PORT:-3001}"
+  API_URL: http://127.0.0.1:${VENT_LOCAL_API_PORT:-3001}
+  API_PUBLIC_URL: http://localhost:${VENT_LOCAL_API_PORT:-3001}
+  VENT_ACCESS_TOKEN: vent_local_development
+  DASHBOARD_URL: http://localhost:3000
+  RUNNER_CALLBACK_SECRET: vent-local-callback-secret
+  PLATFORM_CONNECTIONS_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+  RUNNER_PUBLIC_HOST: "${VENT_LOCAL_RUNNER_PUBLIC_HOST:-}"
+  RUNNER_LISTEN_PORT: "${VENT_LOCAL_RUNNER_PORT:-18443}"
+  WORKER_METRICS_PORT: "${VENT_LOCAL_METRICS_PORT:-19091}"
+  WORKER_TOTAL_CONCURRENCY: "2"
+  FLEET_MAX_ACTIVE_RUNS: "2"
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: vent
+      POSTGRES_PASSWORD: vent_local
+      POSTGRES_DB: vent_local
+    ports:
+      - "127.0.0.1:${VENT_LOCAL_POSTGRES_PORT:-15432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vent -d vent_local"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  redis:
+    image: redis:7.4-alpine
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory-policy", "noeviction"]
+    ports:
+      - "127.0.0.1:${VENT_LOCAL_REDIS_PORT:-16379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  storage:
+    # SeaweedFS 4.50, pinned to the multi-platform image used for verification.
+    image: chrislusf/seaweedfs@sha256:c2658820e763294a9e9de7b36c81e59b879e3459148351aee4e31a126ca64860
+    command: ["mini", "-dir=/data", "-ip=storage"]
+    environment:
+      AWS_ACCESS_KEY_ID: vent-local
+      AWS_SECRET_ACCESS_KEY: vent-local-storage-secret
+      S3_BUCKET: vent-local
+    ports:
+      - "127.0.0.1:${VENT_LOCAL_STORAGE_PORT:-18333}:8333"
+    volumes:
+      - storage-data:/data
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:9333/cluster/status"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+volumes:
+  postgres-data:
+  redis-data:
+  storage-data:

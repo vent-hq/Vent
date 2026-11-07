@@ -1,2 +1,18 @@
-.context
-.playwright-mcp
+# Upload ONLY dashboard and pnpm/Turbo build config.
+/*
+!.vercelignore
+!.npmrc
+!package.json
+!pnpm-lock.yaml
+!pnpm-workspace.yaml
+!turbo.json
+!apps
+apps/*
+!apps/dashboard
+
+# Keep generated files and local environment files out of the upload.
+**/node_modules
+**/.next
+**/.turbo
+**/.env*
+**/*.tsbuildinfo

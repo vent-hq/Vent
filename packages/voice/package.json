@@ -10,11 +10,9 @@
   },
   "dependencies": {
     "@deepgram/sdk": "^4.11.3",
-    "@vent/shared": "workspace:*",
-    "ws": "catalog:"
+    "@vent/shared": "workspace:*"
   },
   "devDependencies": {
-    "@types/ws": "catalog:",
     "typescript": "catalog:"
   }
 }

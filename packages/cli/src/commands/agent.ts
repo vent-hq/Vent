@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as net from "node:net";
 import { apiFetch } from "../lib/api.js";
 import { loadAccessToken } from "../lib/config.js";
-import { debug, printError, printInfo, printSuccess } from "../lib/output.js";
+import { printError, printInfo, printSuccess } from "../lib/output.js";
 import { startAgentSession, type RelayHandle } from "../lib/relay.js";
 import type { RelayDisconnectedInfo } from "@vent/relay-client";
 
@@ -62,7 +62,6 @@ export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
 
   if (!connection.agent_port) {
     connection.agent_port = await findFreePort();
-    debug(`auto-port assigned for agent session: ${connection.agent_port}`);
   }
 
   let session: AgentSessionResponse | null = null;
@@ -74,8 +73,8 @@ export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
       await apiFetch(`/agent-sessions/${session.session_id}/close`, accessToken, {
         method: "POST",
       });
-    } catch (err) {
-      debug(`agent session close failed: ${(err as Error).message}`);
+    } catch {
+      // Best-effort session cleanup.
     }
   };
 
