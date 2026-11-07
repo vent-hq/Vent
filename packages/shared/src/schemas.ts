@@ -141,23 +141,6 @@ export const PlatformConfigSchema = z.discriminatedUnion("provider", [
   ElevenLabsPlatformSchema,
 ]);
 
-export const PlatformSummarySchema = z.object({
-  provider: PlatformProviderSchema,
-}).catchall(z.unknown());
-
-export const PlatformConnectionSummarySchema = z.object({
-  id: z.string().uuid(),
-  provider: PlatformProviderSchema,
-  version: z.number().int().min(1),
-  resource_label: z.string().min(1),
-});
-
-export const RunPlatformSummarySchema = z.object({
-  platform_connection_id: z.string().uuid().nullable(),
-  platform_connection: PlatformConnectionSummarySchema.nullable(),
-  platform: PlatformSummarySchema.nullable(),
-});
-
 export const ConversationTurnSchema = z.object({
   role: z.enum(["caller", "agent"]),
   text: z.string(),

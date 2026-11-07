@@ -1,6 +1,6 @@
 import * as fs from "node:fs/promises";
 import type { PlatformConfig } from "@vent/shared";
-import { apiFetch, ApiError, ensurePlatformConnection } from "../lib/api.js";
+import { apiFetch, ApiError } from "../lib/api.js";
 import { streamRunEvents } from "../lib/sse.js";
 import { printEvent, printError, printInfo, printSummary, printWarn } from "../lib/output.js";
 import { loadAccessToken } from "../lib/config.js";
@@ -70,11 +70,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
     return 2;
   }
 
-  // 2b. Resolve remote platform credentials from local env and keep them local to the CLI.
-  // The CLI will upsert a saved platform connection and submit only the resulting ID.
-  let resolvedRemotePlatform: PlatformConfig | null = null;
+  // 2b. Resolve provider settings for the API to encrypt with this run.
   try {
-    resolvedRemotePlatform = resolveRemotePlatformConfig(config);
+    const platform = resolveRemotePlatformConfig(config);
+    if (platform) {
+      (config as { connection: { platform?: PlatformConfig } }).connection.platform = platform;
+    }
   } catch (err) {
     printError((err as Error).message);
     return 2;
@@ -102,42 +103,15 @@ export async function runCommand(args: RunArgs): Promise<number> {
     status: string;
   };
 
-  let activeAccessToken = accessToken;
-  const configConnection = config as {
-    connection?: {
-      adapter?: string;
-      platform?: Record<string, unknown>;
-      platform_connection_id?: string;
-    };
-  };
-
-  async function prepareConfigForSubmit(currentAccessToken: string): Promise<void> {
-    if (!configConnection.connection) return;
-
-    if (resolvedRemotePlatform) {
-      const ensured = await ensurePlatformConnection(currentAccessToken, resolvedRemotePlatform);
-      configConnection.connection.platform_connection_id = ensured.platform_connection_id;
-    }
-
-    if ("platform" in configConnection.connection) {
-      delete configConnection.connection.platform;
-    }
-  }
-
-  async function submitPrepared(currentAccessToken: string): Promise<typeof submitResult> {
-    await prepareConfigForSubmit(currentAccessToken);
-    const res = await apiFetch("/runs/submit", currentAccessToken, {
+  try {
+    const res = await apiFetch("/runs/submit", accessToken, {
       method: "POST",
       body: JSON.stringify({
         config,
         agent_session_id: args.session,
       }),
     });
-    return res.json() as Promise<typeof submitResult>;
-  }
-
-  try {
-    submitResult = await submitPrepared(activeAccessToken);
+    submitResult = await res.json() as typeof submitResult;
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) {
       printError("Access token rejected. Run `npx vent-hq login` to re-authenticate.");
@@ -174,7 +148,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   const onSignal = () => {
     if (!stopRequested) {
       stopRequested = true;
-      stopPromise = apiFetch(`/runs/${run_id}/stop`, activeAccessToken, {
+      stopPromise = apiFetch(`/runs/${run_id}/stop`, accessToken, {
         method: "POST",
         signal: AbortSignal.timeout(5_000),
       }).catch(() => {});
@@ -185,7 +159,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   process.on("SIGTERM", onSignal);
 
   try {
-    for await (const event of streamRunEvents(run_id, activeAccessToken, abortController.signal)) {
+    for await (const event of streamRunEvents(run_id, accessToken, abortController.signal)) {
       const meta = (event.metadata_json ?? {}) as Record<string, unknown>;
       printEvent(event);
 
@@ -228,7 +202,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
     let rawRunDetails: Record<string, unknown> | null = null;
     if (args.verbose && !isTTY) {
       try {
-        const res = await apiFetch(`/runs/${run_id}`, activeAccessToken);
+        const res = await apiFetch(`/runs/${run_id}`, accessToken);
         rawRunDetails = (await res.json()) as Record<string, unknown>;
       } catch {
         printWarn("Verbose result fetch failed; falling back to streamed summary.");

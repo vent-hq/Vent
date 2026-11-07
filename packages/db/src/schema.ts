@@ -27,8 +27,6 @@ export const agentSessionStatusEnum = pgEnum("agent_session_status", ["connectin
 
 export const scenarioStatusEnum = pgEnum("scenario_status", ["completed", "error"]);
 
-export const platformConnectionStatusEnum = pgEnum("platform_connection_status", ["active", "disabled", "invalid"]);
-
 export const runs = pgTable(
   "runs",
   {
@@ -47,6 +45,7 @@ export const runs = pgTable(
     duration_ms: integer("duration_ms"),
     aggregate_json: jsonb("aggregate_json"),
     test_spec_json: jsonb("test_spec_json"),
+    platform_config_encrypted: jsonb("platform_config_encrypted"),
     error_text: text("error_text"),
     // Stores a SHA-256 of the provided idempotency key.
     idempotency_key: text("idempotency_key"),
@@ -94,36 +93,6 @@ export const accessTokens = pgTable("access_tokens", {
     .notNull()
     .defaultNow(),
 });
-
-export const platformConnections = pgTable(
-  "platform_connections",
-  {
-    id: uuid("id").primaryKey().defaultRandom(),
-    user_id: text("user_id").notNull(),
-    provider: text("provider").notNull(),
-    identity_key: text("identity_key").notNull(),
-    resource_label: text("resource_label").notNull(),
-    config_json: jsonb("config_json").notNull(),
-    secrets_encrypted: jsonb("secrets_encrypted").notNull(),
-    resolved_hash: text("resolved_hash").notNull(),
-    version: integer("version").notNull().default(1),
-    status: platformConnectionStatusEnum("status").notNull().default("active"),
-    last_verified_at: timestamp("last_verified_at", { withTimezone: true }),
-    last_used_at: timestamp("last_used_at", { withTimezone: true }),
-    created_at: timestamp("created_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-    updated_at: timestamp("updated_at", { withTimezone: true })
-      .notNull()
-      .defaultNow(),
-  },
-  (table) => ({
-    platformConnectionsUserIdentityUnique: uniqueIndex("platform_connections_user_provider_identity_unique")
-      .on(table.user_id, table.provider, table.identity_key),
-    platformConnectionsUserUpdatedIdx: index("platform_connections_user_updated_idx")
-      .on(table.user_id, table.updated_at),
-  }),
-);
 
 export const artifacts = pgTable("artifacts", {
   id: uuid("id").primaryKey().defaultRandom(),

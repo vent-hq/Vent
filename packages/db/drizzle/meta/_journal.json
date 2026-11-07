@@ -148,6 +148,13 @@
       "when": 1777400000000,
       "tag": "0020_event_indexes",
       "breakpoints": true
+    },
+    {
+      "idx": 21,
+      "version": "7",
+      "when": 1794038950967,
+      "tag": "0021_store_run_platform_config",
+      "breakpoints": true
     }
   ]
 }

@@ -3,7 +3,7 @@ import postgres from "postgres";
 import * as schema from "./schema.js";
 
 export { schema };
-export type { runs, scenarioResults, artifacts, accessTokens, platformConnections } from "./schema.js";
+export type { runs, scenarioResults, artifacts, accessTokens } from "./schema.js";
 
 export interface CreateDbOptions {
   /** Max pool connections. postgres-js default is 10 — too low for the worker

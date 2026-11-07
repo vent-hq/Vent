@@ -6,11 +6,10 @@ import {
   AdapterTypeSchema,
   ConversationCallSpecSchema,
   CallerAudioEffectsSchema,
-  PlatformSummarySchema,
+  PlatformConfigSchema,
   FLEET_ACTIVE_RUNS_KEY,
-  type PlatformConnectionSummary,
-  type PlatformSummary,
 } from "@vent/shared";
+import { encryptPlatformConfig, validateResolvedPlatformConfig } from "@vent/platform-connections";
 import type { FastifyInstance } from "fastify";
 
 const PLATFORM_ADAPTERS = new Set(["livekit", "vapi", "retell", "elevenlabs", "bland"]);
@@ -42,29 +41,39 @@ export const RunSubmitConfigSchema = z.object({
     start_command: z.string().optional(),
     health_endpoint: z.string().optional(),
     caller_audio: CallerAudioEffectsSchema.optional(),
-    platform_connection_id: z.string().uuid().optional(),
-    platform: z.never().optional(),
+    platform: PlatformConfigSchema.optional(),
   }),
   call: ConversationCallSpecSchema,
 }).superRefine((d, ctx) => {
   const adapter = d.connection.adapter;
-  const platformConnectionId = d.connection.platform_connection_id;
-  const requiresSavedConnection = PLATFORM_ADAPTERS.has(adapter);
+  const platform = d.connection.platform;
+  const requiresPlatform = PLATFORM_ADAPTERS.has(adapter);
 
-  if (requiresSavedConnection && !platformConnectionId) {
+  if (requiresPlatform && !platform) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ["connection", "platform_connection_id"],
-      message: `${adapter} runs require platform_connection_id`,
+      path: ["connection", "platform"],
+      message: `${adapter} runs require platform configuration`,
     });
   }
 
-  if (!requiresSavedConnection && platformConnectionId) {
+  if (platform && (!requiresPlatform || platform.provider !== adapter)) {
     ctx.addIssue({
       code: z.ZodIssueCode.custom,
-      path: ["connection", "platform_connection_id"],
-      message: `${adapter} runs cannot include platform_connection_id`,
+      path: ["connection", "platform"],
+      message: "Platform provider must match the connection adapter",
     });
+  }
+  if (platform) {
+    try {
+      validateResolvedPlatformConfig(platform);
+    } catch (error) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["connection", "platform"],
+        message: (error as Error).message,
+      });
+    }
   }
 });
 
@@ -82,14 +91,7 @@ export function hashIdempotencyKey(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
-export function buildCallSpec(
-  cfg: Record<string, unknown>,
-  platformMeta?: {
-    platform_connection_id: string | null;
-    platform_connection: PlatformConnectionSummary | null;
-    platform: PlatformSummary | null;
-  },
-) {
+export function buildCallSpec(cfg: Record<string, unknown>) {
   const adapter = (cfg.adapter as string) ?? "websocket";
   const agentUrl = cfg.agent_url as string | undefined;
   const voiceConfig = { adapter };
@@ -109,9 +111,6 @@ export function buildCallSpec(
       start_command: cfg.start_command ?? null,
       health_endpoint: cfg.health_endpoint ?? null,
       agent_url: agentUrl ?? null,
-      platform_connection_id: platformMeta?.platform_connection_id ?? null,
-      platform_connection: platformMeta?.platform_connection ?? null,
-      platform: platformMeta?.platform ?? null,
     },
     adapter,
     agentUrl,
@@ -166,60 +165,9 @@ export async function submitRun(
     }
   }
 
-  const { connection, ...rest } = config;
-  const cfg = { ...connection, ...rest } as Record<string, unknown>;
-
-  const platformConnectionId = connection.platform_connection_id ?? null;
-  const adapter = connection.adapter;
-  const requiresSavedConnection = PLATFORM_ADAPTERS.has(adapter);
-
-  let platformConnectionSummary: PlatformConnectionSummary | null = null;
-  let platformSummary: PlatformSummary | null = null;
-
-  if (requiresSavedConnection) {
-    if (!platformConnectionId) {
-      throw new SubmitRunConfigError(`${adapter} runs require platform_connection_id`);
-    }
-
-    const [savedConnection] = await app.db
-      .select({
-        id: schema.platformConnections.id,
-        provider: schema.platformConnections.provider,
-        resource_label: schema.platformConnections.resource_label,
-        version: schema.platformConnections.version,
-        config_json: schema.platformConnections.config_json,
-      })
-      .from(schema.platformConnections)
-      .where(
-        and(
-          eq(schema.platformConnections.id, platformConnectionId),
-          eq(schema.platformConnections.user_id, userId),
-        ),
-      )
-      .limit(1);
-
-    if (!savedConnection) {
-      throw new SubmitRunConfigError("Platform connection not found", 404);
-    }
-    if (savedConnection.provider !== adapter) {
-      throw new SubmitRunConfigError(
-        `Adapter ${adapter} does not match saved connection provider ${savedConnection.provider}`,
-      );
-    }
-
-    platformConnectionSummary = {
-      id: savedConnection.id,
-      provider: savedConnection.provider as PlatformConnectionSummary["provider"],
-      version: savedConnection.version,
-      resource_label: savedConnection.resource_label,
-    };
-    platformSummary = PlatformSummarySchema.parse(savedConnection.config_json) as PlatformSummary;
-  } else if (platformConnectionId) {
-    throw new SubmitRunConfigError(`${adapter} runs cannot include platform_connection_id`);
-  }
-
-  delete cfg.platform_connection_id;
-  delete cfg.platform;
+  const { platform, ...connection } = config.connection;
+  const { call: submittedCall } = config;
+  const cfg = { ...connection, call: submittedCall } as Record<string, unknown>;
 
   const {
     callSpecJson,
@@ -229,11 +177,7 @@ export async function submitRun(
 
     call,
     isRemote,
-  } = buildCallSpec(cfg, {
-    platform_connection_id: platformConnectionId,
-    platform_connection: platformConnectionSummary,
-    platform: platformSummary,
-  });
+  } = buildCallSpec(cfg);
 
   // Fleet-wide capacity gate — reject before enqueuing to avoid mid-call provider errors.
   // Uses a Redis SET of run IDs: SADD is idempotent (no drift), SCARD gives exact count.
@@ -289,6 +233,7 @@ export async function submitRun(
       source_type: sourceType,
       status: "queued",
       test_spec_json: callSpecJson,
+      platform_config_encrypted: platform ? encryptPlatformConfig(platform) : null,
       idempotency_key: hashedIdempotencyKey,
       ...(agentSessionId ? { agent_session_id: agentSessionId } : {}),
     })
@@ -329,7 +274,6 @@ export async function submitRun(
     start_command: cfg.start_command as string | undefined,
     health_endpoint: cfg.health_endpoint as string | undefined,
     agent_url: agentUrl,
-    platform_connection_id: platformConnectionId,
     ...(agentSessionId ? { agent_session_id: agentSessionId } : {}),
   };
 

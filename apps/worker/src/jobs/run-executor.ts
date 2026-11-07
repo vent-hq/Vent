@@ -1,4 +1,4 @@
-import { eq, and } from "drizzle-orm";
+import { eq } from "drizzle-orm";
 import IORedis from "ioredis";
 import { createDb, schema, type Database } from "@vent/db";
 import {
@@ -66,14 +66,9 @@ async function postSignedWithRetry(
 import type {
   CallSpec,
   AdapterType,
-  PlatformConfig,
 } from "@vent/shared";
 import type { AudioChannelConfig } from "@vent/adapters";
-import {
-  decryptSecrets,
-  mergePlatformConfig,
-  type EncryptedSecretsEnvelope,
-} from "@vent/platform-connections";
+import { loadRunPlatformConfig } from "./platform-config.js";
 import { executeCall } from "@vent/runner/executor";
 
 // ---------------------------------------------------------------------------
@@ -109,62 +104,18 @@ async function emitEvent(
 
 interface RunJob {
   run_id: string;
-  user_id?: string;
+  user_id: string;
   adapter?: string;
   call_spec?: Record<string, unknown>;
   voice_config?: Record<string, unknown>;
   start_command?: string;
   health_endpoint?: string;
   agent_url?: string;
-  platform_connection_id?: string | null;
   agent_session_id?: string;
 }
 
 const redisUrl = requireEnv("REDIS_URL");
 const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
-
-async function resolvePlatformConfig(
-  db: Database,
-  platformConnectionId: string | null | undefined,
-  userId: string | undefined,
-): Promise<PlatformConfig | undefined> {
-  if (!platformConnectionId) return undefined;
-
-  // Defense-in-depth: re-check user_id when loading creds. The submit path
-  // already validates ownership but if the row was deleted/reassigned
-  // between submit and execute, we don't want to silently decrypt with the
-  // global master key for whoever now owns the row.
-  const filters = userId
-    ? and(
-        eq(schema.platformConnections.id, platformConnectionId),
-        eq(schema.platformConnections.user_id, userId),
-      )
-    : eq(schema.platformConnections.id, platformConnectionId);
-
-  const [savedConnection] = await db
-    .select({
-      id: schema.platformConnections.id,
-      config_json: schema.platformConnections.config_json,
-      secrets_encrypted: schema.platformConnections.secrets_encrypted,
-    })
-    .from(schema.platformConnections)
-    .where(filters)
-    .limit(1);
-
-  if (!savedConnection) {
-    throw new Error(`Platform connection ${platformConnectionId} not found`);
-  }
-
-  await db
-    .update(schema.platformConnections)
-    .set({ last_used_at: new Date() })
-    .where(eq(schema.platformConnections.id, savedConnection.id));
-
-  return mergePlatformConfig(
-    savedConnection.config_json as Record<string, unknown>,
-    decryptSecrets(savedConnection.secrets_encrypted as EncryptedSecretsEnvelope),
-  );
-}
 
 // ---------------------------------------------------------------------------
 // Direct execution for already-deployed agents (platform adapters or agent_url)
@@ -181,7 +132,7 @@ async function executeRemoteRun(
 
   const adapterType = (job.adapter ?? "websocket") as AdapterType;
   const agentUrl = job.agent_url ?? "http://localhost:3001";
-  const platform = await resolvePlatformConfig(db, job.platform_connection_id, job.user_id);
+  const platform = await loadRunPlatformConfig(db, job.run_id, job.user_id, adapterType);
   const callSpec = (job.call_spec as unknown as CallSpec).call;
 
   const channelConfig: AudioChannelConfig = {

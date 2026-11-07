@@ -24,14 +24,13 @@ export const LOCK_DURATION_MS = 900_000;
 
 export interface RunJobData {
   run_id: string;
-  user_id?: string;
+  user_id: string;
   adapter?: string;
   call_spec?: Record<string, unknown>;
   voice_config?: Record<string, unknown>;
   start_command?: string;
   health_endpoint?: string;
   agent_url?: string;
-  platform_connection_id?: string | null;
   agent_session_id?: string;
 }
 

@@ -172,25 +172,6 @@ export type PlatformConfig =
 
 export type PlatformProvider = PlatformConfig["provider"];
 
-/** Safe platform config summary with provider plus non-secret fields only. */
-export type PlatformSummary = Record<string, unknown> & { provider: PlatformProvider };
-
-/** Safe metadata describing a saved platform connection. */
-export interface PlatformConnectionSummary {
-  id: string;
-  provider: PlatformProvider;
-  version: number;
-  resource_label: string;
-}
-
-/** Safe run-level platform metadata persisted with the run. */
-export interface RunPlatformSummary {
-  platform_connection_id: string | null;
-  platform_connection: PlatformConnectionSummary | null;
-  platform: PlatformSummary | null;
-}
-
-
 export interface CallSpec {
   call: ConversationCallSpec;
 }
