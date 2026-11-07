@@ -134,7 +134,7 @@ Vent provides `DEEPGRAM_API_KEY` and `ANTHROPIC_API_KEY` for its hosted caller/e
 
 ### Credential resolution
 
-In platform-direct mode the CLI auto-resolves credentials from `.env.local`, `.env`, and the current shell environment. Do not run `source .env && export` before Vent commands. If you include credential fields in JSON, use the actual value, not the env var name. Do not manually author `platform_connection_id`; the CLI creates or updates the saved platform connection automatically.
+In platform-direct mode the CLI auto-resolves credentials from `.env.local`, `.env`, and the current shell environment. Do not run `source .env && export` before Vent commands. Keep credentials out of chat and suite files; the CLI sends the resolved configuration to Vent, which stores an encrypted copy with each run.
 
 Auto-resolved env vars and JSON fields:
 

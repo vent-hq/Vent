@@ -108,7 +108,6 @@ async function processRun(
         start_command: data.start_command,
         health_endpoint: data.health_endpoint,
         agent_url: data.agent_url,
-        platform_connection_id: data.platform_connection_id ?? null,
         agent_session_id: data.agent_session_id,
       });
     });

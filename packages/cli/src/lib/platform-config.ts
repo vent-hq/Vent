@@ -75,12 +75,10 @@ export function resolveRemotePlatformConfig(config: unknown): PlatformConfig | n
     connection?: {
       adapter?: string;
       platform?: Record<string, unknown> & { provider?: string };
-      platform_connection_id?: string;
     };
   };
   const adapter = cfg.connection?.adapter;
   if (!isRemotePlatformAdapter(adapter)) return null;
-  if (cfg.connection?.platform_connection_id) return null;
 
   const current = cfg.connection?.platform ?? {};
   const provider = current.provider ?? adapter;

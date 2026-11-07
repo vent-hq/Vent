@@ -80,7 +80,7 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 
 1. CLI submits call via `POST /runs/submit`
 2. API validates config (Zod), checks usage limits, enqueues to per-user BullMQ queue
-3. Worker picks up job, decrypts platform credentials, creates audio channel via adapter
+3. Worker picks up job, decrypts that run's platform configuration, creates audio channel via adapter
 4. Call executes with conversation turns, progress streams via HTTP callbacks to API
 5. API broadcasts events via Redis pub/sub → SSE to CLI
 6. Results stored and returned to the coding agent
@@ -137,5 +137,6 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 
 ## Project Rules
 
+- **No "just in case" code.** Build only what's needed now. Ask before expanding scope.
 - **PRODUCTION-ONLY fixes. No localhost.** Test against deployed services, not local dev servers.
 - **Don't worry about backward compatibility.** Early-stage project — break things if it leads to a cleaner result.
