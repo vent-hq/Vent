@@ -4,22 +4,6 @@ import type { SSEEvent } from "./sse.js";
 
 const isTTY = process.stdout.isTTY;
 
-let _verbose = false;
-
-export function setVerbose(v: boolean): void {
-  _verbose = v;
-}
-
-export function debug(msg: string): void {
-  if (!_verbose) return;
-  const ts = new Date().toISOString().slice(11, 23);
-  stdoutSync(`[vent ${ts}] ${msg}\n`);
-}
-
-export function isVerbose(): boolean {
-  return _verbose;
-}
-
 /**
  * Synchronous write to stdout. On POSIX, process.stdout.write() to a pipe is
  * ASYNC — if the process exits before the buffer drains, the data is lost and
@@ -289,19 +273,19 @@ export function printError(message: string): void {
 }
 
 export function printInfo(message: string, { force }: { force?: boolean } = {}): void {
-  if (!force && !isTTY && !_verbose) return;
+  if (!force && !isTTY) return;
   const line = blue("▸") + ` ${message}\n`;
   stdoutSync(line);
 }
 
 export function printSuccess(message: string, { force }: { force?: boolean } = {}): void {
-  if (!force && !isTTY && !_verbose) return;
+  if (!force && !isTTY) return;
   const line = green("✔") + ` ${message}\n`;
   stdoutSync(line);
 }
 
 export function printWarn(message: string, { force }: { force?: boolean } = {}): void {
-  if (!force && !isTTY && !_verbose) return;
+  if (!force && !isTTY) return;
   const line = yellow("⚠") + ` ${message}\n`;
   stdoutSync(line);
 }
