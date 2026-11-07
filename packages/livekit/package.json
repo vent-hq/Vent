@@ -34,7 +34,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/vent-hq/vent.git",
+    "url": "git+https://github.com/vent-hq/Vent.git",
     "directory": "packages/livekit"
   },
   "homepage": "https://venthq.dev",
