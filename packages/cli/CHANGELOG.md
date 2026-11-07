@@ -1,5 +1,13 @@
 # vent-hq
 
+## 0.13.2
+
+### Patch Changes
+
+- 6c035ab: Always connect to api.venthq.dev without an environment variable override.
+
+  Remove the unused WebSocket dependency and inactive diagnostic logging while preserving verbose result output.
+
 ## 0.13.1
 
 ### Patch Changes
