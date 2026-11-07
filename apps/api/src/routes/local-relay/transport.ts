@@ -11,7 +11,7 @@ function timingSafeCompare(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
   return timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
-import { broadcast } from "../lib/run-subscribers.js";
+import { broadcast } from "../../lib/run-subscribers.js";
 import type WebSocket from "ws";
 
 // ---------------------------------------------------------------------------

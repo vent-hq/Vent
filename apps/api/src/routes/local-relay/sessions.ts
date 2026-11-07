@@ -2,7 +2,7 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { eq, and } from "drizzle-orm";
 import { schema } from "@vent/db";
-import { cleanupSession, relaySessions } from "./relay.js";
+import { cleanupSession, relaySessions } from "./transport.js";
 
 async function agentSessionRoutes(app: FastifyInstance) {
   // POST /agent-sessions — Create a new agent session (relay tunnel)
