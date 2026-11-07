@@ -32,11 +32,7 @@
     "directory": "packages/cli"
   },
   "homepage": "https://venthq.dev",
-  "dependencies": {
-    "ws": "^8.18.0"
-  },
   "devDependencies": {
-    "@types/ws": "catalog:",
     "@vent/relay-client": "workspace:*",
     "@vent/shared": "workspace:*",
     "esbuild": "catalog:"

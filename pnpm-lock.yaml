@@ -273,14 +273,7 @@ importers:
         version: 5.9.3
 
   packages/cli:
-    dependencies:
-      ws:
-        specifier: ^8.18.0
-        version: 8.19.0
     devDependencies:
-      '@types/ws':
-        specifier: 'catalog:'
-        version: 8.18.1
       '@vent/relay-client':
         specifier: workspace:*
         version: link:../relay-client
@@ -385,13 +378,7 @@ importers:
       '@vent/shared':
         specifier: workspace:*
         version: link:../shared
-      ws:
-        specifier: 'catalog:'
-        version: 8.19.0
     devDependencies:
-      '@types/ws':
-        specifier: 'catalog:'
-        version: 8.18.1
       typescript:
         specifier: 'catalog:'
         version: 5.9.3
