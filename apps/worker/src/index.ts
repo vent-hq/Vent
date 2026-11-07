@@ -3,6 +3,7 @@ import { AsyncLocalStorage } from "node:async_hooks";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { hostname } from "node:os";
 import type { Job } from "bullmq";
+import { requireEnv } from "@vent/shared";
 import { WebhookServer } from "@vent/adapters";
 import { executeRun } from "./jobs/run-executor.js";
 import { createWorkerMetrics } from "./metrics.js";
@@ -40,7 +41,7 @@ function parsePositiveIntEnv(name: string, fallback: number): number {
   return value;
 }
 
-const redisUrl = process.env["REDIS_URL"] ?? "redis://localhost:6379";
+const redisUrl = requireEnv("REDIS_URL");
 const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 // Dedicated connection for BullMQ Workers (blocking BLPOP). Sharing with
 // the general-purpose `connection` causes BullMQ to log a deprecation and,

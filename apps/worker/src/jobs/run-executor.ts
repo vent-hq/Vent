@@ -5,6 +5,7 @@ import {
   FLEET_ACTIVE_RUNS_KEY,
   formatConversationResult,
   signCallback,
+  requireEnv,
 } from "@vent/shared";
 
 // Build headers + raw body for an HMAC-signed POST to /internal/* on the API.
@@ -119,7 +120,7 @@ interface RunJob {
   agent_session_id?: string;
 }
 
-const redisUrl = process.env["REDIS_URL"] ?? "redis://localhost:6379";
+const redisUrl = requireEnv("REDIS_URL");
 const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 
 async function resolvePlatformConfig(
@@ -364,7 +365,7 @@ function parsePoolMax(): number {
   return Math.min(50, Math.max(10, conc * 2));
 }
 
-const db = createDb(process.env["DATABASE_URL"]!, {
+const db = createDb(requireEnv("DATABASE_URL"), {
   max: parsePoolMax(),
   idleTimeoutSeconds: 30,
   maxLifetimeSeconds: 3600,

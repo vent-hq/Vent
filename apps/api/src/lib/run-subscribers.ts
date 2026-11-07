@@ -1,5 +1,6 @@
 import IORedis from "ioredis";
 import { EventEmitter } from "node:events";
+import { requireEnv } from "@vent/shared";
 
 /**
  * Redis pub/sub for broadcasting run events across API instances.
@@ -11,7 +12,7 @@ import { EventEmitter } from "node:events";
  * `vent:run-events:*` once via psubscribe and dispatch by run_id locally.
  */
 
-const redisUrl = process.env["REDIS_URL"] ?? "redis://localhost:6379";
+const redisUrl = requireEnv("REDIS_URL");
 
 const redisPub = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 const redisSub = new IORedis(redisUrl, { maxRetriesPerRequest: null });

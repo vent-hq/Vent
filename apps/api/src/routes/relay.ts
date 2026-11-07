@@ -5,7 +5,7 @@ import { eq, and } from "drizzle-orm";
 import IORedis from "ioredis";
 import { schema } from "@vent/db";
 import { timingSafeEqual } from "node:crypto";
-import { RUNNER_CALLBACK_HEADER } from "@vent/shared";
+import { RUNNER_CALLBACK_HEADER, requireEnv } from "@vent/shared";
 
 function timingSafeCompare(a: string, b: string): boolean {
   if (a.length !== b.length) return false;
@@ -58,7 +58,7 @@ const PING_INTERVAL_MS = 30_000;
 const MAX_BUFFER_BYTES = 1_048_576; // 1 MB safety limit per connection
 
 // Redis — pub/sub for instant notification + key for cross-instance relay-ready checks
-const redisUrl = process.env["REDIS_URL"] ?? "redis://localhost:6379";
+const redisUrl = requireEnv("REDIS_URL");
 const redisPub = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 
 // ---------------------------------------------------------------------------

@@ -8,6 +8,7 @@ import {
   RUN_QUEUE_NEW_CHANNEL,
   RUN_QUEUE_PREFIX,
   RUN_QUEUE_REGISTRY_SET,
+  requireEnv,
 } from "@vent/shared";
 
 declare module "fastify" {
@@ -20,7 +21,7 @@ declare module "fastify" {
 }
 
 export const queuePlugin = fp(async (app) => {
-  const redisUrl = process.env["REDIS_URL"] ?? "redis://localhost:6379";
+  const redisUrl = requireEnv("REDIS_URL");
   const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 
   app.decorate("redis", connection);

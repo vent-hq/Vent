@@ -1,5 +1,6 @@
 import fp from "fastify-plugin";
 import { createDb, type Database } from "@vent/db";
+import { requireEnv } from "@vent/shared";
 
 declare module "fastify" {
   interface FastifyInstance {
@@ -18,10 +19,7 @@ function parsePositiveInt(name: string, fallback: number): number {
 }
 
 export const dbPlugin = fp(async (app) => {
-  const connectionString = process.env["DATABASE_URL"];
-  if (!connectionString) {
-    throw new Error("DATABASE_URL is required");
-  }
+  const connectionString = requireEnv("DATABASE_URL");
   // Default 30 = comfortable headroom for SSE replays + cleanup interval +
   // /internal/* callback transactions. Override with API_DB_POOL_MAX if you
   // run a fatter API box.

@@ -12,6 +12,8 @@ kill_timeout = "5m"
 [env]
   NODE_ENV = "production"
   WORKER_TOTAL_CONCURRENCY = "45"
+  API_URL = "http://vent-api.internal:3000"
+  API_PUBLIC_URL = "https://api.venthq.dev"
   RUNNER_LISTEN_PORT = "8443"
   RUNNER_PUBLIC_HOST = "vent-worker.fly.dev"
   WORKER_METRICS_PORT = "9091"
