@@ -112,34 +112,33 @@ export interface BlandPathwayLogEntry {
 
 // ── Post-call data fetching ──────────────────────────────────
 
-/** Poll GET /v1/calls/{callId} until the call is marked completed. */
-export async function fetchBlandCallResponse(apiKey: string, callId: string): Promise<BlandCallResponse | null> {
-  const delays = [200, 400, 800, 1500, 3000, 5000];
-  for (const delay of delays) {
-    await sleep(delay);
-    const res = await fetch(`${BLAND_API_BASE}/v1/calls/${callId}`, {
-      headers: { authorization: apiKey },
-    });
-    if (!res.ok) continue;
+/**
+ * Find a web agent's call_id after the call. Bland only sends the `callID`
+ * WebSocket frame for pathway agents; every web call is recorded with
+ * `to` = the web agent ID, and GET /v1/calls lists newest first (it has no
+ * filter for `to`, so match it here).
+ */
+/** One lookup of the call a Vent-created web agent received (matched by `to`). */
+export async function findBlandCallIdByAgent(apiKey: string, agentId: string): Promise<string | null> {
+  const res = await fetch(`${BLAND_API_BASE}/v1/calls?limit=50`, {
+    headers: { authorization: apiKey },
+  });
+  if (!res.ok) throw new Error(`Bland list calls failed (${res.status})`);
+  const { calls } = await res.json() as { calls?: Array<{ call_id?: string; to?: string }> };
+  return calls?.find((call) => call.to === agentId)?.call_id ?? null;
+}
 
-    const data = (await res.json()) as BlandCallResponse;
-    if (data.completed || data.status === "completed" || data.status === "failed") {
-      const logSummary = {
-        status: data.status,
-        transcript_count: data.transcripts?.length ?? 0,
-        agent_actions: data.transcripts?.filter((t) => t.user === "agent-action").length ?? 0,
-        pathway_log_count: data.pathway_logs?.length ?? 0,
-        variables: data.variables ? Object.keys(data.variables) : [],
-      };
-      console.log(`[bland] Post-call response summary: ${JSON.stringify(logSummary)}`);
-      if (data.pathway_logs?.length) {
-        console.log(`[bland] Pathway logs: ${JSON.stringify(data.pathway_logs)}`);
-      }
-      return data;
-    }
-  }
+/** One fetch of a call's post-call data. */
+export async function fetchBlandCallResponse(apiKey: string, callId: string): Promise<BlandCallResponse> {
+  const res = await fetch(`${BLAND_API_BASE}/v1/calls/${callId}`, {
+    headers: { authorization: apiKey },
+  });
+  if (!res.ok) throw new Error(`Bland get call failed (${res.status})`);
+  return await res.json() as BlandCallResponse;
+}
 
-  return null;
+export function isBlandCallDone(data: BlandCallResponse): boolean {
+  return !!data.completed || data.status === "completed" || data.status === "failed";
 }
 
 /** Fetch corrected (speaker-diarized) transcripts for a call. */
@@ -165,44 +164,43 @@ export async function fetchBlandCorrectedTranscripts(
   return null;
 }
 
-/** Fetch event stream for latency data when webhooks did not provide it. */
+/**
+ * Fetch per-turn LLM/TTS latency from the call's event stream. Bland returns
+ * `{ event_stream_data: [{ category: "latency", message: "LLM: 184ms", ... }] }`.
+ * It carries no STT timings.
+ */
 export async function fetchBlandEventStream(
   apiKey: string,
   callId: string,
 ): Promise<ComponentLatency[]> {
-  const latencies: ComponentLatency[] = [];
   try {
     const res = await fetch(`${BLAND_API_BASE}/v1/event_stream/${callId}`, {
       headers: { authorization: apiKey },
     });
-    if (!res.ok) return latencies;
-
-    const raw = await res.json() as unknown;
-
-    type EventEntry = { level?: string; message?: string; category?: string; log_level?: string };
-    let events: EventEntry[];
-    if (Array.isArray(raw)) {
-      events = raw;
-    } else if (raw && typeof raw === "object" && "events" in raw && Array.isArray((raw as { events: unknown }).events)) {
-      events = (raw as { events: EventEntry[] }).events;
-    } else {
-      console.log(`[bland] Event stream: unexpected shape for ${callId}: ${JSON.stringify(raw).slice(0, 200)}`);
-      return latencies;
+    if (!res.ok) {
+      console.warn(`[bland] Event stream: HTTP ${res.status} for ${callId}`);
+      return [];
     }
 
-    console.log(`[bland] Event stream: ${events.length} events for ${callId}`);
+    const raw = await res.json() as { event_stream_data?: Array<{ category?: string; message?: string }> };
+    const events = raw.event_stream_data;
+    if (!Array.isArray(events)) {
+      console.warn(`[bland] Event stream: unexpected shape for ${callId}: ${JSON.stringify(raw).slice(0, 200)}`);
+      return [];
+    }
 
+    const latencies: ComponentLatency[] = [];
     for (const evt of events) {
-      const isPerf = evt.category === "performance" || evt.log_level === "performance";
-      if (isPerf && evt.message) {
-        const timing = parseLatencyMessage(evt.message);
-        if (timing) latencies.push(timing);
-      }
+      if (evt.category !== "latency" || !evt.message) continue;
+      const timing = parseLatencyMessage(evt.message);
+      if (timing) latencies.push(timing);
     }
-  } catch {
-    // Non-critical — webhooks are primary source
+    console.log(`[bland] Event stream: ${latencies.length} latency entries of ${events.length} events for ${callId}`);
+    return latencies;
+  } catch (err) {
+    console.warn(`[bland] Event stream fetch failed for ${callId}: ${(err as Error).message}`);
+    return [];
   }
-  return latencies;
 }
 
 // ── Tool call / transfer parsing ─────────────────────────────
@@ -345,7 +343,8 @@ export function extractBlandTransfers(data: BlandCallResponse): CallTransfer[] |
 
 /** Build ended_reason string from Bland call response. */
 export function buildBlandEndedReason(data: BlandCallResponse): string | undefined {
-  let endedReason = data.status;
+  // Bland returns `status: null` for web calls; the schema accepts a string or nothing.
+  let endedReason = data.status ?? undefined;
   if (data.call_ended_by) endedReason = `ended_by_${data.call_ended_by.toLowerCase()}`;
   if (data.error_message) endedReason = `error: ${data.error_message}`;
   return endedReason;
@@ -355,8 +354,6 @@ export function buildBlandEndedReason(data: BlandCallResponse): string | undefin
 export function buildBlandCallMetadata(
   data: BlandCallResponse,
   callId: string | null,
-  realtimeCitations: unknown[],
-  componentLatencies: ComponentLatency[],
 ): CallMetadata {
   const durationS =
     data.corrected_duration != null
@@ -387,7 +384,7 @@ export function buildBlandCallMetadata(
     provider_metadata: compactUnknownRecord({
       duration_s: durationS,
       answered_by: data.answered_by,
-      citations: data.citations ?? (realtimeCitations.length > 0 ? realtimeCitations : undefined),
+      citations: data.citations,
     }),
     transfers: extractBlandTransfers(data),
   };
@@ -423,33 +420,6 @@ export function buildBlandTranscripts(
   }
   console.log(`[bland] Raw transcripts: ${data.transcripts.length} entries -> ${transcripts.length} caller turns`);
   return transcripts;
-}
-
-/** Get full caller transcript string from Bland data. */
-export function getFullCallerTranscriptFromData(
-  data: BlandCallResponse | null,
-  correctedData: BlandCorrectedTranscriptEntry[] | null,
-): string {
-  if (correctedData?.length) {
-    return correctedData
-      .filter((e) => e.speaker_label === "user")
-      .map((e) => stripBlandAnnotations(e.text))
-      .join(" ");
-  }
-  if (!data?.transcripts) return "";
-  return data.transcripts
-    .filter((e) => e.user === "user")
-    .map((e) => stripBlandAnnotations(e.text))
-    .join(" ");
-}
-
-/** Get agent text from Bland post-call data. */
-export function getAgentTextFromData(data: BlandCallResponse | null): string {
-  if (!data?.transcripts) return "";
-  return data.transcripts
-    .filter((e) => e.user === "assistant" || e.user === "robot")
-    .map((e) => stripBlandAnnotations(e.text))
-    .join(" ");
 }
 
 // ── Latency parsing ──────────────────────────────────────────
@@ -505,9 +475,7 @@ export function toRelativeBlandTimestampMs(timestamp: string | undefined, callSt
   return Math.max(0, absoluteMs - callStartMs);
 }
 
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
+
 
 /** Strip Bland-injected annotations like "<Block interruptions enabled. This message was ignored>" */
 export function stripBlandAnnotations(text: string): string {

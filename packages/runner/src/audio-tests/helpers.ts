@@ -4,6 +4,23 @@
 
 import type { AudioChannel } from "@vent/adapters";
 import { VoiceActivityDetector, type VADState, transcribe as sttTranscribe, concatPcm } from "@vent/voice";
+
+/** Longest a platform may report a tool call as running before Vent stops waiting on it. */
+const TOOL_CALL_MAX_MS = 30_000;
+/** After a platform's end-of-turn signal, how long to wait in case the agent keeps talking. */
+const PLATFORM_EOT_SETTLE_MS = 500;
+
+/**
+ * How patiently Vent waits for the agent to finish its turn. Platforms that
+ * report when the agent stops talking (hasPlatformEndOfTurn) can be trusted
+ * quickly. On the rest, Vent's own voice detection decides, so it waits out
+ * the agent's natural pauses: mid-reply, and right after a tool result.
+ */
+export function turnTiming(hasPlatformEndOfTurn: boolean) {
+  return hasPlatformEndOfTurn
+    ? { silenceThresholdMs: 400, postVadContinuationMs: 0, postToolCallContinuationMs: 0 }
+    : { silenceThresholdMs: 1200, postVadContinuationMs: 1000, postToolCallContinuationMs: 2000 };
+}
 /**
  * Stats about audio collection — used by adaptive threshold to tune silence detection.
  */
@@ -44,10 +61,7 @@ export async function collectUntilEndOfTurn(
   const timeoutMs = opts.timeoutMs ?? 15000;
   const silenceThresholdMs = opts.silenceThresholdMs ?? 800;
   const debugLabel = opts.debugLabel ?? "collect";
-  const platformDrainMs = opts.preferPlatformEOT ? (channel.platformEndOfTurnDrainMs ?? 0) : 0;
-  const platformSettleMs = opts.preferPlatformEOT ? (channel.platformEndOfTurnSettleMs ?? 500) : 500;
-  const postToolCallContinuationMs = channel.postToolCallContinuationMs ?? 0;
-  const postVadContinuationMs = channel.postVadContinuationMs ?? 0;
+  const { postToolCallContinuationMs, postVadContinuationMs } = turnTiming(!!opts.preferPlatformEOT);
   // Noise gate for "audible audio arrived — extending turn" checks. Real
   // speech on 16-bit PCM sits at RMS 500–5000; platform noise floors
   // (Retell/Twilio/etc.) are typically 50–200. 500 lands in the gap so
@@ -89,17 +103,17 @@ export async function collectUntilEndOfTurn(
   try {
     await new Promise<void>((resolve) => {
       console.log(
-        `    [collect:${debugLabel}] start timeout=${timeoutMs}ms silenceThreshold=${silenceThresholdMs}ms ` +
-        `preferPlatformEOT=${!!opts.preferPlatformEOT} platformDrain=${platformDrainMs}ms ` +
+        `    [collect:${debugLabel}] start timeout=${timeoutMs}ms silenceThreshold=${vad.silenceThresholdMs}ms ` +
+        `preferPlatformEOT=${!!opts.preferPlatformEOT} ` +
         `postToolContinuation=${postToolCallContinuationMs}ms postVadContinuation=${postVadContinuationMs}ms`
       );
       let platformEOTFired = false;
       let vadEOTFired = false;
       let platformEOTResolveTimer: ReturnType<typeof setTimeout> | null = null;
       let vadDeferTimer: ReturnType<typeof setTimeout> | null = null;
-      let platformDrainTimer: ReturnType<typeof setTimeout> | null = null;
-      let platformDrainReason = "";
       let toolCallInProgress = false;
+      /** Ends a tool call the platform never reports as finished. */
+      let toolCallCapTimer: ReturnType<typeof setTimeout> | null = null;
       let lastToolCallCompletedAt: number | null = null;
       let platformSpeechStartedAt: number | null = null;
       /** True when platform confirmed agent silence and no platformSpeechStart has fired since. */
@@ -127,37 +141,10 @@ export async function collectUntilEndOfTurn(
         platformEOTResolveTimer = null;
       };
 
-      const clearPlatformDrain = () => {
-        if (!platformDrainTimer) return;
-        clearTimeout(platformDrainTimer);
-        platformDrainTimer = null;
-      };
-
-      const schedulePlatformDrain = (reason: string, waitMs: number) => {
-        clearPlatformDrain();
-        platformDrainReason = reason;
-        platformDrainTimer = setTimeout(() => {
-          platformDrainTimer = null;
-          console.log(`    [vad] playback drain elapsed — resolving`);
-          cleanup();
-          resolve();
-        }, waitMs);
-      };
-
-      const resolveAfterPlatformDrain = (reason: string) => {
-        if (platformDrainMs <= 0) {
-          console.log(`    [vad] ${reason} — resolving immediately`);
-          cleanup();
-          resolve();
-          return;
-        }
-
-        // Treat platformEndOfTurnDrainMs as a real minimum hold after the
-        // platform says speech stopped. Some transports emit the stop signal
-        // slightly before the audible tail has fully drained, so "time since
-        // last audible chunk" is not a reliable substitute here.
-        console.log(`    [vad] ${reason} — waiting ${platformDrainMs}ms for playback drain`);
-        schedulePlatformDrain(reason, platformDrainMs);
+      const resolveNow = (reason: string) => {
+        console.log(`    [vad] ${reason} — resolving`);
+        cleanup();
+        resolve();
       };
 
       const shouldWaitForPostToolContinuation = (now: number) => {
@@ -223,7 +210,6 @@ export async function collectUntilEndOfTurn(
               console.log(`    [vad] Audible audio arrived during continuation window — extending turn`);
               clearDeferredEndOfTurn();
               clearPlatformResolve();
-              clearPlatformDrain();
               vadEOTFired = false;
               platformEOTFired = false;
               platformConfirmedSilent = false;
@@ -248,22 +234,12 @@ export async function collectUntilEndOfTurn(
               console.log(`    [vad] Audible audio arrived during platform EOT settle — extending turn`);
               clearPlatformResolve();
               clearDeferredEndOfTurn();
-              clearPlatformDrain();
               vadEOTFired = false;
               platformEOTFired = false;
               platformConfirmedSilent = false;
               firstEOTAt = null;
               vad.reset();
             }
-          }
-          if (platformDrainTimer && !platformConfirmedSilent && !budgetExhausted) {
-            console.log(`    [vad] Audible audio arrived during drain window — extending turn`);
-            // Reset firstEOTAt so the next pause's extension-budget check
-            // starts from now, not from the stale platform EOT timestamp.
-            // Without this, drain-extended turns can hit budget exhaustion
-            // prematurely on a subsequent legit pause.
-            firstEOTAt = null;
-            schedulePlatformDrain(platformDrainReason || "end_of_turn confirmed", platformDrainMs);
           }
         }
 
@@ -303,7 +279,6 @@ export async function collectUntilEndOfTurn(
           if ((vadEOTFired || platformEOTFired) && !platformConfirmedSilent) {
             clearDeferredEndOfTurn();
             clearPlatformResolve();
-            clearPlatformDrain();
             vadEOTFired = false;
             platformEOTFired = false;
             firstEOTAt = null;
@@ -356,11 +331,11 @@ export async function collectUntilEndOfTurn(
             // instead of waiting 3s for a phantom new platform EOT (Retell only
             // emits one final agent_stop_talking, then goes silent).
             const platformAgeMs = lastPlatformEOTAt !== null ? now - lastPlatformEOTAt : Infinity;
-            if (platformAgeMs < PLATFORM_EOT_FRESH_MS && !platformDrainTimer) {
+            if (platformAgeMs < PLATFORM_EOT_FRESH_MS) {
               console.log(
                 `    [vad] end_of_turn detected (platformEndOfTurn was ${platformAgeMs}ms ago) — resolving via drain`
               );
-              resolveAfterPlatformDrain("end_of_turn after recent platformEndOfTurn");
+              resolveNow("end_of_turn after recent platformEndOfTurn");
             } else if (!vadDeferTimer) {
               vadEOTFired = true;
               if (firstEOTAt === null) firstEOTAt = now;
@@ -372,8 +347,8 @@ export async function collectUntilEndOfTurn(
                 resolve();
               }, 3000);
             }
-          } else if (!platformDrainTimer) {
-            resolveAfterPlatformDrain("end_of_turn detected");
+          } else {
+            resolveNow("end_of_turn detected");
           }
         }
       };
@@ -381,13 +356,12 @@ export async function collectUntilEndOfTurn(
       const onPlatformSpeechStart = () => {
         platformSpeechStartedAt = Date.now();
         platformConfirmedSilent = false;
-        if (!vadDeferTimer && !platformDrainTimer && !platformEOTResolveTimer && !vadEOTFired && !platformEOTFired) {
+        if (!vadDeferTimer && !platformEOTResolveTimer && !vadEOTFired && !platformEOTFired) {
           return;
         }
         console.log(`    [vad] platform speech resumed during continuation window — extending turn`);
         clearDeferredEndOfTurn();
         clearPlatformResolve();
-        clearPlatformDrain();
         vadEOTFired = false;
         platformEOTFired = false;
         firstEOTAt = null;
@@ -401,13 +375,19 @@ export async function collectUntilEndOfTurn(
       };
 
       const onToolCallActive = (active: boolean) => {
+        if (toolCallCapTimer) clearTimeout(toolCallCapTimer);
+        toolCallCapTimer = active
+          ? setTimeout(() => {
+            console.log(`    [vad] No tool result after ${TOOL_CALL_MAX_MS / 1000}s — treating the tool call as finished`);
+            onToolCallActive(false);
+          }, TOOL_CALL_MAX_MS)
+          : null;
         toolCallInProgress = active;
         console.log(`    [vad] toolCallActive=${active} vadEOTFired=${vadEOTFired}`);
         if (active) {
           lastToolCallCompletedAt = null;
           clearDeferredEndOfTurn();
           clearPlatformResolve();
-          clearPlatformDrain();
           vadEOTFired = false;
           platformEOTFired = false;
           vad.reset();
@@ -419,7 +399,6 @@ export async function collectUntilEndOfTurn(
           // Reset VAD to detect the post-tool-call response.
           clearDeferredEndOfTurn();
           clearPlatformResolve();
-          clearPlatformDrain();
           console.log(`    [vad] Tool call completed, resetting VAD for post-tool speech`);
           vadEOTFired = false;
           platformEOTFired = false;
@@ -448,11 +427,11 @@ export async function collectUntilEndOfTurn(
         // trigger on brief TTS gaps between sentences — not true end of response.
         // The settle window lets agent_start_talking cancel via onPlatformSpeechStart.
         if (!platformEOTResolveTimer) {
-          console.log(`    [vad] platformEndOfTurn — waiting ${platformSettleMs}ms settle (vadEOTFired=${vadEOTFired})`);
+          console.log(`    [vad] platformEndOfTurn — waiting ${PLATFORM_EOT_SETTLE_MS}ms settle (vadEOTFired=${vadEOTFired})`);
           platformEOTResolveTimer = setTimeout(() => {
             platformEOTResolveTimer = null;
-            resolveAfterPlatformDrain("platformEndOfTurn after settle");
-          }, platformSettleMs);
+            resolveNow("platformEndOfTurn after settle");
+          }, PLATFORM_EOT_SETTLE_MS);
         }
       };
 
@@ -486,9 +465,9 @@ export async function collectUntilEndOfTurn(
 
       function cleanup() {
         clearTimeout(timeout);
+        if (toolCallCapTimer) clearTimeout(toolCallCapTimer);
         clearDeferredEndOfTurn();
         clearPlatformResolve();
-        clearPlatformDrain();
         channel.off("audio", onAudio);
         channel.off("error", onError);
         channel.off("platformEndOfTurn", onPlatformEOT);

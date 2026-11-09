@@ -5,14 +5,15 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tests",
     "clean": "rm -rf dist",
-    "test": "tsx --test src/**/*.test.ts"
+    "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
     "@elevenlabs/elevenlabs-js": "^2.39.0",
     "@livekit/protocol": "^1.45.1",
     "@livekit/rtc-node": "^0.13.0",
+    "@roamhq/wrtc": "0.10.0",
     "@vapi-ai/server-sdk": "^0.11.0",
     "@vent/shared": "workspace:*",
     "@vent/voice": "workspace:*",

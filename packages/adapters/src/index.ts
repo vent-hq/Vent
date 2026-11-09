@@ -9,22 +9,8 @@ import type {
 } from "@vent/shared";
 import { RUNNER_CALLBACK_HEADER } from "@vent/shared";
 import type { AudioChannel } from "./audio-channel.js";
-import { WsAudioChannel } from "./ws-audio-channel.js";
-import { WebRtcAudioChannel } from "./webrtc-audio-channel.js";
-import { VapiAudioChannel } from "./vapi-audio-channel.js";
-import { ElevenLabsAudioChannel } from "./elevenlabs-audio-channel.js";
-import { RetellAudioChannel } from "./retell-audio-channel.js";
-import { BlandWsAudioChannel } from "./bland-ws-audio-channel.js";
 
-export type { AudioChannel, AudioChannelEvents, CallRecording, LiveCallRecording } from "./audio-channel.js";
-export { BaseAudioChannel } from "./audio-channel.js";
-export { WsAudioChannel } from "./ws-audio-channel.js";
-export { WebRtcAudioChannel } from "./webrtc-audio-channel.js";
-export { VapiAudioChannel } from "./vapi-audio-channel.js";
-export { RetellAudioChannel } from "./retell-audio-channel.js";
-export { ElevenLabsAudioChannel } from "./elevenlabs-audio-channel.js";
-export { BlandWsAudioChannel } from "./bland-ws-audio-channel.js";
-export { WebhookServer } from "./webhook-server.js";
+export type { AudioChannel } from "./audio-channel.js";
 
 export interface AudioChannelConfig {
   adapter: AdapterType;
@@ -35,11 +21,11 @@ export interface AudioChannelConfig {
   callName?: string;
   /** Target sample rate for WebSocket wire format. Default: 24000. */
   wsSampleRate?: number;
-  /** Enable caller audio normalization for WebSocket adapter. Default: false. */
-  wsNormalizeAudio?: boolean;
 }
 
-export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
+// Each call runs in its own process, so load only the chosen platform's
+// adapter: the platform SDKs together add ~150 MB to every call process.
+export async function createAudioChannel(config: AudioChannelConfig): Promise<AudioChannel> {
   const agentUrl = config.agentUrl ?? "http://localhost:3001";
 
   switch (config.adapter) {
@@ -57,11 +43,11 @@ export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
         if (secret) headers[RUNNER_CALLBACK_HEADER] = secret;
         if (config.relayHeaders) Object.assign(headers, config.relayHeaders);
       }
+      const { WsAudioChannel } = await import("./ws-audio-channel.js");
       return new WsAudioChannel({
         wsUrl,
         headers,
         sampleRate: config.wsSampleRate,
-        normalizeAudio: config.wsNormalizeAudio,
       });
     }
 
@@ -77,6 +63,7 @@ export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
       if (!apiSecret) throw new Error("LiveKit adapter requires LIVEKIT_API_SECRET env or platform.livekit_api_secret");
 
       const roomName = `vent-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
+      const { WebRtcAudioChannel } = await import("./webrtc-audio-channel.js");
       return new WebRtcAudioChannel({
         livekitUrl,
         apiKey,
@@ -92,6 +79,7 @@ export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
       const assistantId = p?.vapi_assistant_id || process.env["VAPI_ASSISTANT_ID"] || process.env["VAPI_AGENT_ID"] || "";
       if (!apiKey) throw new Error("Vapi adapter requires vapi_api_key or VAPI_API_KEY env");
       if (!assistantId) throw new Error("Vapi adapter requires VAPI_ASSISTANT_ID or VAPI_AGENT_ID in .env");
+      const { VapiAudioChannel } = await import("./vapi-audio-channel.js");
       return new VapiAudioChannel({ apiKey, assistantId });
     }
 
@@ -101,6 +89,7 @@ export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
       const agentId = p?.retell_agent_id || process.env["RETELL_AGENT_ID"] || "";
       if (!apiKey) throw new Error("Retell adapter requires retell_api_key or RETELL_API_KEY env");
       if (!agentId) throw new Error("Retell adapter requires retell_agent_id or RETELL_AGENT_ID env");
+      const { RetellAudioChannel } = await import("./retell-audio-channel.js");
       return new RetellAudioChannel({ apiKey, agentId });
     }
 
@@ -110,6 +99,7 @@ export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
       const agentId = p?.elevenlabs_agent_id || process.env["ELEVENLABS_AGENT_ID"] || "";
       if (!apiKey) throw new Error("ElevenLabs adapter requires elevenlabs_api_key or ELEVENLABS_API_KEY env");
       if (!agentId) throw new Error("ElevenLabs adapter requires elevenlabs_agent_id or ELEVENLABS_AGENT_ID env");
+      const { ElevenLabsAudioChannel } = await import("./elevenlabs-audio-channel.js");
       return new ElevenLabsAudioChannel({ apiKey, agentId });
     }
 
@@ -118,19 +108,14 @@ export function createAudioChannel(config: AudioChannelConfig): AudioChannel {
       const apiKey = p?.bland_api_key || process.env["BLAND_API_KEY"] || "";
       const pathwayId = p?.bland_pathway_id || process.env["BLAND_PATHWAY_ID"] || "";
       if (!apiKey) throw new Error("Bland adapter requires bland_api_key or BLAND_API_KEY env");
-      if (!pathwayId && !p?.task && !p?.persona_id) {
-        throw new Error("Bland adapter requires bland_pathway_id, persona_id, or platform.task");
+      if (!pathwayId && !p?.task) {
+        throw new Error("Bland adapter requires bland_pathway_id or platform.task");
       }
 
-      const blandPublicHost = process.env["RUNNER_PUBLIC_HOST"] ?? "";
-      if (!blandPublicHost) {
-        throw new Error("Bland adapter requires RUNNER_PUBLIC_HOST env var");
-      }
-
+      const { BlandWsAudioChannel } = await import("./bland-ws-audio-channel.js");
       return new BlandWsAudioChannel({
         apiKey,
         agentId: pathwayId || undefined,
-        publicBaseUrl: `https://${blandPublicHost}`,
         callOptions: {
           task: p?.task,
           tools: p?.tools,
