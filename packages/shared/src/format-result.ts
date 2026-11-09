@@ -139,6 +139,7 @@ export interface FormattedConversationResult {
   status: "completed" | "error";
   duration_ms: number;
   error: string | null;
+  end_note: string | null;
   transcript: FormattedTranscriptTurn[];
   latency: FormattedLatency | null;
   tool_calls: FormattedToolCalls;
@@ -176,6 +177,7 @@ export function formatConversationResult(
     status: r.status,
     duration_ms: r.duration_ms,
     error: r.error ?? null,
+    end_note: r.end_note ?? null,
     transcript: formatTranscript(r.transcript, options),
     latency: r.metrics?.latency ? formatLatency(r.metrics.latency, r.metrics, verbose) : null,
     tool_calls: formatToolCalls(r.metrics?.tool_calls, r.observed_tool_calls, verbose),
@@ -232,12 +234,14 @@ function formatLatency(latency: LatencyMetrics, metrics: ConversationCallResult[
     && latency.p50_ttfw_ms != null
     && latency.p95_ttfw_ms != null;
   const responseTimeSource: "ttfw" | "ttfb" = hasTtfw ? "ttfw" : "ttfb";
+  const firstResponse = hasTtfw ? (latency.first_turn_ttfw_ms ?? latency.first_turn_ttfb_ms) : latency.first_turn_ttfb_ms;
+  if (firstResponse == null || (!hasTtfw && (metrics.mean_ttfb_ms == null || latency.p95_ttfb_ms == null))) return null;
 
   const result: FormattedLatency = {
-    response_time_ms: hasTtfw ? metrics.mean_ttfw_ms! : metrics.mean_ttfb_ms,
+    response_time_ms: hasTtfw ? metrics.mean_ttfw_ms! : metrics.mean_ttfb_ms!,
     response_time_source: responseTimeSource,
-    p95_response_time_ms: hasTtfw ? latency.p95_ttfw_ms! : latency.p95_ttfb_ms,
-    first_response_time_ms: hasTtfw ? (latency.first_turn_ttfw_ms ?? latency.first_turn_ttfb_ms) : latency.first_turn_ttfb_ms,
+    p95_response_time_ms: hasTtfw ? latency.p95_ttfw_ms! : latency.p95_ttfb_ms!,
+    first_response_time_ms: firstResponse,
   };
 
   if (!verbose) return result;
