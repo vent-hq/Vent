@@ -1,5 +1,24 @@
 # vent-hq
 
+## 0.14.0
+
+### Minor Changes
+
+- 175ecc5: Use short-lived signed access tokens with automatic renewal. Required update:
+  the API no longer accepts credentials saved by 0.13.2 and earlier. Sign in again
+  to replace them, or set VENT_REFRESH_TOKEN to an API key.
+
+### Patch Changes
+
+- de3ec13: List the supported caller accents in the agent skill files; an unknown `caller_audio.accent` is now rejected instead of silently using the American voice.
+- 65ee54b: Removed the `silence_threshold_ms` call option. Vent now decides when the agent has finished its turn on its own, the same way on every call, so an agent that pauses too long mid-reply shows up in the results instead of being waited out. Configs that still set it keep working; the field is ignored.
+- a83c715: Show the run status and error when a run ends without a call result, and exit with code 1 instead of 0.
+- 54ef1fa: `vent agent start` reports a rejected relay connection right away (with the reason) instead of appearing connected after 3 seconds.
+- a83c715: The exit code now follows the run status (0 = passed, 1 = failed or cancelled). If a call result never reaches the stream, the CLI shows the stored result instead of an empty list. Call results include `end_note` when Vent ended the call or the connection closed.
+- a83c715: `vent-hq stop` on a running call now reports that the call is stopping. The run ends as `cancelled` once the call hangs up.
+- b4a5755: Keep waiting for a run's result when the API answers 502–504 while restarting during a deploy, instead of failing the run.
+- a83c715: `vent run` resends a submit once if the connection drops or the API is restarting, with the same idempotency key, so a lost response never starts a second call.
+
 ## 0.13.2
 
 ### Patch Changes
