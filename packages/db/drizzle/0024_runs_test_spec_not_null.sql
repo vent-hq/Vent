@@ -1,0 +1,1 @@
+ALTER TABLE "runs" ALTER COLUMN "test_spec_json" SET NOT NULL;
