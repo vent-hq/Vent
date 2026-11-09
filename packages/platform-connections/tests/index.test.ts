@@ -5,7 +5,7 @@ import {
   decryptPlatformConfig,
   encryptPlatformConfig,
   type EncryptedPlatformConfig,
-} from "./index.js";
+} from "../src/index.js";
 
 const masterKey = "12".repeat(32);
 const previousKey = process.env["PLATFORM_CONNECTIONS_MASTER_KEY"];

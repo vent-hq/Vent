@@ -5,7 +5,7 @@ import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
 import type { Database } from "@vent/db";
 import { encryptPlatformConfig } from "@vent/platform-connections";
-import { loadRunPlatformConfig } from "./platform-config.js";
+import { loadRunPlatformConfig } from "../../src/jobs/platform-config.js";
 
 const previousKey = process.env["PLATFORM_CONNECTIONS_MASTER_KEY"];
 process.env["PLATFORM_CONNECTIONS_MASTER_KEY"] = "12".repeat(32);

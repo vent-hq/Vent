@@ -5,9 +5,9 @@
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tests",
     "clean": "rm -rf dist",
-    "test": "tsx --test src/index.test.ts"
+    "test": "tsx --test tests/index.test.ts"
   },
   "dependencies": {
     "@vent/shared": "workspace:*"
