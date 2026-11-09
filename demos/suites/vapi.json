@@ -1,0 +1,15 @@
+{
+  "connection": {
+    "adapter": "vapi",
+    "platform": {
+      "provider": "vapi"
+    }
+  },
+  "calls": {
+    "lookup_and_availability": {
+      "caller_prompt": "You are James Chen from Harbor Logistics. Ask about availability for an OSHA inspection on the next weekday afternoon. Provide your name or company when asked. Do not book: thank the agent, say you will call back to book later, and end the call.",
+      "max_turns": 8,
+      "language": "en"
+    }
+  }
+}

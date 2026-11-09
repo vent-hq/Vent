@@ -1,7 +1,0 @@
-{
-  "watch": [".", "../../packages"],
-  "ignore": ["**/dist/**", "**/.turbo/**"],
-  "ext": "ts,mjs,txt,wasm,json",
-  "exec": "pnpm build && node",
-  "signal": "SIGTERM"
-}

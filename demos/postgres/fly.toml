@@ -1,0 +1,32 @@
+app = "vent-demo-db"
+primary_region = "iad"
+kill_signal = "SIGINT"
+kill_timeout = "30s"
+
+[build]
+  dockerfile = "Dockerfile"
+
+[env]
+  POSTGRES_USER = "demo"
+  POSTGRES_DB = "vent_demo"
+  PGDATA = "/data/pgdata"
+  POSTGRES_INITDB_ARGS = "--auth-host=scram-sha-256"
+
+[experimental]
+  cmd = ["postgres", "-c", "shared_buffers=64MB", "-c", "max_connections=30"]
+
+[[mounts]]
+  source = "demo_postgres_data"
+  destination = "/data"
+
+[checks.postgres]
+  type = "tcp"
+  port = 5432
+  interval = "15s"
+  timeout = "5s"
+  grace_period = "30s"
+
+[[vm]]
+  memory = "512mb"
+  cpu_kind = "shared"
+  cpus = 1

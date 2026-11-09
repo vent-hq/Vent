@@ -1,12 +1,12 @@
 # Start dependencies: docker compose -f compose.local.yaml up -d --wait
-# Start dependencies + API/worker with hot reload: pnpm dev:local
+# Start Vent's API and worker in Docker: doppler run --project vent --config dev -- pnpm dev:docker
 # Stop:  docker compose -f compose.local.yaml down
 # Local data survives stopping; `down --volumes` resets it.
 # Credentials below are for this isolated local environment only.
 name: vent-nassau-local
 
-# Settings for the API and worker running directly in Node.js on your Mac.
-x-local-environment:
+# Host settings for database setup and CLI requests; container addresses override these below.
+x-local-environment: &local-environment
   NODE_ENV: development
   DATABASE_URL: postgres://vent:vent_local@127.0.0.1:${VENT_LOCAL_POSTGRES_PORT:-15432}/vent_local
   REDIS_URL: redis://127.0.0.1:${VENT_LOCAL_REDIS_PORT:-16379}
@@ -18,18 +18,59 @@ x-local-environment:
   API_HOST: 127.0.0.1
   API_PORT: "${VENT_LOCAL_API_PORT:-3001}"
   API_URL: http://127.0.0.1:${VENT_LOCAL_API_PORT:-3001}
-  API_PUBLIC_URL: http://localhost:${VENT_LOCAL_API_PORT:-3001}
-  VENT_ACCESS_TOKEN: vent_local_development
+  API_PUBLIC_URL: http://127.0.0.1:${VENT_LOCAL_API_PORT:-3001}
+  VENT_REFRESH_TOKEN: vent_010101010101010101010101010101010101010101010101
   DASHBOARD_URL: http://localhost:3000
   RUNNER_CALLBACK_SECRET: vent-local-callback-secret
   PLATFORM_CONNECTIONS_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-  RUNNER_PUBLIC_HOST: "${VENT_LOCAL_RUNNER_PUBLIC_HOST:-}"
-  RUNNER_LISTEN_PORT: "${VENT_LOCAL_RUNNER_PORT:-18443}"
   WORKER_METRICS_PORT: "${VENT_LOCAL_METRICS_PORT:-19091}"
   WORKER_TOTAL_CONCURRENCY: "2"
   FLEET_MAX_ACTIVE_RUNS: "2"
 
+x-container-environment: &container-environment
+  <<: *local-environment
+  DATABASE_URL: postgres://vent:vent_local@postgres:5432/vent_local
+  REDIS_URL: redis://redis:6379
+  S3_ENDPOINT: http://storage:8333
+  API_HOST: 0.0.0.0
+  API_PORT: "3000"
+  API_URL: http://api:3000
+  WORKER_METRICS_PORT: "9091"
+
 services:
+  api:
+    profiles: [app]
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    environment:
+      <<: *container-environment
+      JWT_PRIVATE_KEY: ${JWT_PRIVATE_KEY:-}
+    ports:
+      - "127.0.0.1:${VENT_LOCAL_API_PORT:-3001}:3000"
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis: { condition: service_healthy }
+      storage: { condition: service_healthy }
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+
+  worker:
+    profiles: [app]
+    image: vent-nassau-local-worker
+    build:
+      context: .
+      dockerfile: apps/worker/Dockerfile
+    environment:
+      <<: *container-environment
+      DEEPGRAM_API_KEY: ${DEEPGRAM_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    depends_on:
+      api: { condition: service_healthy }
+
   postgres:
     image: postgres:17-alpine
     environment:

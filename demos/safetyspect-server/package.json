@@ -1,0 +1,25 @@
+{
+  "name": "@vent/demo-backend",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/index.js",
+    "seed": "node src/seed.js",
+    "setup:bland": "tsx scripts/setup-bland-pathway.ts",
+    "setup:elevenlabs": "tsx scripts/setup-elevenlabs-agent.ts",
+    "setup:retell": "tsx scripts/setup-retell-agent.ts",
+    "setup:vapi": "tsx scripts/setup-vapi-assistant.ts",
+    "test": "node --test src/*.test.js",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "retell-sdk": "^5.10.3",
+    "postgres": "^3.4.5"
+  },
+  "devDependencies": {
+    "tsx": "catalog:",
+    "typescript": "catalog:"
+  }
+}

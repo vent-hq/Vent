@@ -12,7 +12,7 @@ pnpm install                    # Install all dependencies
 ### Build & Dev
 ```bash
 pnpm build                      # Build all packages and apps (Turbo)
-pnpm dev                        # Watch mode with hot reload for all apps
+pnpm dev                        # Start apps; API/worker build once, dashboard hot reloads
 pnpm typecheck                  # Run TypeScript type checking across all packages
 pnpm clean                      # Remove all dist/ and .next/ outputs
 ```
@@ -79,7 +79,7 @@ packages/
 Each `vent run` executes a single call. Run N calls in parallel via separate shell commands.
 
 1. CLI submits call via `POST /runs/submit`
-2. API validates config (Zod), checks usage limits, enqueues to per-user BullMQ queue
+2. API validates config (Zod), checks usage limits, enqueues to the shared BullMQ run queue
 3. Worker picks up job, decrypts that run's platform configuration, creates audio channel via adapter
 4. Call executes with conversation turns, progress streams via HTTP callbacks to API
 5. API broadcasts events via Redis pub/sub → SSE to CLI
@@ -104,11 +104,11 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 - `DASHBOARD_URL` — Frontend URL for CORS and device auth redirects
 - `NEXT_PUBLIC_WORKOS_REDIRECT_URI` — WorkOS OAuth callback URL
 - `RUNNER_CALLBACK_SECRET` — HMAC secret for worker→API callbacks
-- `RUNNER_PUBLIC_HOST`, `RUNNER_LISTEN_PORT` — Public host/port for Bland webhook callbacks
-- `WORKER_TOTAL_CONCURRENCY` — Required total active run budget for one worker Machine across all owned user queues. Keep this at or below what one worker box can actually sustain.
-- `FLEET_MAX_ACTIVE_RUNS` — Optional fleet-wide cap on concurrent runs across all machines (default 45). Set to match the lowest external provider concurrency limit (e.g. Deepgram TTS streaming). API returns 429 when the cap is reached.
+- `WORKER_TOTAL_CONCURRENCY` — Required number of calls one worker Machine runs at once from the shared run queue. Keep this at or below what one worker box can actually sustain.
+- `FLEET_MAX_ACTIVE_RUNS` — Required fleet-wide cap on queued and running calls across all machines. Set within worker capacity and external provider limits. API returns 429 when the cap is reached.
 - `WORKER_METRICS_PORT` — Optional internal Prometheus scrape port for worker metrics (default `9091`)
 - `WORKOS_API_KEY`, `WORKOS_CLIENT_ID`, `WORKOS_COOKIE_PASSWORD` — WorkOS auth
+- `JWT_PRIVATE_KEY` — RSA signing key, PKCS#8 PEM, at least 2048 bits; public verification key is derived at startup
 - `PLATFORM_CONNECTIONS_MASTER_KEY` — 32-byte hex key for encrypting platform credentials (`openssl rand -hex 32`)
 - `ANTHROPIC_API_KEY`, `DEEPGRAM_API_KEY` — AI/voice providers
 - `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY`, `S3_ENDPOINT`, `S3_BUCKET`, `S3_REGION` — Tigris (S3-compatible storage)
