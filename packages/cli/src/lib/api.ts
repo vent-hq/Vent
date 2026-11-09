@@ -1,4 +1,4 @@
-import { API_BASE } from "./config.js";
+import { API_BASE, loadAccessToken, refreshAccessToken } from "./config.js";
 
 export class ApiError extends Error {
   constructor(
@@ -9,28 +9,38 @@ export class ApiError extends Error {
   }
 }
 
-export async function apiFetch(
+export async function authenticatedFetch(
   path: string,
   apiKey: string,
   options: RequestInit = {},
 ): Promise<Response> {
   const url = `${API_BASE}${path}`;
-  const res = await fetch(url, {
-    ...options,
-    headers: {
-      Authorization: `Bearer ${apiKey}`,
-      "Content-Type": "application/json",
-      ...options.headers,
-    },
-  });
+  const token = await loadAccessToken() ?? apiKey;
+  const send = (accessToken: string) => {
+    const headers = new Headers(options.headers);
+    headers.set("Authorization", `Bearer ${accessToken}`);
+    if (!headers.has("Content-Type")) headers.set("Content-Type", "application/json");
+    return fetch(url, { ...options, headers });
+  };
+  const response = await send(token);
+  if (response.status !== 401) return response;
+  const refreshed = await refreshAccessToken(token);
+  if (!refreshed) return response;
+  await response.body?.cancel();
+  return send(refreshed);
+}
+
+export async function apiFetch(
+  path: string,
+  apiKey: string,
+  options: RequestInit = {},
+): Promise<Response> {
+  const res = await authenticatedFetch(path, apiKey, options);
 
   if (!res.ok) {
-    let body: unknown;
-    try {
-      body = await res.json();
-    } catch {
-      body = await res.text();
-    }
+    const text = await res.text();
+    let body: unknown = text;
+    try { body = JSON.parse(text); } catch {}
     throw new ApiError(res.status, body);
   }
 

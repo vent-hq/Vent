@@ -27,7 +27,7 @@ interface AgentSessionResponse {
 export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
   const accessToken = await loadAccessToken();
   if (!accessToken) {
-    printError("No Vent access token found. Set VENT_ACCESS_TOKEN, run `npx vent-hq login`, or pass --access-token.");
+    printError("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
     return 2;
   }
 
@@ -116,7 +116,7 @@ export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
 export async function agentStopCommand(args: AgentStopArgs): Promise<number> {
   const accessToken = await loadAccessToken();
   if (!accessToken) {
-    printError("No Vent access token found. Set VENT_ACCESS_TOKEN, run `npx vent-hq login`, or pass --access-token.");
+    printError("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
     return 2;
   }
 

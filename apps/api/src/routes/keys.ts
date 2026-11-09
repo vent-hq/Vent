@@ -1,7 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { randomBytes, createHash } from "node:crypto";
 import { eq, and, isNull, desc } from "drizzle-orm";
 import { schema } from "@vent/db";
+import { createRefreshCredential } from "../lib/access-credentials.js";
 
 export async function keyRoutes(app: FastifyInstance) {
   const authPreHandler = { preHandler: app.verifyAuth };
@@ -10,31 +10,18 @@ export async function keyRoutes(app: FastifyInstance) {
   // an in-browser form POST against a signed-in dashboard user.
   const mutatingPreHandler = { preHandler: app.verifyAuthAndCsrf };
 
-  app.post("/keys", mutatingPreHandler, async (request, reply) => {
+  app.post("/keys", { preHandler: app.verifyCredentialIssuer }, async (request, reply) => {
     const body = request.body as { name?: string } | undefined;
     const name = body?.name ?? "default";
 
-    const rawAccessToken = `vent_${randomBytes(24).toString("hex")}`;
-    const tokenHash = createHash("sha256").update(rawAccessToken).digest("hex");
-    const prefix = rawAccessToken.slice(0, 12);
-
-    const [row] = await app.db
-      .insert(schema.accessTokens)
-      .values({
-        user_id: request.userId!,
-        token_hash: tokenHash,
-        name,
-        prefix,
-      })
-      .returning();
+    const { row, refreshToken } = await createRefreshCredential(app.db, request.userId!, name);
 
     return reply.status(201).send({
-      id: row!.id,
-      access_token: rawAccessToken,
+      id: row.id,
+      refresh_token: refreshToken,
       name,
-      prefix,
-      created_at: row!.created_at,
-      warning: "Save this access token — it will not be shown again.",
+      prefix: row.prefix,
+      created_at: row.created_at,
     });
   });
 

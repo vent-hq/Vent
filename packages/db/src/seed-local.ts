@@ -7,7 +7,7 @@ async function main() {
     throw new Error("Local seeding requires the local vent_local database.");
   }
 
-  const token = "vent_local_development";
+  const token = "vent_010101010101010101010101010101010101010101010101";
   const hash = createHash("sha256").update(token).digest("hex");
   const sql = postgres(url.toString(), { max: 1 });
   try {

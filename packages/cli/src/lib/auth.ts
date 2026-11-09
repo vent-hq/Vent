@@ -1,4 +1,5 @@
-import { saveAccessToken, API_BASE } from "./config.js";
+import { saveCredentials, API_BASE } from "./config.js";
+import { AccessCredentialsSchema } from "@vent/shared";
 import { openBrowser } from "./browser.js";
 import { printError, printInfo } from "./output.js";
 
@@ -54,13 +55,13 @@ export async function deviceAuthFlow(): Promise<AuthResult> {
 
       const data = (await res.json()) as {
         status?: "pending" | "approved" | "expired" | "consumed" | "invalid";
-        access_token?: string;
       };
 
-      const accessToken = data.access_token;
-      if (data.status === "approved" && accessToken) {
-        await saveAccessToken(accessToken);
-        return { ok: true, accessToken };
+      if (data.status === "approved") {
+        const parsed = AccessCredentialsSchema.safeParse(data);
+        if (!parsed.success) return { ok: false, error: "Vent returned invalid sign-in credentials." };
+        await saveCredentials(parsed.data);
+        return { ok: true, accessToken: parsed.data.access_token };
       }
 
       if (data.status === "expired") {

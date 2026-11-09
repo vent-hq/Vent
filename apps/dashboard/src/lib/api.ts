@@ -11,11 +11,10 @@ export interface AccessToken {
 
 export interface CreateAccessTokenResponse {
   id: string;
-  access_token: string;
+  refresh_token: string;
   name: string;
   prefix: string;
   created_at: string;
-  warning: string;
 }
 
 export async function fetchAccessTokens(): Promise<AccessToken[]> {

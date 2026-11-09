@@ -5,10 +5,10 @@
   "main": "dist/index.js",
   "scripts": {
     "build": "node scripts/bundle.mjs",
-    "dev": "nodemon --config ../../nodemon.json dist/index.js",
+    "dev": "pnpm build && pnpm start",
     "start": "node dist/index.js",
-    "typecheck": "tsc --noEmit",
-    "test": "tsx --test src/lib/run-submit.test.ts",
+    "typecheck": "tsc -p tests",
+    "test": "tsx --test --experimental-test-module-mocks tests/lib/run-submit.test.ts tests/lib/finalize-run.test.ts tests/lib/run-queue-monitor.test.ts tests/lib/client-ip.test.ts tests/lib/rate-limit-redis.test.ts tests/lib/access-jwt.test.ts tests/plugins/auth.test.ts tests/routes/credentials.test.ts tests/plugins/rate-limit.test.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {
@@ -27,6 +27,7 @@
     "fastify": "^5.2.0",
     "fastify-plugin": "^5.0.0",
     "ioredis": "catalog:",
+    "jose": "^6.2.15",
     "ws": "catalog:",
     "zod": "catalog:"
   },

@@ -1,7 +1,8 @@
 import type { FastifyInstance } from "fastify";
-import { randomBytes, createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import { eq, and, isNull, gt } from "drizzle-orm";
 import { schema } from "@vent/db";
+import { createRefreshCredential, findRefreshCredential, issueAccessCredentials } from "../lib/access-credentials.js";
 
 const SESSION_TTL_MS = 15 * 60 * 1000; // 15 minutes
 const SAFE_ALPHABET = "ABCDEFGHJKMNPQRSTVWXYZ23456789"; // no 0/O/I/1/L
@@ -72,6 +73,12 @@ export async function deviceRoutes(app: FastifyInstance) {
       return reply.send({ status: "pending" });
     }
 
+    const credential = await findRefreshCredential(app.db, session.raw_access_token);
+    if (!credential || credential.id !== session.access_token_id || credential.user_id !== session.user_id) {
+      return reply.send({ status: "invalid" });
+    }
+    const credentials = await issueAccessCredentials(app, credential, session.raw_access_token);
+
     // Approved — atomically consume the session and capture the token. The
     // UPDATE … WHERE consumed_at IS NULL RETURNING guarantees only one
     // concurrent /device/exchange poll claims the token; the loser sees
@@ -97,13 +104,13 @@ export async function deviceRoutes(app: FastifyInstance) {
     // we're the one who claimed it.
     return reply.send({
       status: "approved",
-      access_token: session.raw_access_token,
+      ...credentials,
     });
   });
 
   // Approve a device session (authenticated — called by dashboard, so cookie-
   // authed; CSRF Origin check applies in addition to auth).
-  const mutatingPreHandler = { preHandler: app.verifyAuthAndCsrf };
+  const mutatingPreHandler = { preHandler: app.verifyCredentialIssuer };
 
   app.post("/device/approve", {
     ...mutatingPreHandler,
@@ -117,49 +124,21 @@ export async function deviceRoutes(app: FastifyInstance) {
       return reply.status(400).send({ error: "user_code is required" });
     }
 
-    const [session] = await app.db
-      .select()
-      .from(schema.deviceSessions)
-      .where(
-        and(
-          eq(schema.deviceSessions.user_code, user_code),
-          isNull(schema.deviceSessions.user_id),
-          isNull(schema.deviceSessions.consumed_at),
-          gt(schema.deviceSessions.expires_at, new Date()),
-        ),
-      )
-      .limit(1);
-
-    if (!session) {
-      return reply
-        .status(404)
-        .send({ error: "Invalid or expired device code" });
-    }
-
-    // Create access token (same pattern as keys.ts)
-    const rawAccessToken = `vent_${randomBytes(24).toString("hex")}`;
-    const tokenHash = createHash("sha256").update(rawAccessToken).digest("hex");
-    const prefix = rawAccessToken.slice(0, 12);
-
-    const [accessTokenRow] = await app.db
-      .insert(schema.accessTokens)
-      .values({
-        user_id: request.userId!,
-        token_hash: tokenHash,
-        name: "Vent CLI Login",
-        prefix,
-      })
-      .returning();
-
-    // Mark session as approved with the raw access token for CLI to pick up
-    await app.db
-      .update(schema.deviceSessions)
-      .set({
-        user_id: request.userId!,
-        access_token_id: accessTokenRow!.id,
-        raw_access_token: rawAccessToken,
-      })
-      .where(eq(schema.deviceSessions.id, session.id));
+    const approved = await app.db.transaction(async tx => {
+      const [session] = await tx.select().from(schema.deviceSessions).where(and(
+        eq(schema.deviceSessions.user_code, user_code),
+        isNull(schema.deviceSessions.user_id),
+        isNull(schema.deviceSessions.consumed_at),
+        gt(schema.deviceSessions.expires_at, new Date()),
+      )).for("update").limit(1);
+      if (!session) return false;
+      const { row, refreshToken } = await createRefreshCredential(tx, request.userId!, "Vent CLI Login");
+      await tx.update(schema.deviceSessions).set({
+        user_id: request.userId!, access_token_id: row.id, raw_access_token: refreshToken,
+      }).where(eq(schema.deviceSessions.id, session.id));
+      return true;
+    });
+    if (!approved) return reply.status(404).send({ error: "Invalid or expired device code" });
 
     return reply.send({ success: true });
   });

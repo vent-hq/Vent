@@ -10,6 +10,7 @@
     "dist"
   ],
   "scripts": {
+    "test": "tsx --test --experimental-test-module-mocks tests/lib/credentials.test.ts tests/lib/submit-run.test.ts",
     "build": "node scripts/bundle.mjs",
     "clean": "rm -rf dist",
     "prepack": "pnpm clean && pnpm build"
@@ -35,6 +36,7 @@
   "devDependencies": {
     "@vent/relay-client": "workspace:*",
     "@vent/shared": "workspace:*",
-    "esbuild": "catalog:"
+    "esbuild": "catalog:",
+    "jose": "^6.2.15"
   }
 }
