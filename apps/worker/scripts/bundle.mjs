@@ -7,7 +7,8 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const packages = path.resolve(__dirname, "../../../packages");
 
 await build({
-  entryPoints: ["src/index.ts"],
+  // call-process.js is forked once per call by call-supervisor.ts.
+  entryPoints: ["src/index.ts", "src/call-process.ts"],
   bundle: true,
   platform: "node",
   format: "cjs",

@@ -12,7 +12,7 @@ import type {
 } from "@vent/shared";
 import { requireEnv } from "@vent/shared";
 import { buildArtifactUrl, createArtifactToken, createStorageClient } from "@vent/artifacts";
-import { createAudioChannel, type AudioChannelConfig } from "@vent/adapters";
+import { createAudioChannel, type AudioChannel, type AudioChannelConfig } from "@vent/adapters";
 import { runConversationCall } from "./conversation/index.js";
 
 export interface CallStartInfo {
@@ -78,7 +78,7 @@ function slugifyRecordingLabel(label: string): string {
 
 async function attachRecordingUrl(
   result: ConversationCallResult,
-  channel: ReturnType<typeof createAudioChannel>,
+  channel: AudioChannel,
   adapter: AudioChannelConfig["adapter"],
   activeUpload: ActiveRecordingUpload | null,
   runId?: string,
@@ -136,7 +136,7 @@ function buildRecordingUrl(
 }
 
 async function startRecordingUpload(
-  channel: ReturnType<typeof createAudioChannel>,
+  channel: AudioChannel,
   resultName: string | undefined,
   callerPrompt: string,
   runId?: string,
@@ -223,7 +223,7 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
   // The first real call will fail with a clear error if config is wrong.
   const isPlatformAdapter = ["vapi", "retell", "elevenlabs", "bland", "livekit"].includes(channelConfig.adapter);
   if (!isPlatformAdapter) {
-    const probeChannel = createAudioChannel(channelConfig);
+    const probeChannel = await createAudioChannel(channelConfig);
     try {
       await probeChannel.connect();
       // Hold open to verify end-to-end — if the CLI can't reach the agent,
@@ -281,7 +281,7 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
     runId,
     callName,
   };
-  const channel = createAudioChannel(perCallChannelConfig);
+  const channel = await createAudioChannel(perCallChannelConfig);
   const start = Date.now();
 
   let result: ConversationCallResult;
