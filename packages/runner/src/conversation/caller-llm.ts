@@ -10,14 +10,18 @@
  */
 
 import Anthropic from "@anthropic-ai/sdk";
-import type { ConversationTurn, CallerPersona } from "@vent/shared";
+import type { CallerPersona } from "@vent/shared";
 import { LANGUAGE_NAMES } from "@vent/voice";
 
 // @ts-expect-error — esbuild inlines .txt files as strings via loader
 import SYSTEM_PROMPT from "./caller-system-prompt.txt";
 
-const MODEL = "claude-haiku-4-5-20251001";
-const MAX_TOKENS = 1024;
+const MODEL = "claude-haiku-5-5";
+// The caller thinks only on turns that need it (e.g. working out a date), so its
+// reasoning stays out of the JSON reply. Thinking counts toward MAX_TOKENS.
+const CALLER_THINKING = { type: "adaptive" } as const;
+const CALLER_EFFORT = "low";
+const MAX_TOKENS = 4096;
 
 // ---------------------------------------------------------------------------
 // Persona trait → behavioral instruction mapping
@@ -121,21 +125,6 @@ export class CallerLLM {
   }
 
   /**
-   * Generate the caller's next utterance based on the conversation so far.
-   * Returns a structured decision about the caller's next action.
-   */
-  async nextUtterance(
-    agentResponse: string | null,
-    transcript: ConversationTurn[]
-  ): Promise<CallerDecision | null> {
-    const decision = await this.previewNextUtterance(agentResponse, transcript);
-    if (!decision) return null;
-
-    this.commitDecision(agentResponse, decision);
-    return decision;
-  }
-
-  /**
    * Stream the caller's next utterance, yielding sentence-sized chunks
    * as they are detected in the LLM token stream.
    * Returns the full CallerDecision after the stream completes.
@@ -143,7 +132,6 @@ export class CallerLLM {
    */
   async streamNextUtterance(
     agentResponse: string | null,
-    transcript: ConversationTurn[],
     onSentence: (sentence: string) => void,
   ): Promise<CallerDecision | null> {
     const prompt = this.buildNextPrompt(agentResponse);
@@ -152,7 +140,8 @@ export class CallerLLM {
     const stream = this.client.messages.stream({
       model: MODEL,
       max_tokens: MAX_TOKENS,
-      temperature: 0.4,
+      thinking: CALLER_THINKING,
+      output_config: { effort: CALLER_EFFORT },
       system: this.systemPrompt,
       messages,
     });
@@ -190,11 +179,7 @@ export class CallerLLM {
       }
     }
 
-    // Parse the complete response
-    const finalMessage = await stream.finalMessage();
-    const responseText = finalMessage.content[0]?.type === "text"
-      ? finalMessage.content[0].text.trim()
-      : "";
+    const responseText = fullText.trim();
 
     const lastUserMsg = messages[messages.length - 1]?.content ?? "(none)";
     const preview = typeof lastUserMsg === "string" ? lastUserMsg.slice(0, 120) : "(structured)";
@@ -213,17 +198,7 @@ export class CallerLLM {
     return decision;
   }
 
-  async previewNextUtterance(
-    agentResponse: string | null,
-    transcript: ConversationTurn[]
-  ): Promise<CallerDecision | null> {
-    const prompt = this.buildNextPrompt(agentResponse);
-    const messages = [...this.history, { role: "user" as const, content: prompt }];
-
-    return this.generateCallerDecision(messages);
-  }
-
-  commitDecision(agentResponse: string | null, decision: CallerDecision): void {
+  private commitDecision(agentResponse: string | null, decision: CallerDecision): void {
     const prompt = this.buildNextPrompt(agentResponse);
     this.history.push({ role: "user", content: prompt });
     if (decision.mode === "wait") {
@@ -252,7 +227,7 @@ export class CallerLLM {
     const response = await this.client.messages.create({
       model: MODEL,
       max_tokens: 16,
-      temperature: 0,
+      thinking: { type: "disabled" },
       system: `Classify the agent's speech as either "filler" or "complete".
 
 filler = A very short (under 10 words) transitional phrase where the agent says they will do something but has NOT done it yet, and says NOTHING else. The ENTIRE utterance must be a pure holding statement. Examples: "Let me check that for you", "One moment please", "Sure, let me look that up".
@@ -288,39 +263,11 @@ Return exactly one word: filler or complete`,
         : `Your persona and goal:\n${this.callerPrompt}\n\nYou are starting the phone call. Greet AND state why you are calling.`;
     }
     if (agentResponse) {
-      return agentResponse;
+      return `The agent said: "${agentResponse}"`;
     }
     return "[The agent has not spoken yet. Use \"wait\".]";
   }
 
-  private async generateCallerDecision(
-    messages: Array<{ role: "user" | "assistant"; content: string }>
-  ): Promise<CallerDecision | null> {
-    const response = await this.client.messages.create({
-      model: MODEL,
-      max_tokens: MAX_TOKENS,
-      temperature: 0.4,
-      system: this.systemPrompt,
-      messages,
-    });
-
-    const text =
-      response.content[0]?.type === "text"
-        ? response.content[0].text.trim()
-        : "";
-
-    const lastUserMsg = messages[messages.length - 1]?.content ?? "(none)";
-    const preview = typeof lastUserMsg === "string" ? lastUserMsg.slice(0, 120) : "(structured)";
-    console.log(`[caller-llm] prompt="${preview}" raw_response="${text.slice(0, 200)}" history_len=${this.history.length}`);
-
-    const decision = parseCallerDecision(text);
-    if (decision && "text" in decision) {
-      console.log(`[caller-llm] parsed mode=${decision.mode} text="${decision.text}"`);
-    } else {
-      console.log(`[caller-llm] parsed mode=${decision?.mode ?? "null"}`);
-    }
-    return decision;
-  }
 }
 
 export type CallerDecision =
@@ -331,74 +278,31 @@ export type CallerDecision =
 
 export type FillerClassification = "filler" | "complete";
 
+/** Reads the caller's JSON reply. Returns null if it isn't a valid decision. */
 function parseCallerDecision(raw: string): CallerDecision | null {
-  const text = raw.trim();
-  if (!text) return null;
+  const parsed = firstJsonObject(raw);
+  const mode = parsed?.mode;
+  const text = typeof parsed?.text === "string" ? parsed.text.trim() : "";
 
-  if (text === "[END]") {
-    return { mode: "end_now" };
-  }
-  if (text === "[WAIT]" || text === "[LISTEN]") {
-    return { mode: "wait" };
-  }
-  if (text.includes("[END]")) {
-    const spoken = text.replace(/\[END\]/g, "").trim();
-    return spoken
-      ? { mode: "closing", text: spoken }
-      : { mode: "end_now" };
-  }
-
-  const parsed = parseCallerDecisionJson(text);
-  if (parsed) return parsed;
-
-  return { mode: "continue", text };
-}
-
-function parseCallerDecisionJson(text: string): CallerDecision | null {
-  const candidate = extractJsonObject(text);
-  if (!candidate) return null;
-
-  try {
-    const parsed = JSON.parse(candidate) as Record<string, unknown>;
-    const mode = parsed.mode;
-    const spoken = typeof parsed.text === "string" ? parsed.text.trim() : "";
-
-    if (mode === "end_now") {
-      return { mode: "end_now" };
-    }
-    if (mode === "wait") {
-      return { mode: "wait" };
-    }
-    if ((mode === "continue" || mode === "closing") && spoken) {
-      return { mode, text: spoken };
-    }
-  } catch {
-    return null;
-  }
-
+  if (mode === "end_now" || mode === "wait") return { mode };
+  if ((mode === "continue" || mode === "closing") && text) return { mode, text };
   return null;
 }
 
-function extractJsonObject(text: string): string | null {
-  const trimmed = text.trim();
-  if (trimmed.startsWith("{") && trimmed.endsWith("}")) {
-    return trimmed;
-  }
+/** Returns the first JSON object in the reply and ignores anything after it. */
+function firstJsonObject(text: string): Record<string, unknown> | null {
+  const start = text.indexOf("{");
+  if (start < 0) return null;
 
-  const fenced = trimmed.match(/```(?:json)?\s*([\s\S]*?)```/i);
-  if (fenced?.[1]) {
-    const candidate = fenced[1].trim();
-    if (candidate.startsWith("{") && candidate.endsWith("}")) {
-      return candidate;
+  // Try each "}" as the end until one parses.
+  let end = text.indexOf("}", start);
+  while (end >= 0) {
+    try {
+      return JSON.parse(text.slice(start, end + 1)) as Record<string, unknown>;
+    } catch {
+      end = text.indexOf("}", end + 1);
     }
   }
-
-  const firstBrace = trimmed.indexOf("{");
-  const lastBrace = trimmed.lastIndexOf("}");
-  if (firstBrace >= 0 && lastBrace > firstBrace) {
-    return trimmed.slice(firstBrace, lastBrace + 1);
-  }
-
   return null;
 }
 
