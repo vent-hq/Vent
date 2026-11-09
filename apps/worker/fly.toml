@@ -1,9 +1,9 @@
 app = "vent-worker"
 primary_region = "iad"
 # Wait up to 5m (Fly's hard cap) for in-flight voice calls to drain on deploy.
-# Calls longer than 5m will still be SIGKILLed mid-call; combined with
-# maxStalledCount: 0 in queue-runtime.ts the run fails cleanly rather than
-# being replayed and double-billed.
+# Calls still running 3m after SIGTERM are cancelled so they hang up and report
+# before this (apps/worker/src/index.ts); a killed call fails cleanly rather
+# than being replayed (maxStalledCount: 0 in src/index.ts).
 kill_timeout = "5m"
 
 [build]
@@ -14,22 +14,16 @@ kill_timeout = "5m"
   WORKER_TOTAL_CONCURRENCY = "2"
   API_URL = "http://vent-api.internal:3000"
   API_PUBLIC_URL = "https://api.venthq.dev"
-  RUNNER_LISTEN_PORT = "8443"
-  RUNNER_PUBLIC_HOST = "vent-worker.fly.dev"
   WORKER_METRICS_PORT = "9091"
 
-# Expose HTTP port for inbound Bland webhook callbacks
-[http_service]
-  internal_port = 8443
-  force_https = true
-  auto_stop_machines = false
-  auto_start_machines = true
-
-[[http_service.checks]]
+# The worker takes no inbound traffic; Fly checks the metrics server instead.
+[checks.health]
+  type = "http"
+  port = 9091
+  path = "/health"
+  method = "get"
   grace_period = "15s"
   interval = "30s"
-  method = "GET"
-  path = "/health"
   timeout = "5s"
 
 [metrics]

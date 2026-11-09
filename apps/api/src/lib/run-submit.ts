@@ -1,16 +1,18 @@
 import { createHash } from "node:crypto";
-import { eq, and } from "drizzle-orm";
-import { schema } from "@vent/db";
+import { eq, and, count, sql } from "drizzle-orm";
+import { schema, type RunTestSpec } from "@vent/db";
 import { z } from "zod";
 import {
   AdapterTypeSchema,
   ConversationCallSpecSchema,
   CallerAudioEffectsSchema,
   PlatformConfigSchema,
-  FLEET_ACTIVE_RUNS_KEY,
+  requireEnv,
 } from "@vent/shared";
 import { encryptPlatformConfig, validateResolvedPlatformConfig } from "@vent/platform-connections";
 import type { FastifyInstance } from "fastify";
+import { finalizeRun } from "./finalize-run.js";
+import { enqueueRun, type EnqueueableRun } from "./enqueue-run.js";
 
 const PLATFORM_ADAPTERS = new Set(["livekit", "vapi", "retell", "elevenlabs", "bland"]);
 
@@ -91,10 +93,9 @@ export function hashIdempotencyKey(raw: string): string {
   return createHash("sha256").update(raw).digest("hex");
 }
 
-export function buildCallSpec(cfg: Record<string, unknown>) {
+export function buildCallSpec(cfg: Record<string, unknown>): { callSpecJson: RunTestSpec; isRemote: boolean } {
   const adapter = (cfg.adapter as string) ?? "websocket";
   const agentUrl = cfg.agent_url as string | undefined;
-  const voiceConfig = { adapter };
 
   // Merge root-level caller_audio as default onto the call spec
   const callerAudio = cfg.caller_audio as Record<string, unknown> | undefined;
@@ -107,16 +108,11 @@ export function buildCallSpec(cfg: Record<string, unknown>) {
     callSpecJson: {
       call: call ?? null,
       adapter,
-      voice_config: voiceConfig,
-      start_command: cfg.start_command ?? null,
-      health_endpoint: cfg.health_endpoint ?? null,
+      voice_config: { adapter },
+      start_command: (cfg.start_command as string | undefined) ?? null,
+      health_endpoint: (cfg.health_endpoint as string | undefined) ?? null,
       agent_url: agentUrl ?? null,
     },
-    adapter,
-    agentUrl,
-    voiceConfig,
-
-    call: call ?? null,
     isRemote: PLATFORM_ADAPTERS.has(adapter) || !!agentUrl,
   };
 }
@@ -147,46 +143,16 @@ export async function submitRun(
     ? hashIdempotencyKey(idempotencyKey)
     : null;
 
-  // Idempotency check
-  if (hashedIdempotencyKey) {
-    const [existing] = await app.db
-      .select({ id: schema.runs.id, status: schema.runs.status })
-      .from(schema.runs)
-      .where(
-        and(
-          eq(schema.runs.user_id, userId),
-          eq(schema.runs.idempotency_key, hashedIdempotencyKey),
-        ),
-      )
-      .limit(1);
-
-    if (existing) {
-      return { run_id: existing.id, status: existing.status, deduplicated: true };
-    }
-  }
-
   const { platform, ...connection } = config.connection;
   const { call: submittedCall } = config;
   const cfg = { ...connection, call: submittedCall } as Record<string, unknown>;
 
-  const {
-    callSpecJson,
-    adapter: resolvedAdapter,
-    agentUrl,
-    voiceConfig,
+  const { callSpecJson, isRemote } = buildCallSpec(cfg);
 
-    call,
-    isRemote,
-  } = buildCallSpec(cfg);
-
-  // Fleet-wide capacity gate — reject before enqueuing to avoid mid-call provider errors.
-  // Uses a Redis SET of run IDs: SADD is idempotent (no drift), SCARD gives exact count.
-  // A Lua script makes the check-and-add atomic so no race between SCARD and SADD.
-  const fleetMax = parseInt(process.env["FLEET_MAX_ACTIVE_RUNS"] ?? "45", 10);
-
-  // Insert DB row first so we have a run_id to track in the SET.
-  // If the SET add fails (capacity full), we mark the row as rejected.
-  const sourceType = isRemote ? "remote" : "session";
+  const fleetMax = Number(requireEnv("FLEET_MAX_ACTIVE_RUNS"));
+  if (!Number.isSafeInteger(fleetMax) || fleetMax < 1) {
+    throw new Error("FLEET_MAX_ACTIVE_RUNS must be a positive integer");
+  }
 
   if (!isRemote) {
     // Local agent via agent session — session must already be active
@@ -225,60 +191,59 @@ export async function submitRun(
     }
   }
 
-  const [run] = await app.db
-    .insert(schema.runs)
-    .values({
-      access_token_id: accessTokenId,
-      user_id: userId,
-      source_type: sourceType,
-      status: "queued",
-      test_spec_json: callSpecJson,
-      platform_config_encrypted: platform ? encryptPlatformConfig(platform) : null,
-      idempotency_key: hashedIdempotencyKey,
-      ...(agentSessionId ? { agent_session_id: agentSessionId } : {}),
-    })
-    .returning();
+  const platformConfig = platform ? encryptPlatformConfig(platform) : null;
+  const admission = await app.db.transaction(async (tx): Promise<SubmitRunResult | EnqueueableRun> => {
+    // Serialize fleet admissions across API instances until this transaction ends.
+    await tx.execute(sql`SELECT pg_advisory_xact_lock(173827, 2)`);
 
-  const runId = run!.id;
+    if (hashedIdempotencyKey) {
+      const [existing] = await tx
+        .select({ id: schema.runs.id, status: schema.runs.status })
+        .from(schema.runs)
+        .where(and(
+          eq(schema.runs.user_id, userId),
+          eq(schema.runs.idempotency_key, hashedIdempotencyKey),
+        ))
+        .limit(1);
+      if (existing) return { run_id: existing.id, status: existing.status, deduplicated: true };
+    }
 
-  // Atomic check-and-add: if SET size < fleetMax, SADD run_id and return 1; else return 0.
-  const FLEET_CAP_SCRIPT = `
-    if redis.call('scard', KEYS[1]) < tonumber(ARGV[1]) then
-      redis.call('sadd', KEYS[1], ARGV[2])
-      return 1
-    end
-    return 0
-  `;
-  const admitted = await app.redis.eval(
-    FLEET_CAP_SCRIPT, 1, FLEET_ACTIVE_RUNS_KEY, String(fleetMax), runId,
-  ) as number;
+    const [active] = await tx
+      .select({ total: count() })
+      .from(schema.runs)
+      // Statuses written into the SQL text (not bound parameters) so Postgres can
+      // always match this to runs_open_idx, even with a reused plan.
+      .where(sql`${schema.runs.status} IN ('queued', 'running')`);
+    if (active!.total >= fleetMax) throw new FleetCapacityError();
 
-  const activeAfter = await app.redis.scard(FLEET_ACTIVE_RUNS_KEY);
-  if (!admitted) {
-    console.log(`[fleet-cap] REJECTED run=${runId} active=${activeAfter} max=${fleetMax}`);
-    await app.db
-      .update(schema.runs)
-      .set({ status: "fail", finished_at: new Date(), error_text: "Fleet at capacity" })
-      .where(eq(schema.runs.id, runId));
-    throw new FleetCapacityError();
+    const [run] = await tx
+      .insert(schema.runs)
+      .values({
+        access_token_id: accessTokenId,
+        user_id: userId,
+        status: "queued",
+        test_spec_json: callSpecJson,
+        platform_config_encrypted: platformConfig,
+        idempotency_key: hashedIdempotencyKey,
+        ...(agentSessionId ? { agent_session_id: agentSessionId } : {}),
+      })
+      .returning();
+    return run!;
+  });
+  if ("run_id" in admission) return admission;
+
+  const runId = admission.id;
+  try {
+    await enqueueRun(app, admission);
+  } catch (error) {
+    await finalizeRun(app, {
+      runId,
+      status: "fail",
+      from: ["queued"],
+      errorText: "Could not add the run to the worker queue",
+    });
+    throw error;
   }
-  console.log(`[fleet-cap] ADMITTED run=${runId} active=${activeAfter} max=${fleetMax}`);
-
-  // Enqueue the job
-  const jobData = {
-    run_id: runId,
-    user_id: userId,
-    adapter: resolvedAdapter,
-    call_spec: { call: call ?? null },
-    voice_config: voiceConfig,
-    start_command: cfg.start_command as string | undefined,
-    health_endpoint: cfg.health_endpoint as string | undefined,
-    agent_url: agentUrl,
-    ...(agentSessionId ? { agent_session_id: agentSessionId } : {}),
-  };
-
-  await app.getRunQueue(userId).add("execute-run", jobData, { jobId: runId });
-  await app.markRunQueueActive(userId);
 
   return { run_id: runId, status: "queued" };
 }

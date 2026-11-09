@@ -1,6 +1,7 @@
 import http from "node:http";
 import { Queue } from "bullmq";
 import type IORedis from "ioredis";
+import { RUN_QUEUE_NAME } from "@vent/shared";
 import {
   Counter,
   Gauge,
@@ -9,13 +10,10 @@ import {
 } from "prom-client";
 
 export interface WorkerMetrics {
-  observeQueue(queueName: string): void;
-  forgetQueue(queueName: string): void;
   onJobStart(): void;
   onJobFinish(): void;
-  setHotQueues(count: number): void;
-  setOwnedQueues(count: number): void;
-  setLocalQueueWorkers(count: number): void;
+  /** Startup finished: /health starts returning 200. */
+  markReady(): void;
   close(): Promise<void>;
 }
 
@@ -32,7 +30,10 @@ export function createWorkerMetrics(opts: WorkerMetricsOptions): WorkerMetrics {
   const register = new Registry();
   collectDefaultMetrics({ register });
 
-  const queueObjects = new Map<string, Queue>();
+  const queue = new Queue(RUN_QUEUE_NAME, { connection });
+  // Reports this machine's own startup, not Postgres or Redis health: both are
+  // shared by every machine, so a blip there would fail every check at once.
+  let ready = false;
   let scrapeTimer: ReturnType<typeof setInterval> | null = null;
   let scrapePromise: Promise<void> | null = null;
 
@@ -43,57 +44,33 @@ export function createWorkerMetrics(opts: WorkerMetricsOptions): WorkerMetrics {
   });
   configuredTotalConcurrency.set(totalConcurrency);
 
-  const knownQueues = new Gauge({
-    name: "vent_worker_known_queues",
-    help: "Per-user BullMQ queues currently discovered by this worker process.",
-    registers: [register],
-  });
-
   const localRunningJobs = new Gauge({
     name: "vent_worker_local_running_jobs",
     help: "Runs currently executing on this worker process.",
     registers: [register],
   });
 
-  const localQueueWorkers = new Gauge({
-    name: "vent_worker_local_queue_workers",
-    help: "Per-user BullMQ workers currently active on this machine.",
-    registers: [register],
-  });
-
-  const ownedQueues = new Gauge({
-    name: "vent_worker_owned_queues",
-    help: "Hot per-user queues currently assigned to this machine.",
-    registers: [register],
-  });
-
-  const hotQueues = new Gauge({
-    name: "vent_worker_hot_queues",
-    help: "Recently active per-user queues currently tracked by this machine.",
-    registers: [register],
-  });
-
   const queueWaitingJobs = new Gauge({
     name: "vent_worker_queue_waiting_jobs",
-    help: "Global waiting jobs across all known BullMQ queues. Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
+    help: "Global waiting jobs. Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
     registers: [register],
   });
 
   const queueActiveJobs = new Gauge({
     name: "vent_worker_queue_active_jobs",
-    help: "Global active jobs across all known BullMQ queues. Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
+    help: "Global active jobs. Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
     registers: [register],
   });
 
   const queueDelayedJobs = new Gauge({
     name: "vent_worker_queue_delayed_jobs",
-    help: "Global delayed jobs across all known BullMQ queues. Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
+    help: "Global delayed jobs. Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
     registers: [register],
   });
 
   const queueBacklogJobs = new Gauge({
     name: "vent_worker_queue_backlog_jobs",
-    help: "Global backlog across all known BullMQ queues (wait + prioritized + waiting-children). Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
+    help: "Global backlog (wait + prioritized + waiting-children). Every worker reports the same total; use max(), not sum(), in Prometheus queries.",
     registers: [register],
   });
 
@@ -106,8 +83,8 @@ export function createWorkerMetrics(opts: WorkerMetricsOptions): WorkerMetrics {
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (url.pathname === "/health") {
-      res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
-      res.end("ok");
+      res.writeHead(ready ? 200 : 503, { "Content-Type": "text/plain; charset=utf-8" });
+      res.end(ready ? "ok" : "starting");
       return;
     }
 
@@ -136,31 +113,17 @@ export function createWorkerMetrics(opts: WorkerMetricsOptions): WorkerMetrics {
     }
 
     scrapePromise = (async () => {
-      knownQueues.set(queueObjects.size);
-
-      let waiting = 0;
-      let active = 0;
-      let delayed = 0;
-      let backlog = 0;
-
-      for (const queue of queueObjects.values()) {
-        const counts = await queue.getJobCounts(
-          "wait",
-          "active",
-          "delayed",
-          "prioritized",
-          "waiting-children",
-        );
-        waiting += counts.wait ?? 0;
-        active += counts.active ?? 0;
-        delayed += counts.delayed ?? 0;
-        backlog += (counts.wait ?? 0) + (counts.prioritized ?? 0) + (counts["waiting-children"] ?? 0);
-      }
-
-      queueWaitingJobs.set(waiting);
-      queueActiveJobs.set(active);
-      queueDelayedJobs.set(delayed);
-      queueBacklogJobs.set(backlog);
+      const counts = await queue.getJobCounts(
+        "wait",
+        "active",
+        "delayed",
+        "prioritized",
+        "waiting-children",
+      );
+      queueWaitingJobs.set(counts.wait ?? 0);
+      queueActiveJobs.set(counts.active ?? 0);
+      queueDelayedJobs.set(counts.delayed ?? 0);
+      queueBacklogJobs.set((counts.wait ?? 0) + (counts.prioritized ?? 0) + (counts["waiting-children"] ?? 0));
     })();
 
     try {
@@ -178,20 +141,6 @@ export function createWorkerMetrics(opts: WorkerMetricsOptions): WorkerMetrics {
   }, SCRAPE_INTERVAL_MS);
 
   return {
-    observeQueue(queueName: string) {
-      if (queueObjects.has(queueName)) return;
-      queueObjects.set(queueName, new Queue(queueName, { connection }));
-      knownQueues.set(queueObjects.size);
-      void refreshQueueMetrics();
-    },
-    forgetQueue(queueName: string) {
-      const queue = queueObjects.get(queueName);
-      if (!queue) return;
-      queueObjects.delete(queueName);
-      knownQueues.set(queueObjects.size);
-      void queue.close().catch(() => {});
-      void refreshQueueMetrics();
-    },
     onJobStart() {
       localRunningJobs.inc();
     },
@@ -199,18 +148,12 @@ export function createWorkerMetrics(opts: WorkerMetricsOptions): WorkerMetrics {
       localRunningJobs.dec();
       finishedJobs.inc();
     },
-    setHotQueues(count: number) {
-      hotQueues.set(count);
-    },
-    setOwnedQueues(count: number) {
-      ownedQueues.set(count);
-    },
-    setLocalQueueWorkers(count: number) {
-      localQueueWorkers.set(count);
+    markReady() {
+      ready = true;
     },
     async close() {
       if (scrapeTimer) clearInterval(scrapeTimer);
-      await Promise.allSettled(Array.from(queueObjects.values(), (queue) => queue.close()));
+      await queue.close().catch(() => {});
       await new Promise<void>((resolve, reject) => {
         server.close((err) => {
           if (err) {
