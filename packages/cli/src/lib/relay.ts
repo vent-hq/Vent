@@ -35,7 +35,7 @@ export async function startAgentSession(relayConfig: {
   let agentProcess: ChildProcess | null = null;
 
   if (relayConfig.start_command) {
-    const env = { ...process.env, ...client.agentEnv, PORT: String(relayConfig.agent_port) };
+    const env = { ...process.env, PORT: String(relayConfig.agent_port) };
     agentProcess = spawn(relayConfig.start_command, {
       shell: true,
       stdio: "pipe",
