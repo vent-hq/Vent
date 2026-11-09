@@ -35,7 +35,6 @@ async function agentSessionRoutes(app: FastifyInstance) {
         access_token_id: accessTokenId,
         relay_token: relayToken,
         status: "connecting",
-        config_json: body.config,
       })
       .returning();
 

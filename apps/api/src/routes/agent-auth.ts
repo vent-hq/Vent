@@ -1,6 +1,7 @@
 import type { FastifyInstance } from "fastify";
-import { randomBytes, createHash } from "node:crypto";
-import { schema } from "@vent/db";
+import { RefreshTokenRequestSchema } from "@vent/shared";
+import { getClientIp } from "../lib/client-ip.js";
+import { createRefreshCredential, findRefreshCredential, issueAccessCredentials } from "../lib/access-credentials.js";
 
 const WINDOW_MS = 60 * 60 * 1000; // 1 hour
 const MAX_BOOTSTRAPS_PER_IP = 5;
@@ -27,6 +28,15 @@ function checkRate(ip: string): boolean {
 }
 
 export async function agentAuthRoutes(app: FastifyInstance) {
+  app.post("/auth/refresh", {
+    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
+    const parsed = RefreshTokenRequestSchema.safeParse(request.body);
+    if (!parsed.success) return reply.status(400).send({ error: "Invalid refresh request" });
+    const row = await findRefreshCredential(app.db, parsed.data.refresh_token);
+    if (!row) return reply.status(401).send({ error: "Invalid refresh credential" });
+    return reply.send(await issueAccessCredentials(app, row, parsed.data.refresh_token));
+  });
   // GitHub identity — zero-interaction account creation with verified identity.
   // Anonymous bootstrap was removed: every `vent-hq init` now requires either
   // a working GitHub token (auto) or a one-time browser sign-in via WorkOS
@@ -37,7 +47,7 @@ export async function agentAuthRoutes(app: FastifyInstance) {
       rateLimit: { max: 10, timeWindow: "1 hour" },
     },
   }, async (request, reply) => {
-    const ip = request.ip;
+    const ip = getClientIp(request);
 
     if (!checkRate(ip)) {
       return reply.status(429).send({
@@ -64,19 +74,10 @@ export async function agentAuthRoutes(app: FastifyInstance) {
     }
 
     const userId = `gh_${ghUser.id}`;
-    const rawAccessToken = `vent_${randomBytes(24).toString("hex")}`;
-    const tokenHash = createHash("sha256").update(rawAccessToken).digest("hex");
-    const prefix = rawAccessToken.slice(0, 12);
-
-    await app.db.insert(schema.accessTokens).values({
-      user_id: userId,
-      token_hash: tokenHash,
-      name: `GitHub (${ghUser.login})`,
-      prefix,
-    });
+    const { row, refreshToken } = await createRefreshCredential(app.db, userId, `GitHub (${ghUser.login})`);
 
     return reply.status(201).send({
-      access_token: rawAccessToken,
+      ...await issueAccessCredentials(app, row, refreshToken),
       username: ghUser.login,
     });
   });

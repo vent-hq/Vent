@@ -1,39 +1,33 @@
-import { eq } from "drizzle-orm";
+import { and, eq, sql } from "drizzle-orm";
 import IORedis from "ioredis";
 import { createDb, schema, type Database } from "@vent/db";
 import {
-  FLEET_ACTIVE_RUNS_KEY,
   formatConversationResult,
   signCallback,
   requireEnv,
 } from "@vent/shared";
 
-// Build headers + raw body for an HMAC-signed POST to /internal/* on the API.
-// Returns the same body string that was signed so the caller can pass it as
-// `body:` to fetch (signature is over the exact bytes the API will verify).
-function signedJsonRequest(
-  payload: unknown,
-  secret: string,
-): { headers: Record<string, string>; body: string } {
+// Signed POST to the API's /internal/* routes. The signature covers the
+// method, path, timestamp and exact body (packages/shared/src/callback-auth.ts),
+// so it is re-made for every attempt and only valid for this path.
+function postToApi(path: string, payload: unknown, timeoutMs: number): Promise<Response> {
   const body = JSON.stringify(payload);
-  return {
+  return fetch(`${process.env["API_URL"]!}${path}`, {
+    method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...signCallback(body, secret),
+      ...signCallback("POST", path, body, process.env["RUNNER_CALLBACK_SECRET"] ?? ""),
     },
     body,
-  };
+    signal: AbortSignal.timeout(timeoutMs),
+  });
 }
 
-// POST with bounded retry. The runner-callback is the worker→API handoff
-// that finalizes a run; a transient blip on a single fetch leaves the run
-// stuck in "running" until the 60-min cleanup. Retries with exponential
-// backoff and re-signs each attempt (timestamp must be fresh per request,
-// otherwise the API rejects via verifyCallback's stale-timestamp check).
-async function postSignedWithRetry(
-  url: string,
+// POST with bounded retry, for reports that end a run: a transient blip on a
+// single fetch would otherwise leave the run "running" until the cleanup job.
+async function postToApiWithRetry(
+  path: string,
   payload: unknown,
-  secret: string,
   perAttemptTimeoutMs: number,
   attempts: number,
 ): Promise<Response> {
@@ -44,13 +38,7 @@ async function postSignedWithRetry(
       await new Promise((r) => setTimeout(r, backoff));
     }
     try {
-      const signed = signedJsonRequest(payload, secret);
-      const res = await fetch(url, {
-        method: "POST",
-        headers: signed.headers,
-        body: signed.body,
-        signal: AbortSignal.timeout(perAttemptTimeoutMs),
-      });
+      const res = await postToApi(path, payload, perAttemptTimeoutMs);
       // Success or 4xx (won't get better with retry — stop now).
       if (res.ok) return res;
       if (res.status >= 400 && res.status < 500) return res;
@@ -63,46 +51,41 @@ async function postSignedWithRetry(
   }
   throw lastErr ?? new Error("callback failed");
 }
+
 import type {
   CallSpec,
   AdapterType,
 } from "@vent/shared";
 import type { AudioChannelConfig } from "@vent/adapters";
 import { loadRunPlatformConfig } from "./platform-config.js";
-import { executeCall } from "@vent/runner/executor";
+import { CALL_PROCESS_ENTRY, runCallInProcess } from "../call-supervisor.js";
 
 // ---------------------------------------------------------------------------
 // Event emission — writes to DB and notifies API for SSE broadcast
 // ---------------------------------------------------------------------------
 
 async function emitEvent(
-  _db: Database,
   runId: string,
   eventType: string,
   message: string,
   metadata?: Record<string, unknown>,
 ): Promise<void> {
-  try {
-    // POST to API — it handles both DB write and SSE broadcast.
-    // (Don't write to DB here too, or events get duplicated.)
-    const apiUrl = process.env["API_URL"]!;
-    const secret = process.env["RUNNER_CALLBACK_SECRET"] ?? "";
-    const signed = signedJsonRequest(
-      { run_id: runId, event_type: eventType, message, metadata_json: metadata },
-      secret,
-    );
-    await fetch(`${apiUrl}/internal/run-event`, {
-      method: "POST",
-      headers: signed.headers,
-      body: signed.body,
-      signal: AbortSignal.timeout(10_000),
-    });
-  } catch {
-    // Best-effort — don't fail the run if event emission fails
+  // The API writes the event and broadcasts it to the CLI's stream.
+  // Best-effort: a lost event doesn't fail the run.
+  await postToApi(
+    "/internal/run-event",
+    { run_id: runId, event_type: eventType, message, metadata_json: metadata },
+    10_000,
+  ).catch(() => {});
+}
+
+export class LostCallLock extends Error {
+  constructor() {
+    super("Vent failed, agent not tested: the worker lost its Redis connection mid-call");
   }
 }
 
-interface RunJob {
+export interface RunJob {
   run_id: string;
   user_id: string;
   adapter?: string;
@@ -121,84 +104,74 @@ const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 // Direct execution for already-deployed agents (platform adapters or agent_url)
 // ---------------------------------------------------------------------------
 
-async function executeRemoteRun(
-  db: Database,
+// Runs the call in its own process, reports "call finished" (for the CLI's
+// live view), then the final result, which ends the run.
+async function runCallAndReport(
   job: RunJob,
+  channelConfig: AudioChannelConfig,
   signal: AbortSignal,
 ): Promise<void> {
-  const apiUrl = process.env["API_URL"]!;
-  const callbackSecret = process.env["RUNNER_CALLBACK_SECRET"] ?? "";
-  const callbackUrl = `${apiUrl}/internal/runner-callback`;
-
-  const adapterType = (job.adapter ?? "websocket") as AdapterType;
-  const agentUrl = job.agent_url ?? "http://localhost:3001";
-  const platform = await loadRunPlatformConfig(db, job.run_id, job.user_id, adapterType);
-  const callSpec = (job.call_spec as unknown as CallSpec).call;
-
-  const channelConfig: AudioChannelConfig = {
-    adapter: adapterType,
-    agentUrl,
-    platform,
-  };
-
-  // No try/catch here — let errors propagate to executeRun's outer catch,
-  // which is the single source of truth for cleanup (SREM + DB UPDATE).
-  // Earlier code had cleanup at this layer AND the outer layer; that
-  // overwrote the more-specific inner error_text with a generic outer one
-  // and emitted two [fleet-cap] log lines per failure.
-  const { status, conversationResult, aggregate } = await executeCall({
+  // No try/catch here — errors (including a crashed or killed call process)
+  // propagate to executeRun's outer catch, which reports them to the API.
+  const { status, conversationResult, aggregate } = await runCallInProcess(CALL_PROCESS_ENTRY, {
     runId: job.run_id,
     userId: job.user_id,
-    callSpec,
+    callSpec: (job.call_spec as unknown as CallSpec).call,
     channelConfig,
+  }, {
     signal,
     onCallComplete: async (result) => {
       const callName = result.name ?? "conversation";
       try {
-        const signed = signedJsonRequest(
-          {
-            run_id: job.run_id,
-            completed: 1,
-            total: 1,
-            call_type: "conversation",
-            call_name: callName,
-            status: result.status,
-            duration_ms: result.duration_ms,
-            result: formatConversationResult(result),
-          },
-          callbackSecret,
-        );
-        const res = await fetch(`${apiUrl}/internal/call-progress`, {
-          method: "POST",
-          headers: signed.headers,
-          body: signed.body,
-          signal: AbortSignal.timeout(15_000),
-        });
+        const res = await postToApi("/internal/call-progress", {
+          run_id: job.run_id,
+          completed: 1,
+          total: 1,
+          call_type: "conversation",
+          call_name: callName,
+          status: result.status,
+          duration_ms: result.duration_ms,
+          result: formatConversationResult(result),
+        }, 15_000);
         if (!res.ok) console.warn(`call-progress POST failed (${res.status}) for ${callName}`);
       } catch (err) {
         console.warn(`call-progress POST error for ${callName}:`, (err as Error).message);
       }
     },
   });
+  if (signal.reason instanceof LostCallLock) throw signal.reason;
 
-  const response = await postSignedWithRetry(
-    callbackUrl,
-    {
-      run_id: job.run_id,
-      status,
-      conversation_result: conversationResult,
-      aggregate,
-    },
-    callbackSecret,
-    30_000,
-    4,
-  );
+  const response = await postToApiWithRetry("/internal/runner-callback", {
+    run_id: job.run_id,
+    status: signal.aborted ? "cancelled" : status,
+    conversation_result: conversationResult,
+    aggregate,
+    ...(signal.aborted ? { error_text: "Cancelled by user" } : {}),
+  }, 30_000, 4);
 
   if (!response.ok) {
     throw new Error(`Callback failed: ${response.status} ${await response.text()}`);
   }
 
-  console.log(`Remote run ${job.run_id} completed: ${status}`);
+  console.log(`Run ${job.run_id} completed: ${status}`);
+}
+
+// ---------------------------------------------------------------------------
+// Direct execution for already-deployed agents (platform adapters or agent_url)
+// ---------------------------------------------------------------------------
+
+async function executeRemoteRun(
+  db: Database,
+  job: RunJob,
+  signal: AbortSignal,
+): Promise<void> {
+  const adapterType = (job.adapter ?? "websocket") as AdapterType;
+  const platform = await loadRunPlatformConfig(db, job.run_id, job.user_id, adapterType);
+  await runCallAndReport(job, {
+    adapter: adapterType,
+    agentUrl: job.agent_url ?? "http://localhost:3001",
+    platform,
+  }, signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -206,16 +179,12 @@ async function executeRemoteRun(
 // ---------------------------------------------------------------------------
 
 async function executeSessionRun(
-  db: Database,
   job: RunJob,
   relayMachineId: string,
   signal: AbortSignal,
 ): Promise<void> {
-  const apiUrl = process.env["API_URL"]!;
-  const callbackSecret = process.env["RUNNER_CALLBACK_SECRET"] ?? "";
-  const callbackUrl = `${apiUrl}/internal/runner-callback`;
-
   // Build relay connect URL using session_id — the WsAudioChannel will append conn_id automatically
+  const apiUrl = process.env["API_URL"]!;
   const relayWsUrl = apiUrl.replace(/^http/, "ws") + `/relay/connect?session_id=${job.agent_session_id}`;
 
   // Pin all relay connections to the API machine that holds the relay session.
@@ -227,69 +196,11 @@ async function executeSessionRun(
     console.log(`[relay] Pinning connections to Fly machine ${relayMachineId}`);
   }
 
-  const channelConfig: AudioChannelConfig = {
+  await runCallAndReport(job, {
     adapter: "websocket",
     agentUrl: relayWsUrl,
     relayHeaders,
-  };
-
-  const callSpec = (job.call_spec as unknown as CallSpec).call;
-
-  // Same as executeRemoteRun: no inner try/catch — let errors bubble to
-  // executeRun's outer catch (single cleanup point).
-  const { status, conversationResult, aggregate } = await executeCall({
-    runId: job.run_id,
-    userId: job.user_id,
-    callSpec,
-    channelConfig,
-    signal,
-    onCallComplete: async (result) => {
-      const callName = result.name ?? "conversation";
-      try {
-        const signed = signedJsonRequest(
-          {
-            run_id: job.run_id,
-            completed: 1,
-            total: 1,
-            call_type: "conversation",
-            call_name: callName,
-            status: result.status,
-            duration_ms: result.duration_ms,
-            result: formatConversationResult(result),
-          },
-          callbackSecret,
-        );
-        const res = await fetch(`${apiUrl}/internal/call-progress`, {
-          method: "POST",
-          headers: signed.headers,
-          body: signed.body,
-          signal: AbortSignal.timeout(15_000),
-        });
-        if (!res.ok) console.warn(`call-progress POST failed (${res.status}) for ${callName}`);
-      } catch (err) {
-        console.warn(`call-progress POST error for ${callName}:`, (err as Error).message);
-      }
-    },
-  });
-
-  const response = await postSignedWithRetry(
-    callbackUrl,
-    {
-      run_id: job.run_id,
-      status,
-      conversation_result: conversationResult,
-      aggregate,
-    },
-    callbackSecret,
-    30_000,
-    4,
-  );
-
-  if (!response.ok) {
-    throw new Error(`Callback failed: ${response.status} ${await response.text()}`);
-  }
-
-  console.log(`Session run ${job.run_id} completed: ${status}`);
+  }, signal);
 }
 
 // ---------------------------------------------------------------------------
@@ -351,17 +262,36 @@ const CANCEL_POLL_INTERVAL_MS = 2_000;
 // Main run executor
 // ---------------------------------------------------------------------------
 
-export async function executeRun(job: RunJob): Promise<void> {
+/** Fails if Postgres is unreachable, so a bad DATABASE_URL stops a deploy at startup. */
+export async function checkDatabase(): Promise<void> {
+  await db.execute(sql`SELECT 1`);
+}
+
+export async function executeRun(job: RunJob, lockLost: AbortSignal): Promise<void> {
   // Per-run cancel signal. The poller below trips it when `vent-hq stop`
   // sets `vent:cancelled:<id>` in Redis (see apps/api/src/routes/runs.ts).
   // The runner checks `signal.aborted` at every turn boundary, throws,
   // preserves partial transcript, and hangs up the platform call.
   const cancelController = new AbortController();
+  const signal = AbortSignal.any([cancelController.signal, lockLost]);
   // Declared outside the try so the finally always sees it; assigned inside
   // so a synchronous throw before scheduling doesn't leak a phantom interval.
   let cancelPoller: ReturnType<typeof setInterval> | null = null;
 
   try {
+    // Claim the run. If it is no longer queued, another path (cancel, stuck-
+    // run cleanup) already ended it, and placing the call would bill a run
+    // the user was told is over.
+    const [claimed] = await db
+      .update(schema.runs)
+      .set({ status: "running", started_at: new Date() })
+      .where(and(eq(schema.runs.id, job.run_id), eq(schema.runs.status, "queued")))
+      .returning({ id: schema.runs.id });
+    if (!claimed) {
+      console.log(`Run ${job.run_id} already ended before start — skipping call`);
+      return;
+    }
+
     cancelPoller = setInterval(() => {
       isRunCancelled(job.run_id)
         .then((cancelled) => {
@@ -373,20 +303,7 @@ export async function executeRun(job: RunJob): Promise<void> {
         .catch(() => {});
     }, CANCEL_POLL_INTERVAL_MS);
 
-    if (await isRunCancelled(job.run_id)) {
-      console.log(`Run ${job.run_id} cancelled before start`);
-      const removed = await redis.srem(FLEET_ACTIVE_RUNS_KEY, job.run_id).catch(() => 0);
-      const active = await redis.scard(FLEET_ACTIVE_RUNS_KEY).catch(() => -1);
-      console.log(`[fleet-cap] SREM cancelled-before-start run=${job.run_id} removed=${removed} active=${active}`);
-      return;
-    }
-
-    await db
-      .update(schema.runs)
-      .set({ status: "running", started_at: new Date() })
-      .where(eq(schema.runs.id, job.run_id));
-
-    await emitEvent(db, job.run_id, "run_started", "Run started");
+    await emitEvent(job.run_id, "run_started", "Run started");
 
     // Already-deployed agents: run calls directly in worker process
     const isPlatformAdapter =
@@ -399,8 +316,8 @@ export async function executeRun(job: RunJob): Promise<void> {
       isPlatformAdapter ||
       !!job.agent_url;
     if (isRemote) {
-      await emitEvent(db, job.run_id, "connecting", `Connecting to remote agent (${job.adapter ?? "websocket"})...`);
-      await executeRemoteRun(db, job, cancelController.signal);
+      await emitEvent(job.run_id, "connecting", `Connecting to remote agent (${job.adapter ?? "websocket"})...`);
+      await executeRemoteRun(db, job, signal);
       return;
     }
 
@@ -412,23 +329,28 @@ export async function executeRun(job: RunJob): Promise<void> {
       throw new Error("Missing agent_session_id for local run");
     }
 
-    await emitEvent(db, job.run_id, "connecting", "Connecting to local agent via session relay...");
+    await emitEvent(job.run_id, "connecting", "Connecting to local agent via session relay...");
 
     const machineId = await getSessionMachineId(job.agent_session_id);
 
-    await executeSessionRun(db, job, machineId, cancelController.signal);
+    await executeSessionRun(job, machineId, signal);
   } catch (err) {
     const errorMessage = err instanceof Error ? err.message : "Unknown error";
-    console.error(`Failed to start run ${job.run_id}:`, errorMessage);
-    // SREM and DB update are idempotent — safe to repeat if an inner
-    // executor already cleaned up before throwing.
-    const removed = await redis.srem(FLEET_ACTIVE_RUNS_KEY, job.run_id).catch(() => 0);
-    const active = await redis.scard(FLEET_ACTIVE_RUNS_KEY).catch(() => -1);
-    console.log(`[fleet-cap] SREM outer-catch run=${job.run_id} removed=${removed} active=${active}`);
-    await db
-      .update(schema.runs)
-      .set({ status: "fail", finished_at: new Date(), error_text: errorMessage })
-      .where(eq(schema.runs.id, job.run_id));
+    console.error(`Failed to run ${job.run_id}:`, errorMessage);
+    // The API ends the run (status, run_complete). If this report
+    // is lost too, the API's stuck-run cleanup ends it later.
+    await postToApiWithRetry(
+      "/internal/run-failed",
+      { run_id: job.run_id, error_text: errorMessage.slice(0, 2000) },
+      10_000,
+      4,
+    )
+      .then((res) => {
+        if (!res.ok) console.error(`run-failed report rejected for ${job.run_id}: HTTP ${res.status}`);
+      })
+      .catch((reportErr: Error) => {
+        console.error(`run-failed report lost for ${job.run_id}: ${reportErr.message}`);
+      });
 
     throw err;
   } finally {

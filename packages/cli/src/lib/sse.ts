@@ -1,4 +1,4 @@
-import { API_BASE } from "./config.js";
+import { authenticatedFetch } from "./api.js";
 
 export interface SSEEvent {
   id?: string;
@@ -25,7 +25,7 @@ export async function* streamRunEvents(
   apiKey: string,
   signal?: AbortSignal,
 ): AsyncGenerator<SSEEvent> {
-  const url = `${API_BASE}/runs/${runId}/stream`;
+  const path = `/runs/${runId}/stream`;
   const seenIds = new Set<string>();
   let retries = 0;
 
@@ -36,8 +36,7 @@ export async function* streamRunEvents(
 
     let res: Response;
     try {
-      res = await fetch(url, {
-        headers: { Authorization: `Bearer ${apiKey}` },
+      res = await authenticatedFetch(path, apiKey, {
         signal,
       });
     } catch (err) {
@@ -46,6 +45,11 @@ export async function* streamRunEvents(
       continue;
     }
 
+    // 502-504: the API machine is restarting (deploy); another one will answer.
+    if (res.status >= 502 && res.status <= 504) {
+      retries++;
+      continue;
+    }
     if (!res.ok) {
       const body = await res.text();
       throw new Error(`SSE stream failed (${res.status}): ${body}`);

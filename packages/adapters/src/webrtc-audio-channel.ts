@@ -39,7 +39,7 @@ import { RoomAgentDispatch, RoomConfiguration } from "@livekit/protocol";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import { resample } from "@vent/voice";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, ProviderWarning, UsageEntry } from "@vent/shared";
-import { BaseAudioChannel, type SendAudioOptions } from "./audio-channel.js";
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "./audio-channel.js";
 
 interface WsToolCallEvent {
   type: "tool_call";
@@ -131,7 +131,6 @@ const LIVEKIT_USER_INPUT_TRANSCRIBED_TOPIC = "vent:user-input-transcribed";
 const LIVEKIT_SESSION_USAGE_TOPIC = "vent:session-usage";
 const LIVEKIT_TRANSCRIPTION_TOPIC = "lk.transcription";
 const LIVEKIT_AGENT_STATE_ATTR = "lk.agent.state";
-const RAW_INTERRUPT_TRAILING_SILENCE_MS = 160;
 
 export function applyLiveKitAgentStateChange(
   previousState: string | null,
@@ -229,12 +228,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
   private lastAgentState: string | null = null;
   private roomDisconnected = false;
 
-  // Agent transcript accumulator for consumeAgentText(). Each LiveKit STT
-  // segment fires an interim stream followed by a final stream, both sharing
-  // a segment_id. We only append final streams and dedup by segment_id so a
-  // retry (or a duplicate final) can't double-count.
-  private agentTextBuffer = "";
-  private finalizedAgentSegments = new Set<string>();
   // Cumulative receive-path stats, for diagnosing "agent went silent" failures.
   // Surfaced via getReceiveDiagnostics() and logged by the executor when a
   // collection times out with no speech detected.
@@ -264,7 +257,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
   // Segment-to-turn anchoring: lock each STT segment to the turn that was
   // active when the segment was first observed (interim or final).
   private segmentTurnMap = new Map<string, number>();
-  private comfortNoiseActive = false;
 
   constructor(config: WebRtcAudioChannelConfig) {
     super();
@@ -311,8 +303,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     this.disconnectReasonStr = null;
     this.agentIdentity = null;
     this.lastAgentState = null;
-    this.agentTextBuffer = "";
-    this.finalizedAgentSegments.clear();
     this.rxTracks = 0;
     this.rxFrames = 0;
     this.rxSumAbs = 0;
@@ -443,34 +433,10 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
             }
           }
         } else {
-          // Agent transcription. Per LiveKit docs, every STT segment produces
-          // TWO streams sharing a segment_id: an interim stream (while the
-          // segment is being processed) and a final stream (once complete).
-          // "Replace interim messages with the final message when
-          // lk.transcription_final is true." Accumulating both duplicates
-          // every segment's text. We still read interim streams to capture
-          // the first-token timestamp for TTFW latency, but only append
-          // content from final streams — and dedup by segment_id in case a
-          // retry produces the same final twice.
-          const isFinal = reader.info?.attributes?.["lk.transcription_final"] === "true";
-          const segmentId = reader.info?.attributes?.["lk.segment_id"];
-          let firstChunkCaptured = false;
-          const chunks: string[] = [];
-          for await (const chunk of reader) {
-            chunks.push(chunk);
-            if (!firstChunkCaptured && turn) {
-              if (!turn.firstAgentTextAt) {
-                turn.firstAgentTextAt = Date.now();
-              }
-              firstChunkCaptured = true;
-            }
-          }
-          if (!isFinal) return;
-          if (segmentId && this.finalizedAgentSegments.has(segmentId)) return;
-          if (segmentId) this.finalizedAgentSegments.add(segmentId);
-          const text = chunks.join("");
-          if (text) {
-            this.agentTextBuffer += (this.agentTextBuffer ? " " : "") + text;
+          // Agent transcription: only the time of its first chunk is used,
+          // to split LLM from TTS latency. Vent transcribes the agent itself.
+          for await (const _chunk of reader) {
+            if (turn && !turn.firstAgentTextAt) turn.firstAgentTextAt = Date.now();
           }
         }
       }
@@ -550,7 +516,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     // fires AFTER the greeting finishes, which means gating on it hides the
     // greeting and opens a first-listener race in our early-audio buffer.
     // agent.state transitions are still used for per-turn EOT elsewhere.
-    const AGENT_READY_TIMEOUT = 45_000;
     const agentReady = await new Promise<boolean>((resolve) => {
       const alreadyHasAudio = (p: RemoteParticipant) => {
         if (p.kind !== ParticipantKind.AGENT) return false;
@@ -576,7 +541,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
       const timer = setTimeout(() => {
         this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
         resolve(false);
-      }, AGENT_READY_TIMEOUT);
+      }, CONNECT_TIMEOUT_MS);
 
       // Fast-path: agent already published audio before we got here.
       for (const p of this.room!.remoteParticipants.values()) {
@@ -593,47 +558,13 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
 
     if (!agentReady) {
       throw new Error(
-        `LiveKit agent did not publish an audio track in room "${this.config.roomName}" within ${AGENT_READY_TIMEOUT / 1000}s. ` +
+        `LiveKit agent did not publish an audio track in room "${this.config.roomName}" within ${CONNECT_TIMEOUT_MS / 1000}s. ` +
         `Ensure your agent is running and connected to ${this.config.livekitUrl}. ` +
         `If your agent uses agent_name in WorkerOptions, set "agent_name" in the platform config.`
       );
     }
 
     this._stats.connectLatencyMs = Date.now() - connectStart;
-  }
-
-  /**
-   * Continuously send low-level white noise to keep Opus codec warm.
-   * Without this, Opus enters DTX mode during greeting capture (~15-30s)
-   * and when real speech arrives, bitrate ramps linearly from 0 → 40kbps
-   * over 20s — the agent's VAD never detects speech.
-   */
-  startComfortNoise(): void {
-    this.comfortNoiseActive = true;
-    const sampleRate = this.livekitSampleRate;
-    const chunkSamples = Math.floor(sampleRate * 0.02); // 20ms
-    const AMPLITUDE = 400; // ~-30dBFS — enough to keep Opus out of DTX
-
-    const sendLoop = async () => {
-      while (this.comfortNoiseActive && this.audioSource) {
-        const samples = new Int16Array(chunkSamples);
-        for (let i = 0; i < chunkSamples; i++) {
-          samples[i] = Math.floor((Math.random() * 2 - 1) * AMPLITUDE);
-        }
-        const frame = new AudioFrame(samples, sampleRate, 1, chunkSamples);
-        try {
-          await this.audioSource.captureFrame(frame);
-        } catch {
-          break; // AudioSource closed
-        }
-      }
-    };
-    sendLoop();
-  }
-
-  stopComfortNoise(): void {
-    this.comfortNoiseActive = false;
-    this.clearAudioBuffer();
   }
 
   protected override clearTransportQueue(): void {
@@ -650,7 +581,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
 
   override sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
     if (!this.audioSource || !this.collecting) return;
-    if (this.comfortNoiseActive) this.stopComfortNoise();
 
     // Track turn timing
     this.currentTurnIndex++;
@@ -784,21 +714,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
       }
     }
     return transcripts;
-  }
-
-  /** Consume accumulated real-time agent transcript text (resets buffer). */
-  consumeAgentText(): string {
-    const text = this.agentTextBuffer;
-    this.agentTextBuffer = "";
-    return text;
-  }
-
-  /** Full caller transcript for WER computation (avoids turn alignment issues). */
-  getFullCallerTranscript(): string {
-    return this.turnTimings
-      .filter(t => t.userTranscript)
-      .map(t => t.userTranscript!)
-      .join(" ");
   }
 
   /** Receive-path diagnostics. Used by executor to log rich context when a

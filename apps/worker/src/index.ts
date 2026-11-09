@@ -2,15 +2,17 @@ import IORedis from "ioredis";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { writeFileSync, mkdirSync } from "node:fs";
 import { hostname } from "node:os";
-import type { Job } from "bullmq";
-import { requireEnv } from "@vent/shared";
-import { WebhookServer } from "@vent/adapters";
-import { executeRun } from "./jobs/run-executor.js";
-import { createWorkerMetrics } from "./metrics.js";
+import { Worker, type Job } from "bullmq";
 import {
-  PerUserQueueRuntime,
-  type RunJobData,
-} from "./queue-runtime.js";
+  RUN_JOB_LOCK_DURATION_MS,
+  RUN_JOB_LOCK_RENEW_MS,
+  RUN_JOB_STALLED_INTERVAL_MS,
+  RUN_QUEUE_NAME,
+  requireEnv,
+} from "@vent/shared";
+import { checkDatabase, executeRun, LostCallLock, type RunJob } from "./jobs/run-executor.js";
+import { cancelAllCalls } from "./call-supervisor.js";
+import { createWorkerMetrics } from "./metrics.js";
 
 const LOG_DIR = "/tmp/vent-run-logs";
 try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
@@ -76,42 +78,25 @@ console.error = (...args: unknown[]) => {
 
 const machineId = process.env["FLY_MACHINE_ID"] ?? `${hostname()}-${process.pid}`;
 
-async function processRun(
-  queueName: string,
-  data: RunJobData,
-  _job: Job<RunJobData>,
-  _token: string | undefined,
-): Promise<void> {
+const lockLost = new Map<string, AbortController>();
+
+async function processRun(job: Job<RunJob>): Promise<void> {
+  const data = job.data;
+  const lost = new AbortController();
+  lockLost.set(job.id!, lost);
   console.log(
-    `[${queueName}] Processing run ${data.run_id} (adapter: ${data.adapter ?? "unknown"}${data.agent_session_id ? ", session" : ""})`,
+    `Processing run ${data.run_id} (adapter: ${data.adapter ?? "unknown"}${data.agent_session_id ? ", session" : ""})`,
   );
 
   // Capture all console output for the run so we can dump it at the end.
   // Fly only keeps the last 100 log lines — this ensures we can see the full run.
   const logLines: string[] = [];
 
-  // Note: BullMQ's LockManager auto-renews the job lock every lockDuration/2
-  // for the full duration of processing. We do NOT need a manual extendLock
-  // heartbeat — an earlier version had one and it was a redundant duplicate
-  // that just spammed Redis. maxStalledCount: 0 (in queue-runtime.ts) is
-  // what actually prevents replay-on-stall.
-
   workerMetrics.onJobStart();
   try {
-    await runLogStore.run(logLines, async () => {
-      await executeRun({
-        run_id: data.run_id,
-        user_id: data.user_id,
-        adapter: data.adapter,
-        call_spec: data.call_spec,
-        voice_config: data.voice_config,
-        start_command: data.start_command,
-        health_endpoint: data.health_endpoint,
-        agent_url: data.agent_url,
-        agent_session_id: data.agent_session_id,
-      });
-    });
+    await runLogStore.run(logLines, () => executeRun(data, lost.signal));
   } finally {
+    lockLost.delete(job.id!);
     workerMetrics.onJobFinish();
     const logPath = `${LOG_DIR}/${data.run_id}.log`;
     try {
@@ -123,29 +108,36 @@ async function processRun(
   }
 }
 
-const queueRuntime = new PerUserQueueRuntime({
-  connection,
-  workerConnection,
-  machineId,
-  totalConcurrency,
-  workerMetrics,
-  processRun,
+const worker = new Worker<RunJob>(RUN_QUEUE_NAME, processRun, {
+  connection: workerConnection,
+  concurrency: totalConcurrency,
+  lockDuration: RUN_JOB_LOCK_DURATION_MS,
+  lockRenewTime: RUN_JOB_LOCK_RENEW_MS,
+  stalledInterval: RUN_JOB_STALLED_INTERVAL_MS,
+  // Never redial a call whose lock expired. The API handles its stalled event.
+  maxStalledCount: 0,
+  removeOnComplete: { age: 3600, count: 1000 },
+  removeOnFail: { age: 86_400, count: 5000 },
+  autorun: false,
+});
+worker.on("completed", (job) => console.log(`Run ${job.id} completed`));
+worker.on("failed", (job, err) => console.error(`Run ${job?.id} failed:`, err.message));
+worker.on("error", (err) => console.error("[worker] BullMQ error:", err.message));
+// The API already failed these runs; hang up.
+worker.on("lockRenewalFailed", (jobIds) => {
+  for (const id of jobIds) {
+    console.error(`Run ${id}: could not renew its queue lock, stopping the call`);
+    lockLost.get(id)?.abort(new LostCallLock());
+  }
 });
 
+// /health stays 503 until this finishes, so a deploy whose worker can't reach
+// Postgres or Redis stops at the first machine instead of replacing them all.
 async function start() {
-  // Start persistent HTTP server for Bland webhook callbacks.
-  // Must listen at boot so Fly.io's proxy routes traffic to this machine.
-  const webhookPort = parseInt(process.env["RUNNER_LISTEN_PORT"] ?? "0", 10);
-  const webhookHost = process.env["RUNNER_PUBLIC_HOST"] ?? "";
-  if (webhookPort && webhookHost) {
-    await WebhookServer.startPersistentServer({
-      publicHost: webhookHost,
-      port: webhookPort,
-      publicPort: null, // Behind Fly reverse proxy (443 → 8443)
-    });
-  }
-
-  await queueRuntime.start();
+  await checkDatabase();
+  await worker.waitUntilReady();
+  void worker.run();
+  workerMetrics.markReady();
   console.log(
     `Vent Worker started (machine: ${machineId}, total concurrency: ${totalConcurrency})`,
   );
@@ -156,8 +148,11 @@ start().catch((err) => {
   process.exit(1);
 });
 
-// Track shutdown so we don't fire twice and so the heartbeat in processRun
-// can keep extending the BullMQ lock for in-flight calls during drain.
+// Fly sends SIGTERM, then SIGKILLs after kill_timeout (5m, apps/worker/fly.toml).
+// Calls still running this long after SIGTERM are asked to hang up, leaving
+// them the cancel grace period (45s) to stop and time to report results.
+const CANCEL_CALLS_AFTER_MS = 3 * 60_000;
+
 let shuttingDown = false;
 
 async function gracefulShutdown(signal: string): Promise<void> {
@@ -174,17 +169,21 @@ async function gracefulShutdown(signal: string): Promise<void> {
     console.log(`[shutdown] still draining (${seconds}s elapsed)...`);
   }, 15_000);
 
+  const cancelTimer = setTimeout(() => {
+    console.log("[shutdown] calls still running — asking them to hang up");
+    cancelAllCalls();
+  }, CANCEL_CALLS_AFTER_MS);
+
   try {
-    // queueRuntime.close() pauses every Worker (no new jobs accepted) and
-    // calls Worker.close() which gracefully waits for active jobs to
-    // complete before resolving. Combined with the heartbeat in processRun
-    // and Fly's kill_timeout=15m, in-flight voice calls finish naturally
-    // instead of getting hard-killed mid-conversation on every deploy.
-    await queueRuntime.close();
+    // worker.close() stops taking new calls and waits for running ones. Calls
+    // that finish within CANCEL_CALLS_AFTER_MS end normally; later ones are
+    // cancelled and still report their partial result.
+    await worker.close();
   } catch (err) {
-    console.error(`[shutdown] queueRuntime.close failed:`, (err as Error).message);
+    console.error(`[shutdown] worker.close failed:`, (err as Error).message);
   } finally {
     clearInterval(progressTimer);
+    clearTimeout(cancelTimer);
   }
 
   await workerMetrics.close().catch((err) => {

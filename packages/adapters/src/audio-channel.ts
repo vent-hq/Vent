@@ -14,6 +14,12 @@ import { Readable } from "node:stream";
 import type { ObservedToolCall, ChannelStats, CallMetadata, ComponentLatency } from "@vent/shared";
 import { resample } from "@vent/voice";
 
+/** What an adapter sends while the caller is silent. */
+export type ComfortNoiseMode = "noise" | "silence" | "none";
+
+/** Peak of the comfort noise, about -30 dBFS. */
+const COMFORT_NOISE_AMPLITUDE = 400;
+
 export interface AudioChannelEvents {
   audio: (chunk: Buffer) => void;
   error: (err: Error) => void;
@@ -32,13 +38,6 @@ export interface SendAudioOptions {
   /** When true, skip send guards (silence padding, mark await, clear).
    *  Reserved for low-level sends where timing matters. */
   raw?: boolean;
-}
-
-export interface CallRecording {
-  body: Readable;
-  contentType: string;
-  extension: string;
-  cleanup(): Promise<void>;
 }
 
 export interface LiveCallRecording {
@@ -69,50 +68,19 @@ export interface AudioChannel {
   getCallMetadata?(): Promise<CallMetadata | null>;
   /** Get per-turn component latency breakdown (STT/LLM/TTS) from platform events. */
   getComponentTimings?(): ComponentLatency[];
-  /** Get a Vent-captured call recording when the provider does not expose one natively. */
-  getCallRecording?(): Promise<CallRecording | null>;
   /** Get a live mixed PCM stream so callers can upload while the call is still in progress. */
   getLiveCallRecording?(): LiveCallRecording | null;
   /** Drop any local recording capture state when a fallback artifact is not needed. */
   discardCallRecording?(): Promise<void>;
   /** Get platform's own STT transcripts for cross-referencing with Vent's STT. */
   getTranscripts?(): Array<{ turnIndex: number; text: string }>;
-  /** Get ALL caller speech as a single concatenated string. */
-  getFullCallerTranscript?(): string;
-  /** Consume accumulated real-time agent transcript text (resets buffer). Used as STT fallback. */
-  consumeAgentText?(): string;
   /** Whether this adapter emits platformEndOfTurn events.
    *  When true, collectUntilEndOfTurn can defer to the platform signal over VAD. */
   hasPlatformEndOfTurn?: boolean;
-  /** Optional quiet window after platformEndOfTurn before Vent starts the next turn.
-   *  Some platforms signal end-of-turn slightly before playback has fully drained. */
-  platformEndOfTurnDrainMs?: number;
-  /** Grace period after platformEndOfTurn before starting the drain timer.
-   *  Some platforms (Retell) fire agent_stop_talking between sentences, not just
-   *  at end of full response. A longer settle window lets agent_start_talking
-   *  cancel the resolution before we commit. Defaults to 500ms if unset. */
-  platformEndOfTurnSettleMs?: number;
-  /** Optional continuation window after a tool call completes.
-   *  Some platforms briefly speak filler, wait for the tool result, then continue
-   *  the same assistant turn after a short pause. */
-  postToolCallContinuationMs?: number;
-  /** Optional short continuation window after VAD says end-of-turn.
-   *  Useful on platforms that sometimes pause briefly mid-thought before resuming. */
-  postVadContinuationMs?: number;
   /** Which side should speak first when the call starts. If omitted, executor defaults to agent-first. */
   getOpeningSpeaker?(): Promise<"agent" | "caller" | null>;
-  /** Expected assistant opening message, if the platform has a configured assistant-first greeting. */
-  getExpectedOpeningMessage?(): Promise<string | null>;
   /** Hard platform call limit, if the platform exposes one in its runtime config. */
   getMaxCallDurationSeconds?(): Promise<number | null>;
-  /** Optional adapter-specific normalization for caller speech before TTS/send.
-   *  Useful when a transport is sensitive to pause-heavy sentence punctuation
-   *  inside a single caller turn. */
-  normalizeCallerTextForSpeech?(text: string): string;
-  /** Adapter-preferred initial silence threshold for turn collection. */
-  preferredSilenceThresholdMs?: number;
-  /** Platform-reported concurrency limit (e.g. Vapi returns this on call creation). */
-  platformConcurrencyLimit?: number | null;
   /** Optional receive-path diagnostics snapshot. Called by the executor when a
    *  collection times out with no speech detected, to surface adapter-specific
    *  signals that help distinguish "agent went silent" failure modes (no track
@@ -124,6 +92,9 @@ export interface AudioChannel {
   once<E extends keyof AudioChannelEvents>(event: E, listener: AudioChannelEvents[E]): this;
   emit<E extends keyof AudioChannelEvents>(event: E, ...args: Parameters<AudioChannelEvents[E]>): boolean;
 }
+
+/** How long any adapter waits for a call to connect (LiveKit agents can take tens of seconds to join). */
+export const CONNECT_TIMEOUT_MS = 45_000;
 
 export abstract class BaseAudioChannel extends EventEmitter implements AudioChannel {
   protected _stats: ChannelStats = {
@@ -186,6 +157,14 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
   /** Monotonic clock for self-correcting pacing (Pipecat _write_audio_sleep). */
   private _nextSendTime = 0;
 
+  /** What to send while the caller is silent: faint noise (default), digital
+   *  silence (platforms that hear any noise as the caller talking), or nothing
+   *  (transports that keep the line alive themselves). */
+  protected comfortNoise: ComfortNoiseMode = "noise";
+  private _comfortNoiseOn = false;
+  /** Incremented to end the running comfort-noise loop. */
+  private _comfortNoiseRun = 0;
+
   abstract connect(): Promise<void>;
   abstract disconnect(): Promise<void>;
   abstract get connected(): boolean;
@@ -203,6 +182,7 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
    * size, any number of times (Pipecat-style).
    */
   sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
+    this.stopComfortNoise();
     this._stats.bytesSent += pcm.length;
     this.captureCallerAudio(pcm, performance.now() - this._connectMonotonicMs);
 
@@ -268,10 +248,55 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
     }
     this._audioDrainStopping = false;
 
-    // Resume comfort noise (if adapter implements it)
-    if ("startComfortNoise" in this && typeof (this as any).startComfortNoise === "function") {
-      (this as any).startComfortNoise();
-    }
+    this.startComfortNoise();
+  }
+
+  /**
+   * Keep the line alive while the caller is silent. Platforms otherwise treat
+   * dead air as the caller leaving ("are you still there?"), and WebRTC's Opus
+   * codec goes idle and then misses the start of the caller's next words.
+   * Runs until the caller speaks (sendAudio) or stopComfortNoise().
+   */
+  startComfortNoise(): void {
+    if (this.comfortNoise === "none" || this._comfortNoiseOn) return;
+    this._comfortNoiseOn = true;
+    const run = ++this._comfortNoiseRun;
+    const frameSamples = Math.round((this.outputSampleRate * this.frameDurationMs) / 1000);
+    const silence = new Int16Array(frameSamples);
+    // WebSocket transports send without waiting, so pace at real time;
+    // WebRTC transports (pacingIntervalMs = 0) wait inside captureFrame.
+    const clockPaced = this.pacingIntervalMs > 0;
+
+    void (async () => {
+      let next = performance.now();
+      try {
+        while (run === this._comfortNoiseRun && this.connected) {
+          const frame = this.comfortNoise === "silence" ? silence : noiseFrame(frameSamples);
+          await this.writeComfortNoiseFrame(frame, this.outputSampleRate);
+          if (!clockPaced) continue;
+          next += this.frameDurationMs;
+          const wait = next - performance.now();
+          if (wait > 0) await new Promise<void>((r) => setTimeout(r, wait));
+          else next = performance.now();
+        }
+      } catch {
+        // Transport closed
+      }
+    })();
+  }
+
+  stopComfortNoise(): void {
+    if (!this._comfortNoiseOn) return;
+    this._comfortNoiseOn = false;
+    this._comfortNoiseRun++;
+    // Drop noise the transport already buffered so speech isn't queued behind it.
+    this.clearTransportQueue();
+  }
+
+  /** Send one comfort-noise frame. Override when writeAudioFrame() also does
+   *  per-turn bookkeeping that noise must not touch. */
+  protected writeComfortNoiseFrame(samples: Int16Array, sampleRate: number): Promise<void> {
+    return this.writeAudioFrame(samples, sampleRate);
   }
 
   /** Clear both the audio buffer/queue AND the transport's internal queue.
@@ -346,10 +371,6 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
     this._recordingCapture.append("agent", pcm);
   }
 
-  async getCallRecording(): Promise<CallRecording | null> {
-    return this._recordingCapture.render();
-  }
-
   getLiveCallRecording(): LiveCallRecording | null {
     return this._recordingCapture.getLiveRecording();
   }
@@ -360,7 +381,6 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
 }
 
 type CallSide = "caller" | "agent";
-const CALL_RECORDING_SAMPLE_RATE = 24000;
 const SILENCE_AMPLITUDE_THRESHOLD = 200;
 
 /**
@@ -406,24 +426,6 @@ class CallRecordingCapture {
     }
 
     this.flushMixedAudio();
-  }
-
-  async render(): Promise<CallRecording | null> {
-    if (this.liveRecording) return null;
-
-    this.finalizeOutput();
-    const mixed = this.mixedChunks.takeAll();
-    if (mixed.length === 0) return null;
-
-    const header = createWavHeader(mixed.length, CALL_RECORDING_SAMPLE_RATE);
-    const wav = Buffer.concat([header, mixed]);
-
-    return {
-      body: Readable.from([wav]),
-      contentType: "audio/wav",
-      extension: "wav",
-      cleanup: async () => this.discard(),
-    };
   }
 
   async discard(): Promise<void> {
@@ -644,25 +646,11 @@ function mixPcm16(a: Buffer, b: Buffer, length: number): Buffer {
   return out;
 }
 
-function createWavHeader(dataSize: number, sampleRate: number): Buffer {
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-  const blockAlign = numChannels * (bitsPerSample / 8);
-
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-  return header;
+/** One frame of faint white noise. */
+function noiseFrame(samples: number): Int16Array {
+  const frame = new Int16Array(samples);
+  for (let i = 0; i < samples; i++) {
+    frame[i] = Math.floor((Math.random() * 2 - 1) * COMFORT_NOISE_AMPLITUDE);
+  }
+  return frame;
 }

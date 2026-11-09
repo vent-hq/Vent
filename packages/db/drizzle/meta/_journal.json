@@ -155,6 +155,41 @@
       "when": 1794038950967,
       "tag": "0021_store_run_platform_config",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1794196818011,
+      "tag": "0022_runs_open_index",
+      "breakpoints": true
+    },
+    {
+      "idx": 23,
+      "version": "7",
+      "when": 1794198584817,
+      "tag": "0023_drop_trace_ref",
+      "breakpoints": true
+    },
+    {
+      "idx": 24,
+      "version": "7",
+      "when": 1794204195252,
+      "tag": "0024_runs_test_spec_not_null",
+      "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1794213506918,
+      "tag": "0025_drop_scenario_trace_json",
+      "breakpoints": true
+    },
+    {
+      "idx": 26,
+      "version": "7",
+      "when": 1794213915246,
+      "tag": "0026_drop_unused_schema",
+      "breakpoints": true
     }
   ]
 }

@@ -1,19 +1,36 @@
-import type { FastifyInstance } from "fastify";
-import { eq, and, inArray } from "drizzle-orm";
+import type { FastifyInstance, FastifyRequest } from "fastify";
+import { eq, and } from "drizzle-orm";
 import { schema } from "@vent/db";
-import { broadcast, subscribeToRun } from "../lib/run-subscribers.js";
+import { subscribeToRun } from "../lib/run-subscribers.js";
+import { finalizeRun } from "../lib/finalize-run.js";
 import { RunSubmitSchema, submitRun, SubmitRunConfigError, FleetCapacityError } from "../lib/run-submit.js";
-import { FLEET_ACTIVE_RUNS_KEY } from "@vent/shared";
+import { ipKey } from "../plugins/rate-limit.js";
 
 export async function runRoutes(app: FastifyInstance) {
   const accessTokenPreHandler = { preHandler: app.verifyAccessToken };
 
+  // A request whose access token verifies is limited per user, wherever it
+  // connects from, so users behind one IP (CI runners) don't share a budget.
+  // Anything else, including forged tokens, is limited per connecting IP.
+  const userOrIpKey = async (request: FastifyRequest) => {
+    const userId = await app.accessTokenUserId(request);
+    return userId ? `user:${userId}` : ipKey(request);
+  };
+
+  // A CLI waits on its run's stream until run_complete, so the stream never
+  // ends by itself and would hold shutdown open. End them first: the CLI
+  // reconnects to another API machine and replays the events it missed.
+  const openStreams = new Set<() => void>();
+  let closing = false;
+  app.addHook("preClose", async () => {
+    closing = true;
+    for (const end of [...openStreams]) end();
+  });
+
   // --- Submit a run with full call config (used by CLI) ---
   app.post("/runs/submit", {
     ...accessTokenPreHandler,
-    // 60 submits/minute per user is plenty for legitimate iteration; caps a
-    // misbehaving CLI loop before it floods BullMQ + the worker.
-    config: { rateLimit: { max: 60, timeWindow: "1 minute" } },
+    config: { rateLimit: { max: 50, timeWindow: "1 minute", keyGenerator: userOrIpKey } },
   }, async (request, reply) => {
     const parsed = RunSubmitSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -53,7 +70,10 @@ export async function runRoutes(app: FastifyInstance) {
   });
 
   // --- Stream run events (SSE) ---
-  app.get<{ Params: { id: string } }>("/runs/:id/stream", accessTokenPreHandler, async (request, reply) => {
+  app.get<{ Params: { id: string } }>("/runs/:id/stream", {
+    ...accessTokenPreHandler,
+    config: { rateLimit: { max: 300, timeWindow: "1 minute", keyGenerator: userOrIpKey } },
+  }, async (request, reply) => {
     const { id } = request.params;
 
     const [run] = await app.db
@@ -94,9 +114,13 @@ export async function runRoutes(app: FastifyInstance) {
     const finish = () => {
       if (streamEnded) return;
       streamEnded = true;
+      openStreams.delete(finish);
       unsubscribe?.();
       reply.raw.end();
     };
+    // A stream that reached this point after shutdown began ends right away.
+    if (closing) return finish();
+    openStreams.add(finish);
 
     const handleEvent = (event: Record<string, unknown>) => {
       // Hard guard: once finish() has been called the underlying stream is
@@ -112,7 +136,7 @@ export async function runRoutes(app: FastifyInstance) {
         seenIds.add(eid);
       }
       write(event);
-      if (event.event_type === "run_complete" || event.event_type === "run_cancelled") {
+      if (event.event_type === "run_complete") {
         finish();
       }
     };
@@ -127,6 +151,8 @@ export async function runRoutes(app: FastifyInstance) {
         }
       } catch { /* ignore malformed */ }
     });
+    // Shutdown can end the stream while it is still being set up.
+    if (streamEnded) return unsubscribe();
 
     // Replay historical events from DB
     const history = await app.db
@@ -134,6 +160,7 @@ export async function runRoutes(app: FastifyInstance) {
       .from(schema.runEvents)
       .where(eq(schema.runEvents.run_id, id))
       .orderBy(schema.runEvents.created_at);
+    if (streamEnded) return;
 
     let historyTerminal = false;
     for (const evt of history) {
@@ -146,7 +173,7 @@ export async function runRoutes(app: FastifyInstance) {
         metadata_json: evt.metadata_json,
         created_at: evt.created_at.toISOString(),
       });
-      if (evt.event_type === "run_complete" || evt.event_type === "run_cancelled") {
+      if (evt.event_type === "run_complete") {
         historyTerminal = true;
       }
     }
@@ -257,84 +284,32 @@ export async function runRoutes(app: FastifyInstance) {
         });
       }
 
-      const now = new Date();
-
-      if (run.status === "queued") {
-        // Try to remove from BullMQ before it gets picked up
-        try {
-          const job = await app.getRunQueue(request.userId!).getJob(id);
-          if (job) await job.remove();
-        } catch {
-          // Job may already be processing — that's fine
-        }
-      }
-
-      // Signal worker to skip the run if it was just picked up but has not
-      // started execution yet. This closes the race where BullMQ has the job
-      // active but the DB row still looks queued.
+      // Flag first: if a worker has (or is about to claim) the run, it aborts
+      // the call, hangs up, and ends the run as cancelled itself.
       await app.redis.set(`vent:cancelled:${id}`, "1", "EX", 600);
 
-      // Release fleet capacity slot (idempotent)
-      const removed = await app.redis.srem(FLEET_ACTIVE_RUNS_KEY, id).catch(() => 0);
-      const activeAfter = await app.redis.scard(FLEET_ACTIVE_RUNS_KEY).catch(() => -1);
-      console.log(`[fleet-cap] SREM cancel run=${id} removed=${removed} active=${activeAfter}`);
-
-      // Update DB status — guard on prior state. Without this, a concurrent
-      // runner-callback that flipped the run to pass/fail would be silently
-      // overwritten back to cancelled, and the dashboard would show the
-      // wrong terminal state. UPDATE returns the rows it actually changed
-      // so we can detect the race and respond honestly.
-      const updated = await app.db
-        .update(schema.runs)
-        .set({
-          status: "cancelled",
-          finished_at: now,
-          error_text: "Cancelled by user",
-        })
-        .where(
-          and(
-            eq(schema.runs.id, id),
-            inArray(schema.runs.status, ["queued", "running"]),
-          ),
-        )
-        .returning({ id: schema.runs.id });
-
-      if (updated.length === 0) {
-        // Run terminated between our SELECT and UPDATE (callback won the
-        // race). Re-read the actual current status and report honestly.
+      const ended = await finalizeRun(app, {
+        runId: id,
+        status: "cancelled",
+        from: ["queued"],
+        errorText: "Cancelled by user",
+      });
+      if (!ended) {
         const [current] = await app.db
           .select({ status: schema.runs.status })
           .from(schema.runs)
           .where(eq(schema.runs.id, id))
           .limit(1);
+        if (current?.status === "running") {
+          return reply.status(202).send({ id, status: "cancelling" });
+        }
         return reply.status(409).send({
-          error: `Run completed before cancel could be applied`,
+          error: `Run already ${current?.status ?? "ended"}`,
           status: current?.status ?? "unknown",
         });
       }
 
-      // Emit cancellation event for SSE subscribers — only if we actually
-      // applied the cancel. Otherwise the dashboard would see a phantom
-      // "cancelled" event for a run that finished successfully. Capture
-      // the inserted row's id and include it in the broadcast so SSE
-      // clients can dedupe between the history replay and the live event.
-      const [inserted] = await app.db
-        .insert(schema.runEvents)
-        .values({
-          run_id: id,
-          event_type: "run_cancelled",
-          message: "Run cancelled by user",
-        })
-        .returning();
-
-      broadcast(id, {
-        id: inserted!.id,
-        run_id: id,
-        event_type: "run_cancelled",
-        message: "Run cancelled by user",
-        created_at: inserted!.created_at.toISOString(),
-      });
-
+      await app.runQueue.remove(id).catch(() => 0);
       return reply.send({ id, status: "cancelled" });
     }
   );

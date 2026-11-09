@@ -1,4 +1,5 @@
-import { loadAccessToken, saveAccessToken, API_BASE } from "../lib/config.js";
+import { loadAccessToken, saveCredentials, API_BASE } from "../lib/config.js";
+import { AccessCredentialsSchema } from "@vent/shared";
 import { detectGitHubToken } from "../lib/github.js";
 import { deviceAuthFlow } from "../lib/auth.js";
 import { printError, printInfo, printSuccess } from "../lib/output.js";
@@ -30,12 +31,10 @@ export async function initCommand(): Promise<number> {
         });
 
         if (res.ok) {
-          const { access_token, username } = (await res.json()) as {
-            access_token?: string;
-            username: string;
-          };
-          if (!access_token) throw new Error("Missing access token");
-          await saveAccessToken(access_token);
+          const data = await res.json() as { username: string };
+          const credentials = AccessCredentialsSchema.parse(data);
+          const username = data.username;
+          await saveCredentials(credentials);
           printSuccess(`Authenticated as @${username} (via GitHub).`, {
             force: true,
           });

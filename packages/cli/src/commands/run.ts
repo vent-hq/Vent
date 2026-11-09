@@ -1,6 +1,7 @@
 import * as fs from "node:fs/promises";
 import type { PlatformConfig } from "@vent/shared";
 import { apiFetch, ApiError } from "../lib/api.js";
+import { submitRun } from "../lib/submit-run.js";
 import { streamRunEvents } from "../lib/sse.js";
 import { printEvent, printError, printInfo, printSummary, printWarn } from "../lib/output.js";
 import { loadAccessToken } from "../lib/config.js";
@@ -18,13 +19,6 @@ interface RunArgs {
 }
 
 export async function runCommand(args: RunArgs): Promise<number> {
-  // 1. Resolve Vent access token
-  const accessToken = await loadAccessToken();
-  if (!accessToken) {
-    printError("No Vent access token found. Set VENT_ACCESS_TOKEN, run `npx vent-hq login`, or pass --access-token.");
-    return 2;
-  }
-
   // 2. Parse suite file and extract call
   let config: unknown;
   try {
@@ -96,6 +90,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
     return 2;
   }
 
+  const accessToken = await loadAccessToken();
+  if (!accessToken) {
+    printError("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
+    return 2;
+  }
+
   // 3. Submit run
   printInfo("Submitting run…");
   let submitResult: {
@@ -104,13 +104,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   };
 
   try {
-    const res = await apiFetch("/runs/submit", accessToken, {
-      method: "POST",
-      body: JSON.stringify({
-        config,
-        agent_session_id: args.session,
-      }),
-    });
+    const res = await submitRun(accessToken, { config, agent_session_id: args.session });
     submitResult = await res.json() as typeof submitResult;
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) {
@@ -169,17 +163,12 @@ export async function runCommand(args: RunArgs): Promise<number> {
 
       if (event.event_type === "run_complete") {
         runCompleteData = meta;
-        // Exit code reflects pipeline completion only, not mission success.
-        // 0 = every call ran end-to-end through the pipeline; 1 = at least
-        // one call errored at the pipeline level; 2 = harness error (set
-        // elsewhere). Mission success is the coding agent's judgment from
-        // the transcript — not something Vent claims to know.
-        const anyCallErrored = callResults.some((e) => {
-          const callMeta = (e.metadata_json ?? {}) as Record<string, unknown>;
-          const callStatus = callMeta["status"];
-          return callStatus === "error";
-        });
-        exitCode = anyCallErrored ? 1 : 0;
+        // Exit code reflects pipeline completion only, not mission success:
+        // 0 = the run passed (every call ran end to end), 1 = it didn't
+        // (a call errored, the run failed or was cancelled), 2 = the result
+        // stream was lost (set below). Mission success is the coding agent's
+        // judgment from the transcript.
+        exitCode = meta["status"] === "pass" ? 0 : 1;
       }
 
       if (event.event_type === "error") {
@@ -200,12 +189,14 @@ export async function runCommand(args: RunArgs): Promise<number> {
   // 5. Print summary
   if (runCompleteData) {
     let rawRunDetails: Record<string, unknown> | null = null;
-    if (args.verbose && !isTTY) {
+    // The stored run is the source of truth: fetch it when asked for detail,
+    // or when the call result never arrived on the stream.
+    if ((args.verbose && !isTTY) || callResults.length === 0) {
       try {
         const res = await apiFetch(`/runs/${run_id}`, accessToken);
         rawRunDetails = (await res.json()) as Record<string, unknown>;
       } catch {
-        printWarn("Verbose result fetch failed; falling back to streamed summary.");
+        printWarn("Run result fetch failed; showing the streamed summary only.");
       }
     }
 

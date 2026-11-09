@@ -61,8 +61,10 @@ export function validateResolvedPlatformConfig(platform: PlatformConfig): void {
       return;
     case "bland":
       if (!platform.bland_api_key) throw requiredFieldError("bland_api_key", platform.provider);
-      if (!platform.bland_pathway_id && !platform.task && !platform.persona_id) {
-        throw new Error("Bland configuration requires bland_pathway_id, persona_id, or task");
+      // Each test call creates a Bland web agent, which has no persona field:
+      // the instructions must come from a pathway or a task prompt.
+      if (!platform.bland_pathway_id && !platform.task) {
+        throw new Error("Bland configuration requires bland_pathway_id or task (a persona_id alone gives the agent no instructions)");
       }
       return;
   }

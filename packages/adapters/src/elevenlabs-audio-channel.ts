@@ -11,7 +11,6 @@
  *   3. disconnect() — leaves room, ElevenLabs manages cleanup
  *   4. getCallData() — fetches tool calls via SDK conversations.get()
  *   5. getCallMetadata() — cost, duration, analysis
- *   6. getCallRecording() — fetches native post-call audio via SDK conversations.audio.get()
  *   7. getComponentTimings() — LLM TTFB from transcript turn metrics
  *   8. getTranscripts() — platform STT transcripts for cross-referencing
  *
@@ -40,13 +39,11 @@ import {
   type RemoteTrackPublication,
   type RemoteParticipant,
 } from "@livekit/rtc-node";
-import { Readable } from "node:stream";
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, CostBreakdown, ProviderWarning, UsageEntry } from "@vent/shared";
 import { resample } from "@vent/voice";
-import { BaseAudioChannel, type CallRecording, type SendAudioOptions } from "./audio-channel.js";
-
-const RAW_INTERRUPT_TRAILING_SILENCE_MS = 160;
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "./audio-channel.js";
+import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
 
 export interface ElevenLabsAudioChannelConfig {
   apiKey: string;
@@ -58,36 +55,14 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
   private static readonly ELEVENLABS_API_ORIGIN = "https://api.elevenlabs.io";
   private static readonly AGENT_IDENTITY_PREFIX = "agent";
   private static readonly LIVEKIT_SAMPLE_RATE = 48000;
-  private static readonly AGENT_READY_TIMEOUT = 30_000;
 
   /** Send user_activity keep-alive every 20s to prevent ElevenLabs turn timeout.
    *  ElevenLabs docs recommend 30-60s; we use 20s for safety margin. */
   private static readonly USER_ACTIVITY_INTERVAL_MS = 20_000;
 
-  /** Max amplitude below which a frame is considered silent.
-   *  TTS output is clean digital audio — near-zero means no speech.
-   *  Pipecat uses 20; slightly generous for WebRTC codec floor noise. */
-  private static readonly SILENCE_MAX_AMPLITUDE = 30;
-
-  /** Continuous silence (ms) before emitting platformEndOfTurn.
-   *  Matches Pipecat's BOT_VAD_STOP_SECS (0.35s). */
-  private static readonly SILENCE_DURATION_MS = 350;
-
-  /** If no audio frames arrive for this long, force platformEndOfTurn.
-   *  Bumped from Pipecat's 3s default to 5s to tolerate brief network/codec
-   *  hiccups mid-utterance — a 3s gap during a long agent response was
-   *  triggering false EOT before the rest of the utterance arrived. */
-  private static readonly NO_FRAMES_FALLBACK_MS = 5_000;
-
-  /** ElevenLabs has no explicit "agent stopped talking" signal — we detect
-   *  it from audio silence, mirroring their SDK's playback-drain approach. */
-  hasPlatformEndOfTurn = true;
-
-  /** Audio has already drained by the time silence is detected — no extra wait. */
-  platformEndOfTurnDrainMs = 0;
-
-  /** Settle window for TTS sentence gaps. Combined with 350ms silence = ~950ms total. */
-  platformEndOfTurnSettleMs = 1500;
+  /** ElevenLabs has no "agent stopped talking" signal, so Vent's own voice
+   *  detection decides when the agent's turn ends. */
+  hasPlatformEndOfTurn = false;
 
   private config: ElevenLabsAudioChannelConfig;
   private client: ElevenLabsClient;
@@ -97,7 +72,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
   private audioSource: AudioSource | null = null;
   private localTrack: LocalAudioTrack | null = null;
   private collecting = false;
-  private comfortNoiseActive = false;
 
   // Call state
   private conversationId: string | null = null;
@@ -105,8 +79,7 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
   private connectTimestamp = 0;
   private disconnectTimestamp = 0;
 
-  // Real-time agent text from DataChannel events
-  private agentTextBuffer = "";
+  // Live data-channel backups, used when the post-call fetch fails
   private realtimeUserTranscripts: string[] = [];
   private realtimeToolCalls: ObservedToolCall[] = [];
   private realtimeToolCallIndexById = new Map<string, number>();
@@ -116,11 +89,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
 
   // user_activity keep-alive to prevent ElevenLabs turn timeout
   private _userActivityTimer: ReturnType<typeof setInterval> | null = null;
-
-  // Agent audio silence detection (mirrors ElevenLabs SDK playback-drain detection)
-  private _agentSpeaking = false;
-  private _silenceStartedAt: number | null = null;
-  private _noFramesFallbackTimer: ReturnType<typeof setTimeout> | null = null;
 
   protected override outputSampleRate = ElevenLabsAudioChannel.LIVEKIT_SAMPLE_RATE;
 
@@ -174,7 +142,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
     this.connectTimestamp = Date.now();
     this._connectTimestampMs = this.connectTimestamp;
     this._connectMonotonicMs = performance.now();
-    this.agentTextBuffer = "";
     this.realtimeUserTranscripts = [];
     this.realtimeToolCalls = [];
     this.realtimeToolCallIndexById.clear();
@@ -260,7 +227,7 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
       const timer = setTimeout(() => {
         this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
         resolve(false);
-      }, ElevenLabsAudioChannel.AGENT_READY_TIMEOUT);
+      }, CONNECT_TIMEOUT_MS);
 
       // Check if already subscribed
       for (const p of this.room!.remoteParticipants.values()) {
@@ -281,7 +248,7 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
 
     if (!agentReady) {
       throw new Error(
-        `ElevenLabs agent did not publish audio within ${ElevenLabsAudioChannel.AGENT_READY_TIMEOUT / 1000}s. ` +
+        `ElevenLabs agent did not publish audio within ${CONNECT_TIMEOUT_MS / 1000}s. ` +
         `Ensure the agent (${this.config.agentId}) is configured correctly in ElevenLabs.`
       );
     }
@@ -304,41 +271,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
     this._stats.connectLatencyMs = Date.now() - connectStart;
   }
 
-  // ── Comfort noise ──────────────────────────────────────────────
-
-  /**
-   * Send low-level white noise to prevent Opus DTX mode.
-   * Without this, Opus ramps bitrate from 0 → 40kbps over 20s when
-   * real speech arrives after silence — the agent's VAD misses it.
-   */
-  startComfortNoise(): void {
-    this.comfortNoiseActive = true;
-    const sampleRate = ElevenLabsAudioChannel.LIVEKIT_SAMPLE_RATE;
-    const chunkSamples = Math.floor(sampleRate * 0.02); // 20ms
-    const AMPLITUDE = 400; // ~-30dBFS
-
-    const sendLoop = async () => {
-      while (this.comfortNoiseActive && this.audioSource) {
-        const samples = new Int16Array(chunkSamples);
-        for (let i = 0; i < chunkSamples; i++) {
-          samples[i] = Math.floor((Math.random() * 2 - 1) * AMPLITUDE);
-        }
-        const frame = new AudioFrame(samples, sampleRate, 1, chunkSamples);
-        try {
-          await this.audioSource.captureFrame(frame);
-        } catch {
-          break; // AudioSource closed
-        }
-      }
-    };
-    sendLoop();
-  }
-
-  stopComfortNoise(): void {
-    this.comfortNoiseActive = false;
-    this.clearAudioBuffer();
-  }
-
   protected override clearTransportQueue(): void {
     this.audioSource?.clearQueue();
   }
@@ -355,7 +287,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
 
   override sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
     if (!this.audioSource || !this.collecting) return;
-    if (this.comfortNoiseActive) this.stopComfortNoise();
     super.sendAudio(pcm, opts);
   }
 
@@ -366,12 +297,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
       clearInterval(this._userActivityTimer);
       this._userActivityTimer = null;
     }
-    if (this._noFramesFallbackTimer) {
-      clearTimeout(this._noFramesFallbackTimer);
-      this._noFramesFallbackTimer = null;
-    }
-    this._agentSpeaking = false;
-    this._silenceStartedAt = null;
     this.disconnectTimestamp = Date.now();
     if (this.audioSource) {
       await this.audioSource.close();
@@ -400,11 +325,11 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
   async getCallMetadata(): Promise<CallMetadata | null> {
     const data = await this.fetchConversation();
     if (!data) {
-      const providerWarnings = this.realtimeProviderWarnings.length > 0
-        ? dedupeProviderWarnings(this.realtimeProviderWarnings)
-        : undefined;
+      const providerWarnings = dedupeProviderWarnings([
+        callDataUnavailableWarning("ElevenLabs"),
+        ...this.realtimeProviderWarnings,
+      ]);
       const providerMetadata = compactRealtimeProviderMetadata(this.realtimeProviderMetadata);
-      if (!this.conversationId && !providerWarnings && !providerMetadata) return null;
       return {
         platform: "elevenlabs",
         provider_call_id: this.conversationId ?? undefined,
@@ -417,8 +342,7 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
     const charging = meta?.charging as Record<string, unknown> | undefined;
     const analysis = data.analysis as Record<string, unknown> | undefined;
 
-    // ElevenLabs cost unit is undocumented — llm_price appears to be USD,
-    // call_charge unit is unclear. Pass through what we can.
+    // `cost` is provider credits; only cost_fiat is the conversation total in USD.
     const costBreakdown: CostBreakdown | undefined = charging ? {
       llm_usd: charging.llmPrice as number | undefined,
     } : undefined;
@@ -433,7 +357,7 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
       platform: "elevenlabs",
       provider_call_id: (data.conversationId as string | undefined) || this.conversationId || undefined,
       ended_reason: meta?.terminationReason as string | undefined,
-      cost_usd: meta?.cost as number | undefined,
+      cost_usd: typeof meta?.costFiat === "number" ? meta.costFiat : undefined,
       cost_breakdown: costBreakdown,
       usage: extractElevenLabsUsage(data),
       provider_warnings: providerWarnings,
@@ -444,34 +368,11 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
         has_response_audio: data.hasResponseAudio,
         phone_call: meta?.phoneCall,
         rag_usage: meta?.ragUsage,
+        cost_credits: meta?.cost,
         data_collection_results: analysis?.dataCollectionResults,
       }),
       transfers: extractElevenLabsTransfers(data),
     };
-  }
-
-  async getCallRecording(): Promise<CallRecording | null> {
-    const data = await this.fetchConversation();
-    const hasNativeAudio = data?.hasAudio === true
-      || data?.hasUserAudio === true
-      || data?.hasResponseAudio === true;
-
-    if (this.conversationId && hasNativeAudio) {
-      try {
-        const response = await this.client.conversationalAi.conversations.audio.get(this.conversationId).withRawResponse();
-        const contentType = response.rawResponse.headers.get("content-type") ?? "audio/mpeg";
-        return {
-          body: Readable.fromWeb(response.data),
-          contentType,
-          extension: inferElevenLabsAudioExtension(contentType),
-          cleanup: async () => {},
-        };
-      } catch {
-        return super.getCallRecording();
-      }
-    }
-
-    return super.getCallRecording();
   }
 
   getComponentTimings(): ComponentLatency[] {
@@ -496,18 +397,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
     return transcripts;
   }
 
-  /** Full caller transcript for WER computation (avoids turn alignment issues). */
-  getFullCallerTranscript(): string {
-    return extractElevenLabsCallerTranscript(this.cachedConversation) || this.realtimeUserTranscripts.join(" ");
-  }
-
-  /** Consume accumulated real-time agent transcript text (resets buffer). */
-  consumeAgentText(): string {
-    const text = this.agentTextBuffer;
-    this.agentTextBuffer = "";
-    return text;
-  }
-
   // ── Private helpers ────────────────────────────────────────────
 
   private handleDataEvent(payload: Uint8Array): void {
@@ -526,52 +415,9 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
           break;
         }
 
-        case "agent_response": {
-          // Real-time agent text: { agent_response_event: { agent_response: "..." } }
-          const evt = event.agent_response_event as { agent_response?: string } | undefined;
-          if (evt?.agent_response) {
-            this.agentTextBuffer += (this.agentTextBuffer ? " " : "") + evt.agent_response;
-          }
-          // Agent speaking → emit speech start
+        case "agent_response":
           this.emit("platformSpeechStart");
           break;
-        }
-
-        case "agent_response_correction": {
-          // Per ElevenLabs SDK: this event carries both `original_agent_response`
-          // and `corrected_agent_response`. It is a REPLACE, not an append —
-          // the corrected version supersedes the original. Appending both
-          // duplicates the text in the buffer (prior bug). Find the trailing
-          // occurrence of the original and swap it for the corrected version.
-          const evt = event.agent_response_correction_event as Record<string, unknown> | undefined;
-          const original = firstString(
-            evt?.original_agent_response,
-            event.original_agent_response,
-          )?.trim();
-          const corrected = firstString(
-            evt?.corrected_agent_response,
-            evt?.agent_response,
-            event.corrected_agent_response,
-            event.agent_response,
-          )?.trim();
-          if (!corrected) break;
-          if (original && this.agentTextBuffer.endsWith(original)) {
-            this.agentTextBuffer = this.agentTextBuffer.slice(0, -original.length) + corrected;
-          } else if (original && this.agentTextBuffer.includes(original)) {
-            // Rare: correction targets a non-trailing prior response (the
-            // agent self-corrected after more text already arrived). Replace
-            // the last occurrence.
-            const idx = this.agentTextBuffer.lastIndexOf(original);
-            this.agentTextBuffer =
-              this.agentTextBuffer.slice(0, idx) +
-              corrected +
-              this.agentTextBuffer.slice(idx + original.length);
-          } else {
-            // No original given or not found — append as a standalone turn.
-            this.agentTextBuffer += (this.agentTextBuffer ? " " : "") + corrected;
-          }
-          break;
-        }
 
         case "user_transcript": {
           const evt = firstRecord(
@@ -641,14 +487,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
 
         case "agent_tool_response": {
           this.finalizeRealtimeToolCall(event);
-          break;
-        }
-
-        case "interruption": {
-          // Agent was interrupted — signals end of agent turn
-          this._agentSpeaking = false;
-          this._silenceStartedAt = null;
-          this.emit("platformEndOfTurn");
           break;
         }
 
@@ -853,28 +691,20 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
     ]);
   }
 
-  private async fetchConversation(): Promise<Record<string, unknown> | null> {
-    if (this.cachedConversation) return this.cachedConversation;
-    if (!this.conversationId) return null;
+  private conversationData?: Promise<Record<string, unknown> | null>;
 
-    // Poll with backoff — ElevenLabs transitions through "processing" before "done"
-    const delays = [500, 1000, 2000];
-    for (const delay of delays) {
-      await sleep(delay);
-      try {
-        const data = await this.client.conversationalAi.conversations.get(this.conversationId) as unknown as Record<string, unknown>;
-        const status = data.status as string | undefined;
-        const transcript = data.transcript as unknown[] | undefined;
-        if (status === "done" || status === "failed" || (transcript && transcript.length > 0)) {
-          this.cachedConversation = data;
-          return data;
-        }
-      } catch {
-        continue;
-      }
-    }
-    return null;
+  /** One shared fetch per call. ElevenLabs reports "processing" until the conversation is final. */
+  private fetchConversation(): Promise<Record<string, unknown> | null> {
+    if (!this.conversationId) return Promise.resolve(null);
+    const conversationId = this.conversationId;
+    this.conversationData ??= pollUntilReady(
+      "elevenlabs-postcall",
+      async () => await this.client.conversationalAi.conversations.get(conversationId) as unknown as Record<string, unknown>,
+      (data) => data.status === "done" || data.status === "failed",
+    ).then((data) => (this.cachedConversation = data));
+    return this.conversationData;
   }
+
 
   private parseToolCalls(data: Record<string, unknown>): ObservedToolCall[] {
     const messages = data.transcript as Array<Record<string, unknown>> | undefined;
@@ -947,65 +777,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
     return toolCalls;
   }
 
-  // ── Agent audio silence detection ──────────────────────────────
-
-  /** Check if a PCM frame is effectively silent (max amplitude below threshold). */
-  private static isSilentFrame(pcm: Buffer): boolean {
-    const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
-    let maxAmp = 0;
-    for (let i = 0; i < int16.length; i++) {
-      const abs = int16[i]! < 0 ? -int16[i]! : int16[i]!;
-      if (abs > maxAmp) maxAmp = abs;
-    }
-    return maxAmp < ElevenLabsAudioChannel.SILENCE_MAX_AMPLITUDE;
-  }
-
-  /**
-   * Monitor incoming agent audio for silence → emit platformEndOfTurn / platformSpeechStart.
-   * Mirrors ElevenLabs SDK's playback-drain detection and Pipecat's BOT_VAD_STOP pattern.
-   */
-  private processAgentAudioSilence(pcm24k: Buffer): void {
-    const now = Date.now();
-    this.resetNoFramesFallback();
-
-    const silent = ElevenLabsAudioChannel.isSilentFrame(pcm24k);
-
-    if (silent) {
-      if (this._agentSpeaking) {
-        if (this._silenceStartedAt === null) {
-          this._silenceStartedAt = now;
-        }
-        if (now - this._silenceStartedAt >= ElevenLabsAudioChannel.SILENCE_DURATION_MS) {
-          this._agentSpeaking = false;
-          this._silenceStartedAt = null;
-          this.emit("platformEndOfTurn");
-        }
-      }
-    } else {
-      this._silenceStartedAt = null;
-      if (!this._agentSpeaking) {
-        this._agentSpeaking = true;
-        this.emit("platformSpeechStart");
-      }
-    }
-  }
-
-  /** Reset the no-frames fallback timer. If no frames arrive for 3s while
-   *  agent is speaking, force platformEndOfTurn as a safety net. */
-  private resetNoFramesFallback(): void {
-    if (this._noFramesFallbackTimer) {
-      clearTimeout(this._noFramesFallbackTimer);
-    }
-    if (!this.collecting) return;
-    this._noFramesFallbackTimer = setTimeout(() => {
-      this._noFramesFallbackTimer = null;
-      if (!this.collecting || !this._agentSpeaking) return;
-      this._agentSpeaking = false;
-      this._silenceStartedAt = null;
-      this.emit("platformEndOfTurn");
-    }, ElevenLabsAudioChannel.NO_FRAMES_FALLBACK_MS);
-  }
-
   private startReadingTrack(track: RemoteTrack): void {
     const sampleRate = ElevenLabsAudioChannel.LIVEKIT_SAMPLE_RATE;
     const stream = new AudioStream(track, sampleRate, 1);
@@ -1026,7 +797,6 @@ export class ElevenLabsAudioChannel extends BaseAudioChannel {
           // Resample from LiveKit 48kHz → 24kHz for consumers
           const pcm24k = resample(frameBuffer, sampleRate, 24000);
           this.captureAgentAudio(pcm24k, performance.now() - this._connectMonotonicMs);
-          this.processAgentAudioSilence(pcm24k);
           this.emit("audio", pcm24k);
         }
       } catch (err) {
@@ -1403,26 +1173,6 @@ function resolveElevenLabsRealtimeToolPayload(
   }
 }
 
-function inferElevenLabsAudioExtension(contentType: string): string {
-  const normalized = contentType.split(";")[0]?.trim().toLowerCase();
-  switch (normalized) {
-    case "audio/wav":
-    case "audio/x-wav":
-      return "wav";
-    case "audio/ogg":
-      return "ogg";
-    case "audio/webm":
-      return "webm";
-    case "audio/mp4":
-    case "audio/aac":
-      return "m4a";
-    case "audio/mpeg":
-    case "audio/mp3":
-    default:
-      return "mp3";
-  }
-}
-
 export function extractElevenLabsTransfers(data: Record<string, unknown>): CallTransfer[] | undefined {
   const messages = data.transcript as Array<Record<string, unknown>> | undefined;
   if (!messages) return undefined;
@@ -1478,16 +1228,6 @@ export function extractElevenLabsTransfers(data: Record<string, unknown>): CallT
   }
 
   return transfers.length > 0 ? transfers : undefined;
-}
-
-export function extractElevenLabsCallerTranscript(data: Record<string, unknown> | null | undefined): string {
-  const transcript = data?.transcript as Array<Record<string, unknown>> | undefined;
-  if (!transcript) return "";
-
-  return transcript
-    .filter((msg) => msg.role === "user" && typeof msg.message === "string")
-    .map((msg) => msg.message as string)
-    .join(" ");
 }
 
 function isElevenLabsTransferTool(name: string): boolean {
@@ -1563,8 +1303,4 @@ function classifyElevenLabsResultToken(token: string): CallTransfer["status"] | 
     return "failed";
   }
   return null;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

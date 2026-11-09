@@ -140,6 +140,9 @@ function printRunComplete(meta: Record<string, unknown>): void {
   if (total != null) {
     stdoutSync(`${total} call${total === 1 ? "" : "s"} ran\n`);
   }
+  if (typeof meta.error_text === "string") {
+    stdoutSync(red(`Run ${String(meta.status ?? "ended")}: ${meta.error_text}`) + "\n");
+  }
 }
 
 export function printSummary(
@@ -171,10 +174,14 @@ export function printSummary(
   const counts = agg?.conversation_calls;
   const summaryData = buildRunSummaryJson({
     runId,
+    status: runComplete.status,
     total: runComplete.total_calls ?? counts?.total,
     formattedCalls: allCalls,
     verbose: options.verbose,
-    runDetails: options.runDetails ?? { aggregate: runComplete.aggregate },
+    runDetails: options.runDetails ?? {
+      aggregate: runComplete.aggregate,
+      error_text: runComplete.error_text,
+    },
   });
 
   // Non-TTY (coding agents): write single summary JSON to stdout.

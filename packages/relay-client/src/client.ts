@@ -3,8 +3,7 @@ export interface RelayClientConfig {
   relayToken: string;
   agentPort: number;
   healthEndpoint: string;
-  runId?: string;
-  sessionId?: string;
+  sessionId: string;
 }
 
 interface LocalConnection {
@@ -26,15 +25,9 @@ export class RelayClient {
   private config: RelayClientConfig;
   private closed = false;
   private handlers = new Map<string, RelayEventHandler[]>();
-  private _agentEnv: Record<string, string> = {};
 
   constructor(config: RelayClientConfig) {
     this.config = config;
-  }
-
-  /** Env vars received from Vent server to inject into the agent process. */
-  get agentEnv(): Record<string, string> {
-    return this._agentEnv;
   }
 
   on(event: string, handler: RelayEventHandler): void {
@@ -50,19 +43,12 @@ export class RelayClient {
   }
 
   async connect(timeoutMs = 30_000): Promise<void> {
-    if (!this.config.sessionId && !this.config.runId) {
-      throw new Error("RelayClient.connect() requires either sessionId or runId");
-    }
     const wsBase = this.config.apiUrl.replace(/^http/, "ws");
-    const query = this.config.sessionId
-      ? `session_id=${this.config.sessionId}`
-      : `run_id=${this.config.runId}`;
-    const controlUrl = `${wsBase}/relay/control?${query}&token=${this.config.relayToken}`;
+    const controlUrl = `${wsBase}/relay/control?session_id=${this.config.sessionId}&token=${this.config.relayToken}`;
 
     return new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(controlUrl);
       ws.binaryType = "arraybuffer";
-      let configReceived = false;
       let settled = false;
 
       const settle = (fn: () => void) => {
@@ -87,17 +73,14 @@ export class RelayClient {
         this.emit("connected");
       });
 
-      // Wait for the config message (sent immediately after auth) before resolving.
-      // This ensures agentEnv is populated before the caller spawns the agent.
-      this.on("config_received", () => {
-        configReceived = true;
-        settle(() => resolve());
-      });
+      // Connected once the server confirms the session (handshake after auth).
+      this.on("ready", () => settle(() => resolve()));
 
-      // Fallback: resolve after 3s even if no config arrives (backwards compat)
-      setTimeout(() => {
-        if (!configReceived && this.controlWs) settle(() => resolve());
-      }, 3_000);
+      // The server closes without the handshake when it rejects the session
+      // (bad token, unknown or already active session).
+      ws.addEventListener("close", (ev) => {
+        settle(() => reject(new Error(`Relay rejected the connection (${ev.code}${ev.reason ? `: ${ev.reason}` : ""})`)));
+      });
 
       ws.addEventListener("error", (ev) => {
         if (!this.controlWs) {
@@ -105,24 +88,6 @@ export class RelayClient {
         }
       });
     });
-  }
-
-  async activate(timeoutMs = 15_000): Promise<void> {
-    if (!this.config.runId) {
-      throw new Error("activate() requires runId");
-    }
-    const activateUrl = `${this.config.apiUrl}/internal/runs/${this.config.runId}/activate`;
-    const response = await fetch(activateUrl, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ relay_token: this.config.relayToken }),
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-
-    if (!response.ok) {
-      const text = await response.text();
-      throw new Error(`Activation failed (${response.status}): ${text}`);
-    }
   }
 
   async disconnect(): Promise<void> {
@@ -183,19 +148,16 @@ export class RelayClient {
       // Text message: JSON control
       try {
         const raw = typeof event.data === "string" ? event.data : new TextDecoder().decode(event.data as ArrayBuffer);
-        const msg = JSON.parse(raw) as { type: string; conn_id?: string; env?: Record<string, string> };
+        const msg = JSON.parse(raw) as { type: string; conn_id?: string };
 
-        if (msg.type === "config" && msg.env) {
-          this._agentEnv = msg.env;
-          this.emit("config_received");
+        if (msg.type === "config") {
+          this.emit("ready");
         } else if (msg.type === "new_connection" && msg.conn_id) {
           this.handleNewConnection(msg.conn_id);
         } else if (msg.type === "close" && msg.conn_id) {
           const conn = this.localConnections.get(msg.conn_id);
           if (conn?.local.readyState !== WebSocket.CLOSED) conn?.local.close();
           this.localConnections.delete(msg.conn_id);
-        } else if (msg.type === "run_complete") {
-          this.emit("run_complete");
         }
       } catch {
         // Ignore malformed messages

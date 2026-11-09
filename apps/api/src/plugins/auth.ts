@@ -1,14 +1,18 @@
 import fp from "fastify-plugin";
-import { createHash } from "node:crypto";
-import { eq, and, isNull } from "drizzle-orm";
+import type { FastifyReply, FastifyRequest } from "fastify";
+import { and, eq, isNull } from "drizzle-orm";
 import { schema } from "@vent/db";
 import { WorkOS } from "@workos-inc/node";
+import { createAccessJwt, type AccessIdentity } from "../lib/access-jwt.js";
 
 declare module "fastify" {
   interface FastifyInstance {
-    verifyAccessToken: (request: import("fastify").FastifyRequest, reply: import("fastify").FastifyReply) => Promise<void>;
-    verifyAuth: (request: import("fastify").FastifyRequest, reply: import("fastify").FastifyReply) => Promise<void>;
-    verifyAuthAndCsrf: (request: import("fastify").FastifyRequest, reply: import("fastify").FastifyReply) => Promise<void>;
+    issueAccessToken: (identity: AccessIdentity) => Promise<string>;
+    verifyCredentialIssuer: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    verifyAccessToken: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    accessTokenUserId: (request: FastifyRequest) => Promise<string | null>;
+    verifyAuth: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    verifyAuthAndCsrf: (request: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
   interface FastifyRequest {
     accessTokenId?: string;
@@ -17,11 +21,9 @@ declare module "fastify" {
   }
 }
 
-function hashAccessToken(raw: string): string {
-  return createHash("sha256").update(raw).digest("hex");
-}
-
 export const authPlugin = fp(async (app) => {
+  const accessJwt = await createAccessJwt();
+  app.decorate("issueAccessToken", accessJwt.sign);
   const workosApiKey = process.env["WORKOS_API_KEY"];
   const workosClientId = process.env["WORKOS_CLIENT_ID"];
   const cookiePassword = process.env["WORKOS_COOKIE_PASSWORD"];
@@ -44,52 +46,63 @@ export const authPlugin = fp(async (app) => {
     ? new WorkOS(workosApiKey, { clientId: workosClientId })
     : null;
 
+  type AccessTokenRead = AccessIdentity | "none" | "not_bearer" | "empty" | "invalid";
+  const tokenReads = new WeakMap<FastifyRequest, Promise<AccessTokenRead>>();
+
+  // Reads and verifies the request's Bearer access token, once per request:
+  // the rate-limit key (runs.ts) and authentication both need the answer.
+  function readAccessToken(request: FastifyRequest): Promise<AccessTokenRead> {
+    let read = tokenReads.get(request);
+    if (!read) {
+      read = (async () => {
+        const authHeader = request.headers["authorization"];
+        if (!authHeader) return "none";
+        if (!authHeader.startsWith("Bearer ")) return "not_bearer";
+        const rawAccessToken = authHeader.slice(7).trim();
+        if (!rawAccessToken) return "empty";
+        return accessJwt.verify(rawAccessToken).catch(() => "invalid" as const);
+      })();
+      tokenReads.set(request, read);
+    }
+    return read;
+  }
+
   async function tryAuthenticateAccessToken(
-    request: any,
-    reply: any,
+    request: FastifyRequest,
+    reply: FastifyReply,
     rejectNonBearer: boolean,
   ): Promise<"ok" | "none" | "invalid"> {
-    const authHeader = request.headers["authorization"];
-    if (!authHeader) return "none";
-    if (!authHeader.startsWith("Bearer ")) {
+    const read = await readAccessToken(request);
+    if (read === "none") return "none";
+    if (read === "not_bearer") {
       if (!rejectNonBearer) return "none";
       await reply.status(401).send({
         error: "Invalid authorization header. Expected 'Bearer <access_token>'.",
       });
       return "invalid";
     }
-
-    const rawAccessToken = authHeader.slice(7).trim();
-    if (!rawAccessToken) {
+    if (read === "empty") {
       await reply.status(401).send({ error: "Missing access token value." });
       return "invalid";
     }
-
-    const tokenHash = hashAccessToken(rawAccessToken);
-
-    const [found] = await app.db
-      .select()
-      .from(schema.accessTokens)
-      .where(
-        and(
-          eq(schema.accessTokens.token_hash, tokenHash),
-          isNull(schema.accessTokens.revoked_at),
-        ),
-      )
-      .limit(1);
-
-    if (!found) {
-      await reply.status(401).send({ error: "Invalid access token" });
+    if (read === "invalid") {
+      await reply.status(401).send({ error: "Invalid or expired access token" });
       return "invalid";
     }
 
-    request.accessTokenId = found.id;
-    request.userId = found.user_id;
+    request.accessTokenId = read.accessTokenId;
+    request.userId = read.userId;
     request.authMethod = "access_token";
     return "ok";
   }
 
-  async function verifyAccessToken(request: any, reply: any) {
+  // The user a request's access token proves, or null. Never replies.
+  async function accessTokenUserId(request: FastifyRequest): Promise<string | null> {
+    const read = await readAccessToken(request);
+    return typeof read === "object" ? read.userId : null;
+  }
+
+  async function verifyAccessToken(request: FastifyRequest, reply: FastifyReply) {
     const accessTokenAuth = await tryAuthenticateAccessToken(request, reply, true);
     if (accessTokenAuth === "ok" || accessTokenAuth === "invalid") return;
     await reply.status(401).send({
@@ -97,7 +110,7 @@ export const authPlugin = fp(async (app) => {
     });
   }
 
-  async function verifyAuth(request: any, reply: any) {
+  async function verifyAuth(request: FastifyRequest, reply: FastifyReply) {
     // Path 1: Bearer access token (CLI)
     const accessTokenAuth = await tryAuthenticateAccessToken(request, reply, false);
     if (accessTokenAuth === "ok" || accessTokenAuth === "invalid") {
@@ -149,7 +162,7 @@ export const authPlugin = fp(async (app) => {
             return;
           }
         }
-      } catch (err: any) {
+      } catch (err) {
         app.log.warn({ err }, "Session authentication failed");
         // Fall through to 401
       }
@@ -172,7 +185,7 @@ export const authPlugin = fp(async (app) => {
   // mutating requests come from an allowed Origin. Stops cross-site form
   // POSTs in the user's browser from triggering state changes (CSRF).
   // Bearer-token requests skip the Origin check (CLI/server-to-server).
-  async function verifyAuthAndCsrf(request: any, reply: any) {
+  async function verifyAuthAndCsrf(request: FastifyRequest, reply: FastifyReply) {
     await verifyAuth(request, reply);
     if (reply.sent) return;
     if (request.authMethod === "session") {
@@ -184,7 +197,20 @@ export const authPlugin = fp(async (app) => {
     }
   }
 
+  async function verifyCredentialIssuer(request: FastifyRequest, reply: FastifyReply) {
+    await verifyAuthAndCsrf(request, reply);
+    if (reply.sent || request.authMethod !== "access_token") return;
+    const [active] = await app.db.select({ id: schema.accessTokens.id }).from(schema.accessTokens).where(and(
+      eq(schema.accessTokens.id, request.accessTokenId!),
+      eq(schema.accessTokens.user_id, request.userId!),
+      isNull(schema.accessTokens.revoked_at),
+    )).limit(1);
+    if (!active) await reply.status(401).send({ error: "Credential was revoked" });
+  }
+
   app.decorate("verifyAccessToken", verifyAccessToken);
+  app.decorate("accessTokenUserId", accessTokenUserId);
   app.decorate("verifyAuth", verifyAuth);
   app.decorate("verifyAuthAndCsrf", verifyAuthAndCsrf);
+  app.decorate("verifyCredentialIssuer", verifyCredentialIssuer);
 });

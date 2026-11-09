@@ -1,5 +1,11 @@
+import type { CallerAccent } from "./constants.js";
+
 export type RunStatus = "queued" | "running" | "pass" | "fail";
-export type SourceType = "remote" | "session";
+
+export interface AccessCredentials {
+  access_token: string;
+  refresh_token: string;
+}
 
 // ============================================================
 // Conversation call types
@@ -32,7 +38,7 @@ export interface CallerAudioEffects {
   speakerphone?: boolean;
   mic_distance?: "close" | "normal" | "far";
   clarity?: number;
-  accent?: string;
+  accent?: CallerAccent;
   packet_loss?: number;
   jitter_ms?: number;
 }
@@ -41,8 +47,6 @@ export interface ConversationCallSpec {
   name?: string;
   caller_prompt: string;
   max_turns: number;
-
-  silence_threshold_ms?: number;
   persona?: CallerPersona;
   /** Global audio effects applied to all caller audio (speakerphone, speed, noise, accent, etc.) */
   caller_audio?: CallerAudioEffects;
@@ -212,11 +216,11 @@ export interface ConversationTurn {
 
 export interface LatencyMetrics {
   ttfb_per_turn_ms: number[];
-  p50_ttfb_ms: number;
-  p90_ttfb_ms: number;
-  p95_ttfb_ms: number;
-  p99_ttfb_ms: number;
-  first_turn_ttfb_ms: number;
+  p50_ttfb_ms?: number;
+  p90_ttfb_ms?: number;
+  p95_ttfb_ms?: number;
+  p99_ttfb_ms?: number;
+  first_turn_ttfb_ms?: number;
   /** Time to first word (VAD speech onset) per agent turn */
   ttfw_per_turn_ms?: number[];
   p50_ttfw_ms?: number;
@@ -352,7 +356,8 @@ export interface CallTransfer {
 }
 
 export interface ConversationMetrics {
-  mean_ttfb_ms: number;
+  /** Absent when response bytes cannot be distinguished from a continuous audio stream. */
+  mean_ttfb_ms?: number;
   /** Mean time to first word (VAD speech onset) across agent turns */
   mean_ttfw_ms?: number;
   latency?: LatencyMetrics;
@@ -368,6 +373,8 @@ export interface ConversationCallResult {
   name?: string;
   caller_prompt: string;
   status: "completed" | "error";
+  /** How a completed call ended, when Vent ended it or the connection closed. */
+  end_note?: string;
   transcript: ConversationTurn[];
 
   observed_tool_calls?: ObservedToolCall[];

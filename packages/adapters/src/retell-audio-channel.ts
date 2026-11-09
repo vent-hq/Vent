@@ -1,43 +1,26 @@
 /**
  * Retell Audio Channel (WebRTC)
  *
- * Connects directly to Retell's LiveKit Cloud via @livekit/rtc-node for
- * bidirectional audio. Uses Retell SDK for call creation and post-call data.
- * Pure WebRTC — no telephony dependency.
+ * Audio runs over WebRTC to Retell's v3 gateway (see retell-gateway.ts).
+ * Results (tool calls, caller transcript, latency, cost, recording) come from
+ * the Retell SDK's call.retrieve() after the call ends.
  *
  * Flow:
- *   1. connect()  — createWebCall → LiveKit room.connect with access_token
+ *   1. connect()  — create web call v3 → gateway SDP negotiation
  *   2. sendAudio() / on("audio") — bidirectional PCM 24kHz over WebRTC (48kHz internal)
- *   3. disconnect() — leaves room, Retell manages cleanup
- *   4. getCallData() — fetches tool calls from SDK call.retrieve()
- *   5. getCallMetadata() — cost, latency, recording, analysis
- *   6. getComponentTimings() — STT/LLM/TTS latency with full percentiles
- *   7. getTranscripts() — platform STT transcripts for cross-referencing
+ *   3. disconnect() — closes media and deletes the gateway session
+ *   4. getCallData() — tool calls
+ *   5. getCallMetadata() — cost, recording, end reason, transfers
+ *   6. getComponentTimings() — STT/LLM/TTS latency per turn
+ *   7. getTranscripts() — what Retell heard the caller say
  */
 
 import Retell from "retell-sdk";
 import type { CallResponse } from "retell-sdk/resources/call.js";
-import {
-  Room,
-  RoomEvent,
-  AudioSource,
-  AudioStream,
-  AudioFrame,
-  LocalAudioTrack,
-  TrackKind,
-  TrackPublishOptions,
-  TrackSource,
-  IceTransportType,
-  ContinualGatheringPolicy,
-  type RemoteTrack,
-  type RemoteTrackPublication,
-  type RemoteParticipant,
-} from "@livekit/rtc-node";
-import { resample } from "@vent/voice";
+import { RetellGateway, FRAME_SAMPLES } from "./retell-gateway.js";
+import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, CostBreakdown, UsageEntry } from "@vent/shared";
-import { BaseAudioChannel, type SendAudioOptions } from "./audio-channel.js";
-
-const RAW_INTERRUPT_TRAILING_SILENCE_MS = 160;
+import { BaseAudioChannel, type SendAudioOptions, type ComfortNoiseMode } from "./audio-channel.js";
 
 export interface RetellAudioChannelConfig {
   apiKey: string;
@@ -45,50 +28,14 @@ export interface RetellAudioChannelConfig {
 }
 
 export class RetellAudioChannel extends BaseAudioChannel {
-  private static readonly RETELL_LIVEKIT_URL = "wss://retell-ai-4ihahnq7.livekit.cloud";
-  private static readonly SERVER_IDENTITY = "server";
-  private static readonly LIVEKIT_SAMPLE_RATE = 48000;
-  private static readonly AGENT_READY_TIMEOUT = 30_000;
-
-  /** Retell emits agent_stop_talking via DataChannel — reliable end-of-turn signal. */
-  hasPlatformEndOfTurn = true;
-
-  /** WebRTC audio frames lag behind DataChannel signals — wait for the audio tail
-   *  to fully drain before resolving the turn, otherwise STT truncates. */
-  platformEndOfTurnDrainMs = 500;
-
-  /** Retell fires agent_stop_talking between sentences, not just at end of full
-   *  response. A 1500ms settle window lets agent_start_talking cancel before we
-   *  commit to resolving the turn. */
-  // Retell's mid-response pauses during tool-call processing can run 3-5
-  // seconds. Settle must be longer than the longest legitimate pause so
-  // agent_start_talking for the next chunk can cancel the resolve. 6s covers
-  // observed pauses with margin; real end-of-turn (agent waiting for user
-  // response) is typically >10s silence, so 6s cleanly separates the cases.
-  platformEndOfTurnSettleMs = 6000;
+  /** Retell's v3 data channel only reports call status, not speaking boundaries. */
+  hasPlatformEndOfTurn = false;
 
   private config: RetellAudioChannelConfig;
   private client: Retell;
 
-  // LiveKit room state
-  private room: Room | null = null;
-  private audioSource: AudioSource | null = null;
-  private localTrack: LocalAudioTrack | null = null;
+  private gateway: RetellGateway | null = null;
   private collecting = false;
-  private comfortNoiseActive = false;
-  // Retell's "server" participant publishes TWO audio tracks: the agent voice
-  // and a near-silent secondary. Subscribing to both and feeding both into
-  // captureAgentAudio interleaves chunks at ~10ms granularity, producing a
-  // ~50Hz chopping/aliasing in the mixed recording (the "garbled" symptom).
-  // Lock onto the first track that exceeds a per-frame amplitude threshold;
-  // ignore the rest for recording/audio-emit purposes.
-  private primaryAgentTrackSid: string | null = null;
-  private primaryTrackFallbackTimer: ReturnType<typeof setTimeout> | null = null;
-  private static readonly PRIMARY_TRACK_MEAN_ABS_THRESHOLD = 100;
-  // If neither track exceeds the threshold within this window, lock to the
-  // first one we saw. Prevents quiet greetings (under threshold) from being
-  // dropped silently for the entire call.
-  private static readonly PRIMARY_TRACK_FALLBACK_MS = 1500;
 
   // Call state
   private callId: string | null = null;
@@ -96,43 +43,11 @@ export class RetellAudioChannel extends BaseAudioChannel {
   private connectTimestamp = 0;
   private disconnectTimestamp = 0;
 
-  // Real-time agent text from DataChannel "update" events.
-  //
-  // Retell's DataChannel update payload (measured, 2026-04-23):
-  //   { event_type: "update", transcript: [{ role, content }, ...] }
-  // Only `role` and `content` per entry — no words[], no ids, no timestamps.
-  // Retell's documented Utterance schema (get-call, LLM-websocket) includes
-  // words[0].start, but that's the pruned post-call / server-to-server view.
-  // Real-time DataChannel is stripped down.
-  //
-  // Content is progressive: the same utterance grows word-by-word across
-  // many updates ("Let" → "Let me" → "Let me pull" → ...). New utterances
-  // appear as new array entries that do not share any prefix with existing
-  // ones. So the identity signal is the content itself: if incoming extends
-  // an existing slot (startsWith), it's the same utterance; otherwise new.
-  //
-  // Slots hold the longest content we've seen. consumeAgentText returns the
-  // per-slot character delta since the last consume, which handles utterances
-  // that straddle turn boundaries without duplication or loss.
-  private agentSlots: string[] = [];
-  private returnedAgentLengthBySlot: number[] = [];
-  private realtimeUserTranscripts: string[] = [];
-  private seenUserContent = new Set<string>();
-  private loggedFirstDataEvent = false;
-  private loggedFirstAgentEntry = false;
-  private realtimeToolCallEntries = new Map<string, Record<string, unknown>>();
-  private pendingToolCallIds = new Set<string>();
-
-  // Diagnostic-only: log the first observed `turntaking` value so we can verify
-  // Retell DataChannel events are flowing. Don't gate behavior on this field —
-  // production logs showed Retell keeps it set to "agent_turn" through entire
-  // chunked responses, so any suppression based on it swallows real EOT signals.
-  /** Most recently seen `turntaking` value. Every change is logged. A
-   *  transition into "user_turn" from any non-user state is real end-of-turn. */
-  private latestTurntaking: string | null = null;
-
-  // Output sample rate for LiveKit WebRTC
-  protected override outputSampleRate = RetellAudioChannel.LIVEKIT_SAMPLE_RATE;
+  // The gateway's WebRTC source takes 10ms frames of 48kHz audio, at real time.
+  protected override outputSampleRate = 48000;
+  protected override frameDurationMs = 10;
+  protected override pacingIntervalMs = 10;
+  protected override comfortNoise: ComfortNoiseMode = "silence";
 
   constructor(config: RetellAudioChannelConfig) {
     super();
@@ -140,171 +55,35 @@ export class RetellAudioChannel extends BaseAudioChannel {
     this.client = new Retell({ apiKey: config.apiKey });
   }
 
-  /** Write a single 20ms audio frame to LiveKit's AudioSource. */
-  protected async writeAudioFrame(samples: Int16Array, sampleRate: number): Promise<void> {
-    if (!this.audioSource || !this.collecting) return;
-    // CRITICAL: copy into standalone ArrayBuffer. AudioFrame.protoInfo()
-    // uses the ENTIRE underlying ArrayBuffer, not the subarray view.
-    const copied = new Int16Array(samples);
-    const frame = new AudioFrame(copied, sampleRate, 1, copied.length);
-    await this.audioSource.captureFrame(frame);
+  protected async writeAudioFrame(samples: Int16Array, _sampleRate: number): Promise<void> {
+    if (!this.gateway || !this.collecting) throw new Error("Retell gateway is not connected");
+    // The base class sends the end-of-turn tail as one long chunk; split and pace it.
+    for (let i = 0; i < samples.length; i += FRAME_SAMPLES) {
+      if (i > 0) await new Promise((r) => setTimeout(r, this.frameDurationMs));
+      this.gateway.writeFrame(samples.subarray(i, i + FRAME_SAMPLES));
+    }
   }
 
-  get connected(): boolean {
-    return this.room !== null && this.collecting;
-  }
+  get connected(): boolean { return this.collecting; }
 
   async connect(): Promise<void> {
-    const connectStart = Date.now();
+    const started=Date.now();
     this.enableRecordingCapture();
-
-    // Create web call — access_token has 30s TTL, must connect immediately
-    const webCall = await this.client.call.createWebCall({
-      agent_id: this.config.agentId,
+    this._connectTimestampMs=Date.now();
+    this._connectMonotonicMs=performance.now();
+    this.gateway=new RetellGateway({
+      audio: (pcm) => {
+        this._stats.bytesReceived+=pcm.length;
+        this.captureAgentAudio(pcm,performance.now()-this._connectMonotonicMs);
+        this.emit("audio",pcm);
+      },
+      disconnected: () => {this.collecting=false;this.emit("disconnected");},
+      error: (error) => {this._stats.errorEvents.push(error.message);this.emit("error",error);},
     });
-    this.callId = webCall.call_id;
-    const accessToken = webCall.access_token;
-
-    // Connect to Retell's LiveKit Cloud
-    this.room = new Room();
-
-    // On Fly.io, force TURN relay (same as LiveKit adapter)
-    const isFlyIo = !!process.env["FLY_MACHINE_ID"];
-    const rtcConfig = isFlyIo
-      ? {
-          iceTransportType: IceTransportType.TRANSPORT_RELAY,
-          continualGatheringPolicy: ContinualGatheringPolicy.GATHER_CONTINUALLY,
-          iceServers: [],
-        }
-      : undefined;
-
-    await this.room.connect(RetellAudioChannel.RETELL_LIVEKIT_URL, accessToken, {
-      autoSubscribe: true,
-      dynacast: true,
-      rtcConfig,
-    });
-    this.collecting = true;
-    this.connectTimestamp = Date.now();
-    this._connectTimestampMs = this.connectTimestamp;
-    this._connectMonotonicMs = performance.now();
-    this.agentSlots = [];
-    this.returnedAgentLengthBySlot = [];
-    this.loggedFirstDataEvent = false;
-    this.loggedFirstAgentEntry = false;
-    this.latestTurntaking = null;
-    this.realtimeUserTranscripts = [];
-    this.seenUserContent.clear();
-    this.realtimeToolCallEntries.clear();
-    this.primaryAgentTrackSid = null;
-
-    // ── DataChannel listener for Retell JSON events ──────────────
-    // Don't filter by participant identity. Retell publishes audio under
-    // identity="server", but DataPackets (agent_stop_talking, update with
-    // turntaking, etc.) come from a different participant — production logs
-    // showed zero DataReceived events when filtering on "server", which made
-    // platformEndOfTurn never fire and forced the collector onto local VAD,
-    // which can't handle Retell's chunked TTS pauses during tool calls.
-    this.room.on(
-      RoomEvent.DataReceived,
-      (payload: Uint8Array, _participant?: RemoteParticipant, _kind?: unknown, _topic?: string) => {
-        this.handleRetellDataEvent(payload);
-      }
-    );
-
-    // ── Disconnect detection ─────────────────────────────────────
-    // Mark `collecting = false` so subsequent connected checks return false
-    // and the read loop exits. Do NOT null `room`/`audioSource`/`localTrack`
-    // here — the explicit disconnect() path needs them to call .close() on
-    // the FFI handles. Setting them to null before disconnect() runs leaks
-    // the underlying LiveKit FFI handles (Rust-side resources). Just clear
-    // the per-call lock state and let disconnect() handle the rest.
-    this.room.once(RoomEvent.Disconnected, () => {
-      this.collecting = false;
-      this.primaryAgentTrackSid = null;
-      if (this.primaryTrackFallbackTimer) {
-        clearTimeout(this.primaryTrackFallbackTimer);
-        this.primaryTrackFallbackTimer = null;
-      }
-      this.emit("disconnected");
-    });
-
-    // ── Publish audio track (48kHz, microphone source) ───────────
-    this.audioSource = new AudioSource(RetellAudioChannel.LIVEKIT_SAMPLE_RATE, 1);
-    this.localTrack = LocalAudioTrack.createAudioTrack("vent-tester", this.audioSource);
-    const publishOptions = new TrackPublishOptions();
-    publishOptions.source = TrackSource.SOURCE_MICROPHONE;
-    await this.room.localParticipant!.publishTrack(this.localTrack, publishOptions);
-
-    // ── Comfort noise — keep Opus codec warm ─────────────────────
-    this.startComfortNoise();
-
-    // ── Subscribe to agent audio tracks ──────────────────────────
-    for (const participant of this.room.remoteParticipants.values()) {
-      if (participant.identity === RetellAudioChannel.SERVER_IDENTITY) {
-        for (const pub of participant.trackPublications.values()) {
-          if (pub.track && pub.kind === TrackKind.KIND_AUDIO) {
-            console.log(
-              `[retell] subscribing to pre-existing audio track participant=${participant.identity} trackSid=${pub.sid}`
-            );
-            this.startReadingTrack(pub.track as RemoteTrack, participant.identity, pub.sid);
-          }
-        }
-      }
-    }
-
-    this.room.on(
-      RoomEvent.TrackSubscribed,
-      (track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant) => {
-        if (participant.identity === RetellAudioChannel.SERVER_IDENTITY && pub.kind === TrackKind.KIND_AUDIO) {
-          console.log(
-            `[retell] TrackSubscribed audio participant=${participant.identity} trackSid=${pub.sid}`
-          );
-          this.startReadingTrack(track, participant.identity, pub.sid);
-        }
-      }
-    );
-
-    // ── Wait for agent audio track ───────────────────────────────
-    const agentReady = await new Promise<boolean>((resolve) => {
-      // Define listener first so timeout cleanup can reference it
-      const onTrackSubscribed = (_t: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant) => {
-        if (participant.identity === RetellAudioChannel.SERVER_IDENTITY && pub.kind === TrackKind.KIND_AUDIO) {
-          clearTimeout(timer);
-          this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
-          resolve(true);
-        }
-      };
-
-      const timer = setTimeout(() => {
-        this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
-        resolve(false);
-      }, RetellAudioChannel.AGENT_READY_TIMEOUT);
-
-      // Check if already subscribed
-      for (const p of this.room!.remoteParticipants.values()) {
-        if (p.identity === RetellAudioChannel.SERVER_IDENTITY) {
-          for (const pub of p.trackPublications.values()) {
-            if (pub.track && pub.kind === TrackKind.KIND_AUDIO) {
-              clearTimeout(timer);
-              this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
-              resolve(true);
-              return;
-            }
-          }
-        }
-      }
-
-      this.room!.on(RoomEvent.TrackSubscribed, onTrackSubscribed);
-    });
-
-    if (!agentReady) {
-      throw new Error(
-        `Retell agent did not publish audio within ${RetellAudioChannel.AGENT_READY_TIMEOUT / 1000}s. ` +
-        `Ensure the agent (${this.config.agentId}) is configured correctly in Retell.`
-      );
-    }
-
-    this._stats.connectLatencyMs = Date.now() - connectStart;
+    this.callId=await this.gateway.connect(this.config.apiKey,this.config.agentId);
+    this.collecting=true;
+    this.connectTimestamp=Date.now();
+    this._stats.connectLatencyMs=Date.now()-started;
   }
 
   /** Retell agents always speak first. */
@@ -312,103 +91,34 @@ export class RetellAudioChannel extends BaseAudioChannel {
     return "agent";
   }
 
-  // ── Comfort noise ──────────────────────────────────────────────
-
-  /**
-   * Send low-level white noise to prevent Opus DTX mode.
-   * Without this, Opus ramps bitrate from 0 → 40kbps over 20s when
-   * real speech arrives after silence — the agent's VAD misses it.
-   */
-  startComfortNoise(): void {
-    this.comfortNoiseActive = true;
-    const sampleRate = RetellAudioChannel.LIVEKIT_SAMPLE_RATE;
-    const chunkSamples = Math.floor(sampleRate * 0.02); // 20ms
-    const AMPLITUDE = 400; // ~-30dBFS
-
-    const sendLoop = async () => {
-      while (this.comfortNoiseActive && this.audioSource) {
-        const samples = new Int16Array(chunkSamples);
-        for (let i = 0; i < chunkSamples; i++) {
-          samples[i] = Math.floor((Math.random() * 2 - 1) * AMPLITUDE);
-        }
-        const frame = new AudioFrame(samples, sampleRate, 1, chunkSamples);
-        try {
-          await this.audioSource.captureFrame(frame);
-        } catch {
-          break; // AudioSource closed
-        }
-      }
-    };
-    sendLoop();
-  }
-
-  stopComfortNoise(): void {
-    this.comfortNoiseActive = false;
-    this.clearAudioBuffer();
-  }
-
-  /** Clear LiveKit AudioSource internal queue on interruption. */
-  protected override clearTransportQueue(): void {
-    this.audioSource?.clearQueue();
-  }
-
-  // ── Audio I/O ──────────────────────────────────────────────────
-  // sendAudio(), flushAudioBuffer(), clearAudioBuffer() inherited from BaseAudioChannel.
-  // writeAudioFrame() implemented above.
-  // All audio — including interrupts — goes through the buffer.
-  // Interrupts: caller clears buffer first, then sends normally.
-
   override sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
-    if (!this.audioSource || !this.collecting) return;
-    if (this.comfortNoiseActive) this.stopComfortNoise();
-    super.sendAudio(pcm, opts);
+    if (!this.collecting) throw new Error("Retell gateway is not connected");
+    super.sendAudio(pcm,opts);
   }
 
   async disconnect(): Promise<void> {
-    this.collecting = false;
-    this.stopComfortNoise();
-    this.disconnectTimestamp = Date.now();
-    if (this.primaryTrackFallbackTimer) {
-      clearTimeout(this.primaryTrackFallbackTimer);
-      this.primaryTrackFallbackTimer = null;
-    }
-    if (this.audioSource) {
-      await this.audioSource.close();
-      this.audioSource = null;
-    }
-    if (this.localTrack) {
-      await this.localTrack.close();
-      this.localTrack = null;
-    }
-    if (this.room) {
-      await this.room.disconnect();
-      this.room = null;
-    }
-    // NOTE: Do NOT call dispose() — destroys global FFI runtime
-    // NOTE: Do NOT delete room — Retell manages their LiveKit rooms
+    this.collecting=false;
+    this.clearAudioBuffer();
+    await this.gateway?.close();
+    this.gateway=null;
+    this.disconnectTimestamp=Date.now();
   }
 
   // ── Post-call data ─────────────────────────────────────────────
 
   async getCallData(): Promise<ObservedToolCall[]> {
     const data = await this.fetchCallResponse();
-    if (!data) return this.parseRealtimeToolCalls();
-    const parsed = this.parseToolCalls(data);
-    return parsed.length > 0 ? parsed : this.parseRealtimeToolCalls();
+    return data ? this.parseToolCalls(data) : [];
   }
 
   async getCallMetadata(): Promise<CallMetadata | null> {
     const data = await this.fetchCallResponse();
     if (!data) {
-      const providerMetadata = compactUnknownRecord({
-        realtime_transcript_with_tool_calls:
-          this.realtimeToolCallEntries.size > 0 ? [...this.realtimeToolCallEntries.values()] : undefined,
-      });
-      if (!this.callId && !providerMetadata) return null;
+      if (!this.callId) return null;
       return {
         platform: "retell",
-        provider_call_id: this.callId ?? undefined,
-        provider_metadata: providerMetadata,
+        provider_call_id: this.callId,
+        provider_warnings: [callDataUnavailableWarning("Retell")],
       };
     }
 
@@ -452,9 +162,7 @@ export class RetellAudioChannel extends BaseAudioChannel {
   getTranscripts(): Array<{ turnIndex: number; text: string }> {
     const data = this.cachedCallResponse;
     const entries = data?.transcript_with_tool_calls;
-    if (!entries) {
-      return this.realtimeUserTranscripts.map((text, turnIndex) => ({ turnIndex, text }));
-    }
+    if (!entries) return [];
 
     const transcripts: Array<{ turnIndex: number; text: string }> = [];
     let callerTurnIndex = 0;
@@ -467,162 +175,20 @@ export class RetellAudioChannel extends BaseAudioChannel {
     return transcripts;
   }
 
-  /** Full caller transcript for WER computation (avoids turn alignment issues). */
-  getFullCallerTranscript(): string {
-    return extractRetellCallerTranscript(this.cachedCallResponse) || this.realtimeUserTranscripts.join(" ");
+  private callData?: Promise<CallResponse | null>;
+
+  /** One shared fetch per call: every caller waits on the same poll. */
+  private fetchCallResponse(): Promise<CallResponse | null> {
+    if (!this.callId) return Promise.resolve(null);
+    const callId = this.callId;
+    this.callData ??= pollUntilReady(
+      "retell-postcall",
+      () => this.client.call.retrieve(callId),
+      (data) => data.call_status === "ended" || data.call_status === "error",
+    ).then((data) => (this.cachedCallResponse = data));
+    return this.callData;
   }
 
-  /** Return agent text spoken since the previous consume.
-   *  Walks slots in insertion order, emits the character delta per slot. */
-  consumeAgentText(): string {
-    const deltas: string[] = [];
-    const diag: string[] = [];
-    for (let i = 0; i < this.agentSlots.length; i++) {
-      const full = this.agentSlots[i]!;
-      const returned = this.returnedAgentLengthBySlot[i] ?? 0;
-      const grew = full.length > returned;
-      diag.push(`[${i}]len=${full.length}${grew ? `+${full.length - returned}` : ""}`);
-      if (grew) {
-        deltas.push(full.slice(returned).trimStart());
-        this.returnedAgentLengthBySlot[i] = full.length;
-      }
-    }
-    // Full per-slot snapshot on every consume so we can prove whether Retell
-    // shipped a given utterance at all. If the Wednesday-slots sentence never
-    // appears in any slot across consumes, Retell simply didn't send it. If
-    // it appears, we can see exactly what content/length was there.
-    if (this.agentSlots.length > 0) {
-      console.log(`    [retell] consume slots=${this.agentSlots.length} ${diag.join(" ")}`);
-      for (let i = 0; i < this.agentSlots.length; i++) {
-        console.log(`    [retell] slot[${i}]="${this.agentSlots[i]!.slice(0, 200)}${this.agentSlots[i]!.length > 200 ? "…" : ""}"`);
-      }
-    }
-    return deltas.join(" ").trim();
-  }
-
-  /** Merge an incoming agent content string into our slot list.
-   *  Matches by prefix relationship against existing slots:
-   *  - Incoming extends an existing slot → grow that slot.
-   *  - Existing slot extends the incoming → no-op (we already have a later
-   *    snapshot; sliding-window re-sends land here).
-   *  - No prefix match on any slot → new utterance, new slot. */
-  private mergeAgentContent(content: string): void {
-    if (!content) return;
-    for (let i = 0; i < this.agentSlots.length; i++) {
-      const existing = this.agentSlots[i]!;
-      if (existing === content) return;
-      if (content.startsWith(existing)) {
-        this.agentSlots[i] = content;
-        return;
-      }
-      if (existing.startsWith(content)) return;
-    }
-    this.agentSlots.push(content);
-    this.returnedAgentLengthBySlot.push(0);
-  }
-
-  // ── Private helpers ────────────────────────────────────────────
-
-  private handleRetellDataEvent(payload: Uint8Array): void {
-    const text = new TextDecoder().decode(payload);
-    let event: {
-      event_type?: string;
-      transcript?: Array<{ role: string; content: string }>;
-      [key: string]: unknown;
-    };
-    try {
-      event = JSON.parse(text);
-    } catch {
-      if (!this.loggedFirstDataEvent) {
-        this.loggedFirstDataEvent = true;
-        console.log(`    [retell] first DataReceived (non-JSON) len=${text.length} head="${text.slice(0, 60)}"`);
-      }
-      return;
-    }
-
-    if (!this.loggedFirstDataEvent) {
-      this.loggedFirstDataEvent = true;
-      console.log(`    [retell] first DataReceived event_type="${event.event_type ?? "?"}"`);
-    }
-
-    switch (event.event_type) {
-      case "agent_stop_talking":
-        // Retell fires this per chunk, not per response — between every sentence
-        // and during tool-call thinking. Emit platformEndOfTurn anyway; the
-        // collector's settle window (platformEndOfTurnSettleMs) debounces: if
-        // agent_start_talking (→ platformSpeechStart) cancels within the
-        // window, the turn extends; if the window elapses with no resumption,
-        // the agent is genuinely done and the turn resolves. The settle MUST
-        // be longer than Retell's longest mid-response pause (tool calls can
-        // take 4–5s), which is why platformEndOfTurnSettleMs is set high.
-        this.emit("platformEndOfTurn");
-        break;
-
-      case "agent_start_talking":
-        this.emit("platformSpeechStart");
-        break;
-
-      case "update":
-        if (event.transcript) {
-          for (const entry of event.transcript) {
-            if (entry.role === "agent") {
-              // Snapshot the entry shape on first sight. If Retell ever adds
-              // a stable id (words[0].start, utterance_id, segment_id...) we'll
-              // see it in the `keys=` list and can switch to that signal.
-              if (!this.loggedFirstAgentEntry) {
-                this.loggedFirstAgentEntry = true;
-                console.log(
-                  `    [retell] first agent entry: keys=${Object.keys(entry).join(",")} ` +
-                  `contentLen=${entry.content.length}`
-                );
-              }
-              this.mergeAgentContent(entry.content);
-            } else if (entry.role === "user" && !this.seenUserContent.has(entry.content)) {
-              this.realtimeUserTranscripts.push(entry.content);
-              this.seenUserContent.add(entry.content);
-            }
-          }
-        }
-        // turntaking is Retell's authoritative turn-boundary signal. Log every
-        // change so we can see its actual flow. Transition INTO user_turn from
-        // any non-user state means the agent has yielded — that's end-of-turn.
-        if (typeof event.turntaking === "string") {
-          const prev = this.latestTurntaking;
-          if (prev !== event.turntaking) {
-            this.latestTurntaking = event.turntaking;
-            console.log(`    [retell] turntaking: ${prev ?? "null"} → ${event.turntaking}`);
-            if (prev !== null && prev !== "user_turn" && event.turntaking === "user_turn") {
-              console.log(`    [retell] emitting platformEndOfTurn (turntaking → user_turn)`);
-              this.emit("platformEndOfTurn");
-            }
-          }
-        }
-        this.captureRealtimeToolCallEntries(event);
-        break;
-    }
-  }
-
-  private async fetchCallResponse(): Promise<CallResponse | null> {
-    if (this.cachedCallResponse) return this.cachedCallResponse;
-    if (!this.callId) return null;
-
-    // Poll with backoff — Retell needs time to process call data after disconnect
-    const delays = [500, 1000, 2000];
-    for (const delay of delays) {
-      await sleep(delay);
-      try {
-        const data = await this.client.call.retrieve(this.callId);
-        if (data.call_status === "ended" || data.call_status === "error" || data.transcript_with_tool_calls) {
-          this.cachedCallResponse = data;
-          return data;
-        }
-      } catch {
-        continue;
-      }
-    }
-
-    return null;
-  }
 
   private parseToolCalls(data: CallResponse): ObservedToolCall[] {
     const entries = (data.transcript_with_tool_calls ?? [])
@@ -630,147 +196,7 @@ export class RetellAudioChannel extends BaseAudioChannel {
     return parseRetellToolCallsFromEntries(entries);
   }
 
-  private parseRealtimeToolCalls(): ObservedToolCall[] {
-    return parseRetellToolCallsFromEntries([...this.realtimeToolCallEntries.values()]);
-  }
 
-  private captureRealtimeToolCallEntries(event: Record<string, unknown>): void {
-    const transcriptWithToolCalls =
-      firstRecordArray(event["transcript_with_tool_calls"], event["transcriptWithToolCalls"]);
-    if (!transcriptWithToolCalls) return;
-
-    for (const entry of transcriptWithToolCalls) {
-      const role = typeof entry["role"] === "string" ? entry["role"] : undefined;
-      if (role !== "tool_call_invocation" && role !== "tool_call_result") continue;
-      const toolCallId = typeof entry["tool_call_id"] === "string" ? entry["tool_call_id"] : undefined;
-      if (!toolCallId) continue;
-      const key = `${role}:${toolCallId}`;
-      const prior = this.realtimeToolCallEntries.get(key);
-      this.realtimeToolCallEntries.set(key, {
-        ...(prior ?? {}),
-        ...entry,
-      });
-
-      if (role === "tool_call_invocation" && !this.pendingToolCallIds.has(toolCallId)) {
-        const wasEmpty = this.pendingToolCallIds.size === 0;
-        this.pendingToolCallIds.add(toolCallId);
-        if (wasEmpty) this.emit("toolCallActive", true);
-      } else if (role === "tool_call_result" && this.pendingToolCallIds.has(toolCallId)) {
-        this.pendingToolCallIds.delete(toolCallId);
-        if (this.pendingToolCallIds.size === 0) this.emit("toolCallActive", false);
-      }
-    }
-  }
-
-  private startReadingTrack(track: RemoteTrack, participantIdentity?: string, trackSid?: string): void {
-    const who = `participant=${participantIdentity ?? "?"} trackSid=${trackSid ?? "?"}`;
-    console.log(`[retell] startReadingTrack ${who}`);
-    const sampleRate = RetellAudioChannel.LIVEKIT_SAMPLE_RATE;
-    const stream = new AudioStream(track, sampleRate, 1);
-    const reader = stream.getReader();
-
-    let frameCount = 0;
-    let sumAbs = 0;
-    let sampleCount = 0;
-    let peakAbs = 0;
-    let lastDiagFrame = 0;
-
-    const readLoop = async () => {
-      try {
-        while (this.collecting) {
-          const { value: frame, done } = await reader.read();
-          if (done || !frame) break;
-
-          frameCount++;
-
-          // Sample-level diagnostics on raw pre-resample frame
-          const rawSamples = new Int16Array(
-            frame.data.buffer,
-            frame.data.byteOffset,
-            frame.data.byteLength / 2,
-          );
-          let frameSumAbs = 0;
-          let framePeak = 0;
-          for (let i = 0; i < rawSamples.length; i++) {
-            const v = Math.abs(rawSamples[i]!);
-            frameSumAbs += v;
-            if (v > framePeak) framePeak = v;
-          }
-          sumAbs += frameSumAbs;
-          sampleCount += rawSamples.length;
-          if (framePeak > peakAbs) peakAbs = framePeak;
-
-          if (frameCount === 1) {
-            console.log(
-              `[retell] first_frame ${who} bytes=${frame.data.byteLength} samples=${rawSamples.length} sampleRate=${frame.sampleRate} peak=${framePeak} meanAbs=${Math.round(frameSumAbs / rawSamples.length)}`
-            );
-          }
-          if (frameCount - lastDiagFrame >= 100) {
-            lastDiagFrame = frameCount;
-            console.log(
-              `[retell] frame=${frameCount} ${who} cumMeanAbs=${Math.round(sumAbs / Math.max(1, sampleCount))} cumPeak=${peakAbs} requestedRate=${sampleRate} actualRate=${frame.sampleRate}`
-            );
-          }
-
-          // Lock onto the first track that produces non-silent audio.
-          // Silent secondary tracks are read (drained) but their PCM is not
-          // fed into the recording mixer or the audio event stream. If
-          // neither track crosses the threshold within the fallback window,
-          // lock to the first track we saw (avoids dropping quiet greetings).
-          const frameMeanAbs = frameSumAbs / Math.max(1, rawSamples.length);
-          if (
-            this.primaryAgentTrackSid === null
-            && frameMeanAbs > RetellAudioChannel.PRIMARY_TRACK_MEAN_ABS_THRESHOLD
-          ) {
-            this.primaryAgentTrackSid = trackSid ?? null;
-            if (this.primaryTrackFallbackTimer) {
-              clearTimeout(this.primaryTrackFallbackTimer);
-              this.primaryTrackFallbackTimer = null;
-            }
-            console.log(
-              `[retell] locked primary agent track ${who} (frameMeanAbs=${Math.round(frameMeanAbs)})`
-            );
-          } else if (this.primaryAgentTrackSid === null && !this.primaryTrackFallbackTimer) {
-            // Arm the fallback once on the first frame from any track.
-            const candidate = trackSid ?? null;
-            this.primaryTrackFallbackTimer = setTimeout(() => {
-              if (this.primaryAgentTrackSid === null) {
-                this.primaryAgentTrackSid = candidate;
-                console.log(
-                  `[retell] primary track fallback locked ${who} (no track exceeded threshold within ${RetellAudioChannel.PRIMARY_TRACK_FALLBACK_MS}ms)`
-                );
-              }
-              this.primaryTrackFallbackTimer = null;
-            }, RetellAudioChannel.PRIMARY_TRACK_FALLBACK_MS);
-          }
-          const isPrimary = this.primaryAgentTrackSid === trackSid;
-
-          const frameBuffer = Buffer.from(
-            frame.data.buffer,
-            frame.data.byteOffset,
-            frame.data.byteLength
-          );
-          this._stats.bytesReceived += frameBuffer.length;
-          // Resample from LiveKit 48kHz → 24kHz for consumers
-          const pcm24k = resample(frameBuffer, sampleRate, 24000);
-          if (isPrimary) {
-            this.captureAgentAudio(pcm24k, performance.now() - this._connectMonotonicMs);
-            this.emit("audio", pcm24k);
-          }
-        }
-      } catch (err) {
-        if (err instanceof Error) {
-          this._stats.errorEvents.push(err.message);
-        }
-      }
-      const finalMean = sampleCount > 0 ? Math.round(sumAbs / sampleCount) : 0;
-      console.log(
-        `[retell] Audio read loop ended ${who} frames=${frameCount} meanAbs=${finalMean} peak=${peakAbs}`
-      );
-    };
-
-    readLoop();
-  }
 }
 
 function parseRetellToolCallsFromEntries(entries: Record<string, unknown>[]): ObservedToolCall[] {
@@ -825,15 +251,6 @@ function parseRetellToolCallsFromEntries(entries: Record<string, unknown>[]): Ob
   }
 
   return toolCalls;
-}
-
-function firstRecordArray(...values: unknown[]): Record<string, unknown>[] | undefined {
-  for (const value of values) {
-    if (!Array.isArray(value)) continue;
-    const records = value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item));
-    if (records.length > 0) return records;
-  }
-  return undefined;
 }
 
 export function extractRetellComponentTimings(data: CallResponse | null | undefined): ComponentLatency[] {
@@ -911,21 +328,6 @@ export function resolveRetellTransferTimestampMs(data: Pick<CallResponse, "start
   return undefined;
 }
 
-export function extractRetellCallerTranscript(
-  data: Pick<CallResponse, "transcript_with_tool_calls"> | null | undefined,
-): string {
-  const entries = data?.transcript_with_tool_calls;
-  if (!entries) return "";
-
-  const callerTexts: string[] = [];
-  for (const entry of entries) {
-    if (entry.role === "user" && "content" in entry && typeof entry.content === "string") {
-      callerTexts.push(entry.content);
-    }
-  }
-  return callerTexts.join(" ");
-}
-
 export function buildRetellCostBreakdown(products: Array<{ product: string; cost: number }>): CostBreakdown {
   const breakdown: CostBreakdown = {};
   let total = 0;
@@ -982,8 +384,4 @@ function compactStringRecord(record: Record<string, string | undefined>): Record
 function compactUnknownRecord(record: Record<string, unknown>): Record<string, unknown> | undefined {
   const entries = Object.entries(record).filter(([, value]) => value != null);
   return entries.length > 0 ? Object.fromEntries(entries) : undefined;
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
 }

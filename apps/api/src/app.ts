@@ -1,7 +1,6 @@
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import cookie from "@fastify/cookie";
-import rateLimit from "@fastify/rate-limit";
 import websocket from "@fastify/websocket";
 import { healthRoutes } from "./routes/health.js";
 import { runRoutes } from "./routes/runs.js";
@@ -15,6 +14,7 @@ import { recordingRoutes } from "./routes/recordings.js";
 import { dbPlugin } from "./plugins/db.js";
 import { queuePlugin } from "./plugins/queue.js";
 import { authPlugin } from "./plugins/auth.js";
+import { rateLimitPlugin } from "./plugins/rate-limit.js";
 import { shutdownSubscribers } from "./lib/run-subscribers.js";
 
 import { registerRunCleanup } from "./lib/run-cleanup.js";
@@ -31,10 +31,7 @@ export async function buildApp() {
     routerOptions: {
       maxParamLength: 512,
     },
-    // Trust the Fly proxy so request.ip resolves to the real client IP, not
-    // the LB. Without this, per-IP rate limiting throttles every user behind
-    // the same load balancer to one shared bucket.
-    trustProxy: true,
+    trustProxy: false,
   });
 
   const dashboardUrl = process.env["DASHBOARD_URL"];
@@ -111,40 +108,7 @@ export async function buildApp() {
   await app.register(queuePlugin);
   await app.register(authPlugin);
 
-  // Global rate limit — Redis-backed so multi-instance deploys share state.
-  // Defaults: 100 req/min per (userId ?? ip). Sensitive endpoints opt into
-  // tighter caps via { config: { rateLimit: ... } } on the route. Internal
-  // callbacks (HMAC-protected, called only by the worker) and SSE streams
-  // (long-lived) are skipped.
-  await app.register(rateLimit, {
-    global: true,
-    max: 100,
-    timeWindow: "1 minute",
-    redis: app.redis,
-    nameSpace: "vent:rl:",
-    keyGenerator: (request) => {
-      const userId = (request as unknown as { userId?: string }).userId;
-      return userId ? `u:${userId}` : `ip:${request.ip}`;
-    },
-    skipOnError: true, // Redis blip ⇒ allow request, don't 500.
-    // Skip rate limiting for paths where it doesn't apply or causes harm:
-    //  - /internal/* : HMAC-authed worker→API callbacks, called many times per call
-    //  - /runs/:id/stream : long-lived SSE connections, per-request limit makes no sense
-    //  - /recordings : gated by signed token + dashboard cookie auth
-    //  - /health     : monitoring probes
-    // Match by routerPath (Fastify's resolved route) where possible to avoid
-    // querystring-based bypass (e.g. /runs/submit?x=/stream slipped past
-    // an earlier `url.includes("/stream")` check).
-    allowList: (request) => {
-      const routerPath =
-        (request as unknown as { routerPath?: string }).routerPath ?? "";
-      if (routerPath.startsWith("/internal/")) return true;
-      if (routerPath === "/runs/:id/stream") return true;
-      if (routerPath.startsWith("/recordings/")) return true;
-      if (routerPath === "/health" || routerPath === "/healthz") return true;
-      return false;
-    },
-  });
+  await app.register(rateLimitPlugin);
   await app.register(healthRoutes);
   await app.register(runRoutes);
   await app.register(callbackRoutes);

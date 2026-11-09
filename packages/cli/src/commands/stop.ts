@@ -17,8 +17,13 @@ export async function stopCommand(args: StopArgs): Promise<number> {
     const res = await apiFetch(`/runs/${args.runId}/stop`, accessToken, {
       method: "POST",
     });
-    const data = (await res.json()) as { id: string; status: string };
-    printSuccess(`Run ${data.id} cancelled.`, { force: true });
+    const data = (await res.json()) as { id: string; status: "cancelled" | "cancelling" };
+    printSuccess(
+      data.status === "cancelling"
+        ? `Run ${data.id} is stopping — the call hangs up at the end of the current turn.`
+        : `Run ${data.id} cancelled.`,
+      { force: true },
+    );
   } catch (err) {
     if (err instanceof ApiError) {
       const body = err.body as { error?: string };

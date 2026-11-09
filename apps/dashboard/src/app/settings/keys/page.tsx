@@ -61,7 +61,7 @@ export default function AccessTokensPage() {
     setCreating(true);
     try {
       const data = await createAccessToken(newKeyName || "default");
-      setCreatedKey(data.access_token);
+      setCreatedKey(data.refresh_token);
       loadKeys();
     } catch {
       // TODO: show error
@@ -102,10 +102,10 @@ export default function AccessTokensPage() {
       <div className="h-16 flex items-center justify-between">
         <div>
           <h1 className="text-[1.125rem] leading-none font-medium tracking-[-0.01em]">
-            Access Tokens
+            API Keys
           </h1>
           <p className="text-[14px] text-muted-foreground mt-2">
-            Manage Vent access tokens for authenticating with the CLI.
+            Revoking a key stops renewal. Existing access can last up to 15 minutes.
           </p>
         </div>
         <Dialog
@@ -118,19 +118,19 @@ export default function AccessTokensPage() {
           <DialogTrigger asChild>
             <Button>
               <Plus className="h-4 w-4 mr-2" />
-              Create Token
+              Create Key
             </Button>
           </DialogTrigger>
           <DialogContent>
             <DialogHeader>
               <DialogTitle>
-                {createdKey ? "Access Token Created" : "Create Access Token"}
+                {createdKey ? "API Key Created" : "Create API Key"}
               </DialogTitle>
             </DialogHeader>
             {createdKey ? (
               <div className="space-y-4">
                 <p className="text-sm text-muted-foreground">
-                  Copy this access token now. It will not be shown again.
+                  Copy this API key now. The CLI uses it to renew access automatically. It will not be shown again.
                 </p>
                 <div className="flex items-center gap-2">
                   <code className="flex-1 p-3 bg-muted rounded-md text-sm font-mono break-all select-all">
@@ -149,7 +149,7 @@ export default function AccessTokensPage() {
                     Usage:
                   </p>
                   <code className="text-xs">
-                    {`export VENT_ACCESS_TOKEN=<your-token>`}
+                    {`export VENT_REFRESH_TOKEN=<your-token>`}
                   </code>
                   <p className="text-xs mt-1.5">
                     Or run <code className="font-mono">vent login</code> to save it locally.
@@ -159,7 +159,7 @@ export default function AccessTokensPage() {
             ) : (
               <div className="space-y-4">
                 <div>
-                  <label className="text-sm font-medium">Token Name</label>
+                  <label className="text-sm font-medium">Key Name</label>
                   <Input
                     placeholder="e.g., Vent CLI Login"
                     value={newKeyName}
@@ -175,7 +175,7 @@ export default function AccessTokensPage() {
                   className="w-full"
                   disabled={creating}
                 >
-                  {creating ? "Creating..." : "Create Token"}
+                  {creating ? "Creating..." : "Create Key"}
                 </Button>
               </div>
             )}

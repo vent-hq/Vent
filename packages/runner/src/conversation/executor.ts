@@ -24,8 +24,8 @@ import type {
   HarnessOverhead,
 } from "@vent/shared";
 import { synthesize, TTSSession, BatchVAD, VoiceActivityDetector, StreamingTranscriber, applyEffects, resolveAccentVoiceId, resolveLanguageVoiceId, resolveGenderVoiceId, analyzeAudioQuality, concatPcm, type AudioQualityMetrics } from "@vent/voice";
-import { CallerLLM } from "./caller-llm.js";
-import { collectUntilEndOfTurn, linearRegressionSlope } from "../audio-tests/helpers.js";
+import { CallerLLM, type CallerDecision } from "./caller-llm.js";
+import { collectUntilEndOfTurn, linearRegressionSlope, turnTiming } from "../audio-tests/helpers.js";
 import { computeAllMetrics } from "../metrics/index.js";
 import { AdaptiveThreshold } from "./adaptive-threshold.js";
 
@@ -36,10 +36,8 @@ function summarizeDebugText(text: string | null | undefined, maxChars = 96): str
   return `${normalized.slice(0, maxChars - 3)}...`;
 }
 
-function prepareCallerSpeechText(channel: AudioChannel, text: string): string {
-  return (channel.normalizeCallerTextForSpeech?.(text) ?? text)
-    .replace(/\s+/g, " ")
-    .trim();
+function prepareCallerSpeechText(text: string): string {
+  return text.replace(/\s+/g, " ").trim();
 }
 
 function sinceStartMs(startTime: number): number {
@@ -89,6 +87,17 @@ export interface RunConversationCallOpts {
   signal?: AbortSignal;
 }
 
+/** Prefix for failures of Vent's own components (caller LLM, STT/TTS, VAD),
+ *  so they aren't mistaken for the agent under test failing. */
+const VENT_FAILED = "Vent failed, agent not tested: ";
+
+/** An error on the agent's side of the connection; reported with its raw message. */
+class PlatformError extends Error {}
+
+function ventFailure(err: unknown): never {
+  throw new Error(VENT_FAILED + (err instanceof Error ? err.message : String(err)));
+}
+
 export async function runConversationCall(
   spec: ConversationCallSpec,
   channel: AudioChannel,
@@ -102,20 +111,35 @@ export async function runConversationCall(
   const language = spec.language;
   const caller = new CallerLLM(spec.caller_prompt, spec.persona, language);
   const adaptiveThreshold = new AdaptiveThreshold({
-    baseMs: spec.silence_threshold_ms ?? channel.preferredSilenceThresholdMs ?? 400,
+    baseMs: turnTiming(!!channel.hasPlatformEndOfTurn).silenceThresholdMs,
   });
 
-  // Initialize VAD, batch VAD, and streaming STT up front.
-  // The caller's first turn is generated only after the real greeting turn is collected.
+  // Resolve TTS voice ID. Priority: caller_audio.accent > voice (English-only) > language default.
+  const ttsVoiceId = spec.caller_audio?.accent
+    ? resolveAccentVoiceId(spec.caller_audio.accent)
+    : spec.voice && (!language || language === "en")
+      ? resolveGenderVoiceId(spec.voice)
+      : language
+        ? resolveLanguageVoiceId(language)
+        : undefined;
+  const ttsOpts = ttsVoiceId ? { voiceId: ttsVoiceId } : undefined;
+
+  // Set up everything Vent needs to hear and speak BEFORE dialing the agent:
+  // if Deepgram fails here, the run fails before the customer's platform has
+  // placed (and billed) a call. The caller's first turn is generated only
+  // after the real greeting turn is collected.
   const turnVAD = new VoiceActivityDetector({ silenceThresholdMs: adaptiveThreshold.thresholdMs });
   const batchVAD = new BatchVAD();
   const transcriber = new StreamingTranscriber(language ? { language } : undefined);
+  // Persistent TTS session — one WebSocket for all turns (avoids REST rate limit)
+  const ttsSession = new TTSSession(ttsOpts);
 
   await Promise.all([
     turnVAD.init(),
     batchVAD.init(),
     transcriber.connect(),
-  ]);
+    ttsSession.connect(),
+  ]).catch(ventFailure);
 
   // Attach the opening STT feed BEFORE connecting the channel's transport so
   // no audio frames can arrive with zero listeners. Greeting-start clipping
@@ -129,20 +153,6 @@ export async function runConversationCall(
   channel.on("audio", openingFeedSTT);
   await channel.connect();
   await opts.onConnected?.();
-
-  // Resolve TTS voice ID. Priority: caller_audio.accent > voice (English-only) > language default.
-  const ttsVoiceId = spec.caller_audio?.accent
-    ? resolveAccentVoiceId(spec.caller_audio.accent)
-    : spec.voice && (!language || language === "en")
-      ? resolveGenderVoiceId(spec.voice)
-      : language
-        ? resolveLanguageVoiceId(language)
-        : undefined;
-  const ttsOpts = ttsVoiceId ? { voiceId: ttsVoiceId } : undefined;
-
-  // Persistent TTS session — one WebSocket for all turns (avoids REST rate limit)
-  const ttsSession = new TTSSession(ttsOpts);
-  await ttsSession.connect();
 
   const openingSpeaker = await channel.getOpeningSpeaker?.() ?? "agent";
   const maxCallDurationSeconds = await channel.getMaxCallDurationSeconds?.() ?? null;
@@ -176,6 +186,9 @@ export async function runConversationCall(
 
   // Track channel disconnect — when the agent hangs up, the call ends naturally.
   let channelDisconnected = false;
+  /** How a completed call ended, when Vent ended it or the connection closed. */
+  let endNote: string | undefined;
+  const connectionClosedNote = "The connection closed (platform, agent or network).";
   const safeDisconnect = async () => {
     if (channelDisconnected || !channel.connected) return;
     try {
@@ -188,7 +201,7 @@ export async function runConversationCall(
   };
   channel.on("disconnected", () => {
     channelDisconnected = true;
-    console.log(`    [end] Channel disconnected — agent ended the call`);
+    console.log(`    [end] Connection closed`);
   });
 
   /**
@@ -390,6 +403,7 @@ export async function runConversationCall(
       caller_prompt: spec.caller_prompt,
       status: finalStatus,
       ...(finalError != null ? { error: finalError } : {}),
+      ...(finalStatus === "completed" && endNote ? { end_note: endNote } : {}),
       transcript,
       observed_tool_calls: observedToolCalls.length > 0 ? observedToolCalls : undefined,
       duration_ms: Math.round(performance.now() - startTime),
@@ -402,12 +416,19 @@ export async function runConversationCall(
     // For assistant-speaks-first platforms, turn -1 collects the agent greeting.
     // For caller-speaks-first platforms, we start directly at turn 0.
     for (let turn = collectGreetingFirst ? -1 : 0; turn < spec.max_turns; turn++) {
-      if (channelDisconnected) break;
+      if (channelDisconnected) {
+        endNote = connectionClosedNote;
+        break;
+      }
       if (opts.signal?.aborted) {
-        // External cancel (user ran `vent-hq stop`, hit Ctrl+C, or the run
-        // was force-cancelled). Throw so buildResult("error") preserves the
-        // partial transcript and the finally block hangs up the channel.
-        throw new Error("Cancelled by user");
+        // A string reason means Vent itself stopped the call (time limit,
+        // worker shutdown); anything else is the user cancelling.
+        const reason = opts.signal.reason;
+        if (typeof reason === "string" && reason !== "cancelled") {
+          throw new Error(`Vent stopped the call: ${reason}`);
+        }
+        endNote = "Cancelled by user.";
+        break;
       }
       if (turn >= 0 && !canStartAnotherTurn()) {
         console.log(`    [call-limit] maxDurationSeconds reached — stopping before turn=${turn}`);
@@ -422,10 +443,11 @@ export async function runConversationCall(
         console.log(`    [opening] collect_start t=${sinceStartMs(startTime)}ms`);
 
         turnVAD.silenceThresholdMs = adaptiveThreshold.thresholdMs;
+        const openingWaitMs = resolveCollectionTimeoutMs(30000);
         const { audio: agentAudio, stats, timedOut } = await collectUntilEndOfTurn(
           channel,
           {
-            timeoutMs: resolveCollectionTimeoutMs(30000),
+            timeoutMs: openingWaitMs,
             vad: turnVAD,
             preferPlatformEOT: !!channel.hasPlatformEndOfTurn,
             debugLabel: "opening",
@@ -437,7 +459,8 @@ export async function runConversationCall(
         );
 
         if (timedOut && stats.speechOnsetAt === null) {
-          throw new Error("Agent connected but did not speak within 30s");
+          endNote = `The agent connected but said nothing for ${Math.round(openingWaitMs / 1000)}s; Vent hung up.`;
+          break;
         }
 
         let greetingText = "";
@@ -453,7 +476,6 @@ export async function runConversationCall(
         // collection to avoid feeding Deepgram during caller-LLM/TTS idle
         // audio (which slows CloseStream).
         channel.off("audio", openingFeedSTT);
-        channel.consumeAgentText?.();
 
         if (greetingText) {
           const vadMs = Math.round(performance.now() - vadStart);
@@ -499,7 +521,7 @@ export async function runConversationCall(
       let sendTime: number;
 
       let callerAudio: Buffer | null = null;
-      let callerDecision: Awaited<ReturnType<CallerLLM["nextUtterance"]>>;
+      let callerDecision: CallerDecision | null;
       let llmMs: number = 0;
       let spokenCallerText: string | null = null;
 
@@ -531,6 +553,8 @@ export async function runConversationCall(
       });
 
       // Concurrent audio sender — sends chunks sequentially as they arrive
+      // Caught here: an unhandled rejection would crash the call process.
+      const send = { error: null as unknown };
       const audioSendPromise = (async () => {
         while (true) {
           if (audioSendQueue.length > 0) {
@@ -544,16 +568,12 @@ export async function runConversationCall(
             await new Promise<void>((r) => { audioNotify.fn = r; });
           }
         }
-      })();
+      })().catch((err: unknown) => { send.error = err; });
 
       // Stream LLM — each sentence is sent to Deepgram TTS as it's detected
       callerDecision = await caller.streamNextUtterance(
         agentText,
-        transcript,
-        (sentence) => {
-          const spoken = prepareCallerSpeechText(channel, sentence);
-          ttsStream.sendText((spoken ?? sentence) + " ");
-        },
+        (sentence) => ttsStream.sendText(prepareCallerSpeechText(sentence) + " "),
       );
 
       // Flush remaining TTS buffer and wait for all audio to arrive
@@ -561,6 +581,11 @@ export async function runConversationCall(
       ttsFinished = true;
       audioNotify.fn?.();
       await audioSendPromise;
+      // Hang-up while the caller was talking ends the call below; a send
+      // failure on a live connection is a platform error.
+      if (send.error && !channelDisconnected && channel.connected) {
+        throw new PlatformError(send.error instanceof Error ? send.error.message : String(send.error));
+      }
 
       // Flush the adapter's audio buffer (drain remaining frames + silence tail)
       await channel.flushAudioBuffer?.();
@@ -572,7 +597,10 @@ export async function runConversationCall(
 
       const shouldStopAfterAgentReply = callerDecision?.mode === "closing";
 
-      if (!callerDecision || callerDecision.mode === "end_now") {
+      if (!callerDecision) {
+        throw new Error("Vent's caller LLM returned an empty or unreadable response");
+      }
+      if (callerDecision.mode === "end_now") {
         break;
       }
 
@@ -581,10 +609,11 @@ export async function runConversationCall(
 
         channel.on("audio", feedSTT);
         const vadStart = performance.now();
+        const waitTurnWaitMs = resolveCollectionTimeoutMs(30000);
         const { audio: agentAudio, stats, timedOut } = await collectUntilEndOfTurn(
           channel,
           {
-            timeoutMs: resolveCollectionTimeoutMs(30000),
+            timeoutMs: waitTurnWaitMs,
             vad: turnVAD,
             preferPlatformEOT: !!channel.hasPlatformEndOfTurn,
             debugLabel: `turn-${turn}-wait`,
@@ -607,10 +636,8 @@ export async function runConversationCall(
           channel.off("audio", feedSTT);
           const diag = channel.getReceiveDiagnostics?.();
           if (diag) console.log(diag);
-          throw new Error(
-            `Agent stopped responding — no speech detected for 30s after turn ${turn + 1}. ` +
-            `This may indicate the agent's backend (STT/LLM/TTS) is overwhelmed or rate-limited.`
-          );
+          endNote = `No agent speech for ${Math.round(waitTurnWaitMs / 1000)}s after the caller's turn; Vent hung up.`;
+          break;
         }
 
         adaptiveThreshold.update(stats);
@@ -624,10 +651,6 @@ export async function runConversationCall(
           let { text, confidence } = await transcriber.finalize();
           const sttMs = Math.round(performance.now() - sttStart);
           const textSource = text ? "stt" : "empty";
-          // Drain platform transcript buffer so it doesn't accumulate across
-          // turns. Vent's own STT is authoritative — we listen like a real
-          // caller would hear the call.
-          channel.consumeAgentText?.();
 
           agentText = text;
 
@@ -675,7 +698,7 @@ export async function runConversationCall(
       // Audio was already sent to the channel during the streaming pipeline above.
       // Set up remaining state for this turn.
       callerText = callerDecision.text;
-      spokenCallerText = prepareCallerSpeechText(channel, callerText);
+      spokenCallerText = prepareCallerSpeechText(callerText);
       const emittedCallerText = spokenCallerText ?? callerText;
 
       console.log(
@@ -690,6 +713,7 @@ export async function runConversationCall(
       console.log(`[turn-timing] turn=${turn} caller_llm=${llmMs}ms tts=${ttsMs}ms`);
 
       if (channelDisconnected || !channel.connected) {
+        endNote = connectionClosedNote;
         if (turn === 0 && collectGreetingFirst) {
           console.log(
             `    [opening-error] caller turn skipped because the channel disconnected before turn 0 send`
@@ -724,10 +748,11 @@ export async function runConversationCall(
       // so frames take seconds to deliver. The agent also needs processing time
       // (STT → LLM → TTS) before responding.
       const vadStart = performance.now();
+      const replyWaitMs = resolveCollectionTimeoutMs(30000);
       let { audio: agentAudio, stats, timedOut } = await collectUntilEndOfTurn(
         channel,
         {
-          timeoutMs: resolveCollectionTimeoutMs(30000),
+          timeoutMs: replyWaitMs,
           vad: turnVAD,
           preferPlatformEOT: !!channel.hasPlatformEndOfTurn,
           debugLabel: `turn-${turn}`,
@@ -747,10 +772,8 @@ export async function runConversationCall(
         channel.off("audio", feedSTT);
         const diag = channel.getReceiveDiagnostics?.();
         if (diag) console.log(diag);
-        throw new Error(
-          `Agent stopped responding — no speech detected for 30s after turn ${turn + 1}. ` +
-          `This may indicate the agent's backend (STT/LLM/TTS) is overwhelmed or rate-limited.`
-        );
+        endNote = `No agent speech for ${Math.round(replyWaitMs / 1000)}s after the caller's turn; Vent hung up.`;
+        break;
       }
 
       // Adapt threshold for next turn based on this turn's response cadence
@@ -783,9 +806,6 @@ export async function runConversationCall(
         let { text, confidence } = await transcriber.finalize();
         let sttMs = Math.round(performance.now() - sttStart);
         const textSource = text ? "stt" : "empty";
-        // Drain platform buffer — Vent's own STT is authoritative (we listen
-        // like a real caller).
-        channel.consumeAgentText?.();
 
         agentText = text;
 
@@ -822,7 +842,6 @@ export async function runConversationCall(
               const contSttStart = performance.now();
               const contResult = await transcriber.finalize();
               const contSttMs = Math.round(performance.now() - contSttStart);
-              channel.consumeAgentText?.();
 
               agentAudio = concatPcm([fillerAudio, continuation.audio]);
               agentText = agentText + " " + (contResult.text || "");
@@ -893,8 +912,10 @@ export async function runConversationCall(
 
     return await buildResult("completed");
   } catch (err) {
-    const errorMsg = err instanceof Error ? err.message : String(err);
-    console.error(`    [executor] aborted mid-conversation: ${errorMsg}`);
+    const raw = err instanceof Error ? err.message : String(err);
+    console.error(`    [executor] aborted mid-conversation: ${raw}`);
+    // Inside the conversation, only PlatformError comes from the agent's side.
+    const errorMsg = err instanceof PlatformError || raw.startsWith(VENT_FAILED) ? raw : VENT_FAILED + raw;
     return await buildResult("error", errorMsg);
   } finally {
     // Each cleanup is wrapped in its own try/catch — a throw in any one

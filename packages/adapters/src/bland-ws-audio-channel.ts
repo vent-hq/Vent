@@ -5,22 +5,23 @@
  * Binary PCM16 audio at 44.1kHz wire rate, resampled to 24kHz internally.
  *
  * Flow:
- * 1. POST /v1/agents — create ephemeral web agent with pathway/task + webhook
+ * 1. POST /v1/agents — create ephemeral web agent with pathway/task
  * 2. POST /v1/agents/{id}/authorize — get single-use token
  * 3. Connect wss://stream-v2.aws.dc8.bland.ai/ws/connect/blandshared?agent={id}&token={token}&sampleRate=24000
- * 4. Binary frames = PCM16 bidirectional. Text frames = JSON events.
- * 5. On session end, Bland POSTs call_id to our webhook URL.
- * 6. Post-call: GET /v1/calls/{call_id} for full data.
- * 7. Cleanup: DELETE /v1/agents/{id}.
+ * 4. Binary frames = PCM16 bidirectional. Text frames = JSON events,
+ *    including `callID` with the call_id.
+ * 5. Post-call: GET /v1/calls/{call_id} (transcript, tool calls, metadata)
+ *    and GET /v1/event_stream/{call_id} (LLM/TTS latency).
+ * 6. Cleanup: DELETE /v1/agents/{id}.
+ *
+ * No webhook: everything Bland would push during the call is available from
+ * the post-call endpoints, so the worker needs no public inbound URL.
  */
 
-import http from "node:http";
-import { randomBytes } from "node:crypto";
 import WebSocket from "ws";
 import { resample } from "@vent/voice";
 import type { ObservedToolCall, CallMetadata, ComponentLatency } from "@vent/shared";
-import { BaseAudioChannel, type SendAudioOptions } from "./audio-channel.js";
-import { WebhookServer } from "./webhook-server.js";
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type ComfortNoiseMode, type SendAudioOptions } from "./audio-channel.js";
 import {
   BLAND_API_BASE,
   type BlandCallOptions,
@@ -31,103 +32,54 @@ import {
   fetchBlandCallResponse,
   fetchBlandCorrectedTranscripts,
   fetchBlandEventStream,
+  findBlandCallIdByAgent,
+  isBlandCallDone,
   buildBlandCallMetadata,
   buildBlandTranscripts,
-  getFullCallerTranscriptFromData,
-  getAgentTextFromData,
-  parseLatencyMessage,
-  compactUnknownRecord,
-  sleep,
 } from "./bland-shared.js";
+import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
 
 export interface BlandWsAudioChannelConfig {
   apiKey: string;
   /** pathway_id (UUID) or empty if using task mode */
   agentId?: string;
-  /** Public base URL for webhook callbacks (e.g. https://host.fly.dev) */
-  publicBaseUrl: string;
   /** Bland-specific call options */
   callOptions?: BlandCallOptions;
 }
 
-/** Audio energy threshold for detecting agent speech start. Below this
- *  amplitude a frame is considered silent. Used only to fire
- *  `platformSpeechStart` so the collector can extend a turn through
- *  inter-sentence pauses — never to fire `platformEndOfTurn`. */
-const SILENCE_MAX_AMPLITUDE = 200;
 
-/** Comfort noise: 20ms frame at 44100Hz = 882 samples = 1764 bytes */
-const COMFORT_NOISE_FRAME_SAMPLES = 882;
-const COMFORT_NOISE_INTERVAL_MS = 20;
-const COMFORT_NOISE_AMPLITUDE = 400;
-
-const WS_CONNECT_TIMEOUT_MS = 30_000;
-const CALL_ID_TIMEOUT_MS = 10_000;
 
 const BLAND_WS_BASE = "wss://stream-v2.aws.dc8.bland.ai";
 
 export class BlandWsAudioChannel extends BaseAudioChannel {
   protected override outputSampleRate = 44100;
   protected override pacingIntervalMs = 10; // 2x real-time
+  // Zeros, not noise: Bland's server-side VAD hears any non-zero audio as the
+  // caller talking and barges in, cutting the agent off mid-sentence. Its
+  // browser SDK sends near-zero audio thanks to noise suppression.
+  protected override comfortNoise: ComfortNoiseMode = "silence";
 
-  // Bland's WS does not emit reliable agent speech-state events (its client SDK
-  // just generic-forwards JSON, no transcript/speech_start/speech_stop event
-  // types exist on the wire). An audio-silence heuristic on the receive PCM
-  // is too aggressive for inter-sentence TTS pauses and was truncating
-  // greetings mid-utterance. Match Vapi's strategy: drive end-of-turn from
-  // the collector's VAD with a continuation grace, and only emit
-  // `platformSpeechStart` from local energy detection so the collector can
-  // extend a turn when the agent resumes after a pause.
+  // Bland's WS has no agent speech-state events (no speech_start/speech_stop on
+  // the wire), so Vent's own voice detection decides when the agent's turn ends.
   hasPlatformEndOfTurn = false;
-  preferredSilenceThresholdMs = 1200;
-  // postVadContinuationMs is set conditionally in the constructor based on
-  // whether the call config declares tools. Bland sends webhook/dynamic_data
-  // events only AFTER tool completion — there's no real-time tool-start
-  // signal, so we extend the post-VAD continuation only when tools are
-  // possible. Tool-less agents don't pay the dead-air cost.
-  postVadContinuationMs = 1000;
-  postToolCallContinuationMs = 3500;
 
   private config: BlandWsAudioChannelConfig;
   private ws: WebSocket | null = null;
   private webAgentId: string | null = null;
-  private channelId: string;
+  /** Kept after the agent is deleted, to find the call_id post-call. */
+  private createdAgentId: string | null = null;
   private callId: string | null = null;
-  private callIdResolve: (() => void) | null = null;
 
   private cachedCallResponse: BlandCallResponse | null = null;
   private cachedCorrectedTranscripts: BlandCorrectedTranscriptEntry[] | null = null;
   private componentLatencies: ComponentLatency[] = [];
-  private realtimeToolCalls: ObservedToolCall[] = [];
-  private realtimeCitations: unknown[] = [];
-
-  // Tracks transitions silent → speaking on the receive audio so we can fire
-  // `platformSpeechStart` once per resumption (used by the collector to
-  // cancel the post-VAD continuation grace when the agent picks back up).
-  private _agentSpeaking = false;
-
-  // Comfort noise
-  private comfortNoiseTimer: ReturnType<typeof setInterval> | null = null;
 
   // Playback sample rate (may be updated by server JSON message)
   private playbackSampleRate = 44100;
 
-  // WebhookServer ref (for webhook routing)
-  private webhookServer: WebhookServer | null = null;
-
-  // EOT analysis logging
-  private callStartedAt: number | null = null;
-  private webhookLog: Array<{ type: string; relativeMs: number; detail: string }> = [];
-
   constructor(config: BlandWsAudioChannelConfig) {
     super();
     this.config = config;
-    this.channelId = randomBytes(12).toString("hex");
-    // Only pay the 3.5s dead-air cost when the call actually declares tools.
-    // For tool-less agents the default 1s VAD continuation is plenty.
-    if (config.callOptions?.tools && config.callOptions.tools.length > 0) {
-      this.postVadContinuationMs = 3500;
-    }
   }
 
   get connected(): boolean {
@@ -137,26 +89,9 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
   async connect(): Promise<void> {
     const connectStart = Date.now();
     this.enableRecordingCapture();
-    this.realtimeCitations = [];
 
-    // 1. Get WebhookServer instance for receiving Bland callbacks
-    this.webhookServer = await WebhookServer.acquire({
-      publicHost: new URL(this.config.publicBaseUrl).hostname,
-      port: parseInt(process.env["RUNNER_LISTEN_PORT"] ?? "0", 10) || undefined,
-      publicPort: process.env["RUNNER_LISTEN_PORT"] ? null : undefined,
-    });
-
-    const machineId = process.env["FLY_MACHINE_ID"];
-    const webhookPath = machineId
-      ? `/bland-ws-webhook/${machineId}/${this.channelId}`
-      : `/bland-ws-webhook/${this.channelId}`;
-    const webhookUrl = `${this.config.publicBaseUrl}${webhookPath}`;
-
-    // Register webhook handler for this channel
-    this.webhookServer.registerHandler(this.channelId, (req, res) => this.handleWebhook(req, res));
-
-    // 2. Create ephemeral web agent
-    const agentBody = this.buildAgentBody(webhookUrl);
+    // 1. Create ephemeral web agent
+    const agentBody = this.buildAgentBody();
     console.log(`[bland-ws] POST /v1/agents → pathway_id: ${agentBody.pathway_id ?? "none"}`);
 
     const agentRes = await fetch(`${BLAND_API_BASE}/v1/agents`, {
@@ -178,6 +113,7 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
     if (!this.webAgentId) {
       throw new Error(`Bland POST /v1/agents response missing agent_id: ${JSON.stringify(agentData)}`);
     }
+    this.createdAgentId = this.webAgentId;
     console.log(`[bland-ws] Created web agent: ${this.webAgentId}`);
 
     // 3. Authorize session
@@ -224,36 +160,11 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       throw new Error("Bland WebSocket channel not connected");
     }
-    this.stopComfortNoise();
     super.sendAudio(pcm, opts);
-  }
-
-  startComfortNoise(): void {
-    if (this.comfortNoiseTimer) return;
-    // Send zero-filled silence frames instead of random noise.
-    // Bland's server-side VAD detects non-zero audio as speech and triggers
-    // barge-in, cutting the agent mid-sentence. Their browser SDK relies on
-    // noise suppression to send near-zero audio when the user is silent.
-    const silenceFrame = Buffer.alloc(COMFORT_NOISE_FRAME_SAMPLES * 2); // zeros
-    this.comfortNoiseTimer = setInterval(() => {
-      if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-        this.stopComfortNoise();
-        return;
-      }
-      this.ws.send(silenceFrame);
-    }, COMFORT_NOISE_INTERVAL_MS);
-  }
-
-  stopComfortNoise(): void {
-    if (this.comfortNoiseTimer) {
-      clearInterval(this.comfortNoiseTimer);
-      this.comfortNoiseTimer = null;
-    }
   }
 
   async disconnect(): Promise<void> {
     this.stopComfortNoise();
-    this._agentSpeaking = false;
 
     // Close WebSocket
     if (this.ws) {
@@ -263,41 +174,25 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
 
     // Cleanup: delete ephemeral web agent
     await this.deleteWebAgent();
-
-    // Unregister webhook handler
-    if (this.webhookServer) {
-      this.webhookServer.unregisterHandler(this.channelId);
-      await this.webhookServer.release();
-      this.webhookServer = null;
-    }
   }
 
   // ── Post-call data ────────────────────────────────────────
 
   async getCallData(): Promise<ObservedToolCall[]> {
-    await this.waitForCallId();
     const data = await this.fetchCallResponseCached();
-    if (!data) return [...this.realtimeToolCalls];
-    const parsed = parseBlandToolCalls(data);
-    return parsed.length > 0 ? parsed : [...this.realtimeToolCalls];
+    return data ? parseBlandToolCalls(data) : [];
   }
 
   async getCallMetadata(): Promise<CallMetadata | null> {
-    await this.waitForCallId();
     const data = await this.fetchCallResponseCached();
     if (!data) {
-      const providerMetadata = compactUnknownRecord({
-        citations: this.realtimeCitations.length > 0 ? this.realtimeCitations : undefined,
-      });
-      if (!this.callId && !providerMetadata) return null;
       return {
         platform: "bland",
         provider_call_id: this.callId ?? undefined,
-        provider_metadata: providerMetadata,
+        provider_warnings: [callDataUnavailableWarning("Bland")],
       };
     }
-
-    return buildBlandCallMetadata(data, this.callId, this.realtimeCitations, this.componentLatencies);
+    return buildBlandCallMetadata(data, this.callId);
   }
 
   getComponentTimings(): ComponentLatency[] {
@@ -306,14 +201,6 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
 
   getTranscripts(): Array<{ turnIndex: number; text: string }> {
     return buildBlandTranscripts(this.cachedCallResponse, this.cachedCorrectedTranscripts);
-  }
-
-  consumeAgentText(): string {
-    return getAgentTextFromData(this.cachedCallResponse);
-  }
-
-  getFullCallerTranscript(): string {
-    return getFullCallerTranscriptFromData(this.cachedCallResponse, this.cachedCorrectedTranscripts);
   }
 
   // ── Private: WebSocket connection ─────────────────────────
@@ -327,17 +214,16 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
         if (!resolved) {
           resolved = true;
           ws.close();
-          reject(new Error(`Bland WebSocket connect timeout (${WS_CONNECT_TIMEOUT_MS}ms)`));
+          reject(new Error(`Bland WebSocket connect timeout (${CONNECT_TIMEOUT_MS}ms)`));
         }
-      }, WS_CONNECT_TIMEOUT_MS);
+      }, CONNECT_TIMEOUT_MS);
 
       ws.on("open", () => {
         if (resolved) return;
         resolved = true;
         clearTimeout(timeout);
         this.ws = ws;
-        this.callStartedAt = Date.now();
-        this._connectTimestampMs = this.callStartedAt;
+        this._connectTimestampMs = Date.now();
         this._connectMonotonicMs = performance.now();
         this.setupHandlers(ws);
         resolve();
@@ -406,7 +292,6 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
     }
 
     this.captureAgentAudio(pcm24k, performance.now() - this._connectMonotonicMs);
-    this.processAgentAudioSilence(pcm24k);
     this.emit("audio", pcm24k);
   }
 
@@ -435,10 +320,6 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
       if (type === "callID" && typeof msg.payload === "string" && !this.callId) {
         this.callId = msg.payload;
         console.log(`[bland-ws] Got call_id from WebSocket: ${this.callId}`);
-        if (this.callIdResolve) {
-          this.callIdResolve();
-          this.callIdResolve = null;
-        }
       }
 
       // Log all JSON messages for debugging
@@ -448,151 +329,18 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
     }
   }
 
-  // ── Speech-start detection on receive audio ───────────────
-
-  private static isSilentFrame(pcm: Buffer): boolean {
-    const int16 = new Int16Array(pcm.buffer, pcm.byteOffset, pcm.length / 2);
-    let maxAmp = 0;
-    for (let i = 0; i < int16.length; i++) {
-      const abs = int16[i]! < 0 ? -int16[i]! : int16[i]!;
-      if (abs > maxAmp) maxAmp = abs;
-    }
-    return maxAmp < SILENCE_MAX_AMPLITUDE;
-  }
-
-  private processAgentAudioSilence(pcm24k: Buffer): void {
-    const silent = BlandWsAudioChannel.isSilentFrame(pcm24k);
-    if (silent) {
-      if (this._agentSpeaking) this._agentSpeaking = false;
-      return;
-    }
-    if (!this._agentSpeaking) {
-      this._agentSpeaking = true;
-      this.emit("platformSpeechStart");
-    }
-  }
-
-  // ── Webhook handler ───────────────────────────────────────
-
-  private handleWebhook(req: http.IncomingMessage, res: http.ServerResponse): void {
-    if (req.method !== "POST") {
-      res.writeHead(405);
-      res.end();
-      return;
-    }
-
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString();
-    });
-    req.on("end", () => {
-      res.writeHead(200, { "Content-Type": "application/json" });
-      res.end('{"status":"ok"}');
-
-      try {
-        const event = JSON.parse(body) as Record<string, unknown>;
-        const eventType = (event.event ?? event.type ?? event.category ?? "") as string;
-
-        console.log(`[bland-ws] Webhook (${this.channelId}): type=${eventType} ${JSON.stringify(event).slice(0, 500)}`);
-
-        const relMs = this.eotRelMs();
-        this.webhookLog.push({ type: eventType, relativeMs: relMs, detail: (event.message ?? "") as string });
-
-        // Extract call_id from webhook — this is our main way to get it
-        const webhookCallId = (event.call_id ?? event.callId) as string | undefined;
-        if (webhookCallId && !this.callId) {
-          this.callId = webhookCallId;
-          console.log(`[bland-ws] Got call_id from webhook: ${this.callId}`);
-          if (this.callIdResolve) {
-            this.callIdResolve();
-            this.callIdResolve = null;
-          }
-        }
-
-        // Parse latency events
-        if (eventType === "latency" || event.category === "latency") {
-          const msg = (event.message ?? "") as string;
-          const timing = parseLatencyMessage(msg);
-          if (timing) {
-            this.componentLatencies.push(timing);
-            console.log(`[bland-ws] latency: STT=${timing.stt_ms ?? "?"}ms LLM=${timing.llm_ms ?? "?"}ms TTS=${timing.tts_ms ?? "?"}ms`);
-          }
-        }
-
-        // Bland webhooks fire only after tool completion — no real-time tool-call-start
-        // signal, so toolCallActive gating is not available on this adapter.
-
-        // Capture dynamic_data events
-        if (eventType === "dynamic_data") {
-          const data = (typeof event.data === "object" && event.data !== null ? event.data : event) as Record<string, unknown>;
-          const name = (data.url ?? data.name ?? data.tool_name ?? "dynamic_data") as string;
-          this.realtimeToolCalls.push({
-            name,
-            arguments: (data.request_data ?? data.params ?? {}) as Record<string, unknown>,
-            result: data.response ?? data.result ?? data.response_data,
-            successful: data.status === "success" || data.status_code === 200 || data.response != null,
-            timestamp_ms: relMs,
-          });
-        }
-
-        // Capture webhook events
-        if (eventType === "webhook") {
-          const data = (typeof event.data === "object" && event.data !== null ? event.data : event) as Record<string, unknown>;
-          const name = (data.url ?? data.name ?? data.tool_name ?? "webhook") as string;
-          this.realtimeToolCalls.push({
-            name,
-            arguments: (data.request_data ?? data.params ?? {}) as Record<string, unknown>,
-            result: data.response ?? data.result ?? data.response_data,
-            successful: data.status === "success" || data.status_code === 200 || data.response != null,
-            timestamp_ms: relMs,
-          });
-        }
-
-        if (eventType === "citations") {
-          const citationPayload = event.data ?? event.citations ?? event.result ?? event;
-          this.realtimeCitations.push(citationPayload);
-        }
-
-        // Capture "Storing dynamic data" from call events
-        if (eventType === "call") {
-          const msg = (event.message ?? "") as string;
-          const storeMatch = msg.match(/^Storing dynamic data:\s*\n\n\s*(\S+)\s*:\s*([\s\S]+)$/);
-          if (storeMatch) {
-            const varName = storeMatch[1]!;
-            let varValue: unknown = storeMatch[2]!.trim();
-            try { varValue = JSON.parse(varValue as string); } catch { /* keep as string */ }
-            this.realtimeToolCalls.push({
-              name: `store_${varName}`,
-              arguments: {},
-              result: varValue,
-              successful: true,
-              timestamp_ms: relMs,
-            });
-          }
-        }
-      } catch {
-        // Ignore malformed webhook payloads
-      }
-    });
-  }
-
   // ── Helpers ───────────────────────────────────────────────
 
-  private eotRelMs(): number {
-    return Date.now() - (this.callStartedAt ?? Date.now());
-  }
-
-  private buildAgentBody(webhookUrl: string): Record<string, unknown> {
+  private buildAgentBody(): Record<string, unknown> {
     const opts = this.config.callOptions;
     const body: Record<string, unknown> = {
       record: true,
       wait_for_greeting: opts?.wait_for_greeting ?? false,
-      webhook: webhookUrl,
-      webhook_events: ["latency", "tool", "call", "dynamic_data", "webhook", "citations"],
     };
 
     if (this.config.agentId) body.pathway_id = this.config.agentId;
-    if (opts?.task) body.task = opts.task;
+    // Web agents take the instructions as `prompt` (POST /v1/agents); `task` is the phone-call field.
+    if (opts?.task) body.prompt = opts.task;
     if (opts?.persona_id) body.persona_id = opts.persona_id;
     if (opts?.voice) body.voice = opts.voice;
     if (opts?.model) body.model = opts.model;
@@ -611,41 +359,35 @@ export class BlandWsAudioChannel extends BaseAudioChannel {
     if (opts?.start_node_id) body.start_node_id = opts.start_node_id;
     if (opts?.pathway_version != null) body.pathway_version = opts.pathway_version;
 
-    body.metadata = { vent_channel_id: this.channelId };
-
     return body;
   }
 
-  /** Wait for call_id to arrive from webhook, with timeout. */
-  private async waitForCallId(): Promise<void> {
-    if (this.callId) return;
-    await new Promise<void>((resolve) => {
-      this.callIdResolve = resolve;
-      setTimeout(() => {
-        if (!this.callId) {
-          console.warn(`[bland-ws] call_id not received within ${CALL_ID_TIMEOUT_MS}ms`);
-        }
-        resolve();
-        this.callIdResolve = null;
-      }, CALL_ID_TIMEOUT_MS);
-    });
+  private callData?: Promise<BlandCallResponse | null>;
+
+  /** One shared fetch per call: every caller waits on the same poll. */
+  private fetchCallResponseCached(): Promise<BlandCallResponse | null> {
+    this.callData ??= this.loadCallData();
+    return this.callData;
   }
 
-  private async fetchCallResponseCached(): Promise<BlandCallResponse | null> {
-    if (this.cachedCallResponse) return this.cachedCallResponse;
-    if (!this.callId) return null;
+  private async loadCallData(): Promise<BlandCallResponse | null> {
+    const apiKey = this.config.apiKey;
+    const agentId = this.createdAgentId;
+    if (!this.callId && agentId) {
+      this.callId = await pollUntilReady("bland-call-id", () => findBlandCallIdByAgent(apiKey, agentId), () => true);
+    }
+    const callId = this.callId;
+    if (!callId) return null;
 
-    const data = await fetchBlandCallResponse(this.config.apiKey, this.callId);
+    const data = await pollUntilReady("bland-postcall", () => fetchBlandCallResponse(apiKey, callId), isBlandCallDone);
     if (!data) return null;
 
     this.cachedCallResponse = data;
-    this.cachedCorrectedTranscripts = await fetchBlandCorrectedTranscripts(this.config.apiKey, this.callId);
-    if (this.componentLatencies.length === 0) {
-      const eventLatencies = await fetchBlandEventStream(this.config.apiKey, this.callId);
-      this.componentLatencies.push(...eventLatencies);
-    }
+    this.cachedCorrectedTranscripts = await fetchBlandCorrectedTranscripts(apiKey, callId);
+    this.componentLatencies = await fetchBlandEventStream(apiKey, callId);
     return data;
   }
+
 
   /** Delete the ephemeral web agent (cleanup, errors ignored). */
   private async deleteWebAgent(): Promise<void> {

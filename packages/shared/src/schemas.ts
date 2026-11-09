@@ -1,4 +1,14 @@
 import { z } from "zod";
+import { CALLER_ACCENTS } from "./constants.js";
+
+export const RefreshTokenRequestSchema = z.object({
+  refresh_token: z.string().regex(/^vent_[0-9a-f]{48}$/),
+});
+
+export const AccessCredentialsSchema = z.object({
+  access_token: z.string().min(1),
+  refresh_token: RefreshTokenRequestSchema.shape.refresh_token,
+});
 
 // ============================================================
 // V2 Schemas — Dynamic voice agent calls
@@ -24,7 +34,7 @@ export const CallerAudioEffectsSchema = z.object({
   speakerphone: z.boolean().optional(),
   mic_distance: z.enum(["close", "normal", "far"]).optional(),
   clarity: z.number().min(0).max(1).optional(),
-  accent: z.string().optional(),
+  accent: z.enum(CALLER_ACCENTS).optional(),
   packet_loss: z.number().min(0).max(0.3).optional(),
   jitter_ms: z.number().min(0).max(100).optional(),
 });
@@ -33,8 +43,6 @@ export const ConversationCallSpecSchema = z.object({
   name: z.string().optional(),
   caller_prompt: z.string().min(1),
   max_turns: z.number().int().min(1).max(50).default(6),
-
-  silence_threshold_ms: z.number().int().min(200).max(10000).optional(),
   persona: CallerPersonaSchema,
   caller_audio: CallerAudioEffectsSchema.optional(),
   /** ISO 639-1 language code for multilingual calls (e.g., "es", "fr", "de"). Caller speaks this language, STT transcribes it, judge evaluates in it. */
@@ -168,11 +176,11 @@ export const ConversationTurnSchema = z.object({
 
 export const LatencyMetricsSchema = z.object({
   ttfb_per_turn_ms: z.array(z.number()),
-  p50_ttfb_ms: z.number(),
-  p90_ttfb_ms: z.number(),
-  p95_ttfb_ms: z.number(),
-  p99_ttfb_ms: z.number(),
-  first_turn_ttfb_ms: z.number(),
+  p50_ttfb_ms: z.number().optional(),
+  p90_ttfb_ms: z.number().optional(),
+  p95_ttfb_ms: z.number().optional(),
+  p99_ttfb_ms: z.number().optional(),
+  first_turn_ttfb_ms: z.number().optional(),
   ttfw_per_turn_ms: z.array(z.number()).optional(),
   p50_ttfw_ms: z.number().optional(),
   p90_ttfw_ms: z.number().optional(),
@@ -270,7 +278,7 @@ export const CallMetadataSchema = z.object({
 });
 
 export const ConversationMetricsSchema = z.object({
-  mean_ttfb_ms: z.number(),
+  mean_ttfb_ms: z.number().optional(),
   mean_ttfw_ms: z.number().optional(),
   latency: LatencyMetricsSchema.optional(),
   tool_calls: ToolCallMetricsSchema.optional(),
@@ -283,6 +291,7 @@ export const ConversationCallResultSchema = z.object({
   name: z.string().optional(),
   caller_prompt: z.string(),
   status: z.enum(["completed", "error"]),
+  end_note: z.string().optional(),
   transcript: z.array(ConversationTurnSchema),
 
   observed_tool_calls: z.array(ObservedToolCallSchema).optional(),
@@ -308,7 +317,7 @@ export const RunAggregateV2Schema = z.object({
 // by the stop endpoint; `queued`/`running` by the lifecycle. If a new
 // runner-set terminal state is ever added, update both the DB enum and
 // this tuple.
-export const RUNNER_TERMINAL_STATUSES = ["pass", "fail"] as const;
+export const RUNNER_TERMINAL_STATUSES = ["pass", "fail", "cancelled"] as const;
 export type RunnerTerminalStatus = (typeof RUNNER_TERMINAL_STATUSES)[number];
 
 export const RunnerCallbackV2Schema = z.object({
@@ -317,6 +326,12 @@ export const RunnerCallbackV2Schema = z.object({
   conversation_result: ConversationCallResultSchema,
   aggregate: RunAggregateV2Schema,
   error_text: z.string().optional(),
+});
+
+/** Worker → API: the run failed before a result could be reported. */
+export const RunFailedCallbackSchema = z.object({
+  run_id: z.string().uuid(),
+  error_text: z.string().max(2000),
 });
 
 export const RunEventCallbackSchema = z.object({

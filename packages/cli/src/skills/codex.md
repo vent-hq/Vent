@@ -61,7 +61,7 @@ npx vent-hq agent start -f .vent/suite.X.json     # Start a shared local relay s
 npx vent-hq agent stop <session-id>               # Stop a shared local relay session
 ```
 
-If `~/.vent/credentials` is missing and `VENT_ACCESS_TOKEN` is not set, run `npx vent-hq init`. For an existing account, run `npx vent-hq login` or set `VENT_ACCESS_TOKEN`.
+If `~/.vent/credentials` is missing and neither `VENT_REFRESH_TOKEN` nor `VENT_ACCESS_TOKEN` is set, run `npx vent-hq init`. For an existing account, run `npx vent-hq login` or set `VENT_REFRESH_TOKEN` to an API key. Access JWTs renew automatically; `VENT_ACCESS_TOKEN` alone is short-lived.
 
 ## Suite Config
 
@@ -80,8 +80,7 @@ Local websocket suite:
   "calls": {
     "happy-path": {
       "caller_prompt": "You are Maria calling to reschedule her appointment to next Tuesday.",
-      "max_turns": 8,
-      "silence_threshold_ms": 1200
+      "max_turns": 8
     }
   }
 }
@@ -109,9 +108,9 @@ Write `caller_prompt` as a realistic caller with a name, goal, mood, constraints
 Call fields:
 
 - `caller_prompt` and `max_turns` are required.
-- `silence_threshold_ms` must be `200-10000`. Common ranges: FAQ `800-1200`, tool calls `2000-3000`, complex reasoning `3000-5000`.
 - `persona` supports `pace`, `clarity`, `disfluencies`, `cooperation`, `emotion`, `memory`, `intent_clarity`, and `confirmation_style`.
 - `caller_audio` supports noise, speed, speakerphone, mic distance, clarity, accent, packet loss, and jitter.
+- `caller_audio.accent` picks the caller's voice. Supported: `american` (default), `british`, `australian`, `filipino`, `spanish_mexican`, `spanish_peninsular`, `spanish_colombian`, `spanish_argentine`, `german`, `french`, `italian`, `dutch`, `japanese`. Any other value is rejected. The non-English accents are voices in that language: also set `language` (e.g. `"es"`) so the caller speaks it.
 - `language` is an ISO 639-1 code such as `en`, `es`, `fr`, `de`, `it`, `nl`, or `ja`.
 - `voice` is `"male"` or `"female"` (English only; default female). Use to flip the caller's perceived gender. Ignored if `caller_audio.accent` is set or `language` is non-English.
 
@@ -190,13 +189,13 @@ Use the LiveKit helper for observability; do not publish `vent:*` topics manuall
 
 ### Live result
 
-`npx vent-hq run` returns a single JSON result on stdout in non-TTY mode (not an SSE JSONL stream). Exit codes: `0` = call ran through the pipeline; `1` = pipeline-level failure; `2` = harness error.
+`npx vent-hq run` returns a single JSON result on stdout in non-TTY mode (not an SSE JSONL stream). Exit codes: `0` = the run passed (every call ran end to end); `1` = it didn't (a call errored, or the run failed or was cancelled); `2` = the result stream was lost. A call `error` starting with `Vent failed, agent not tested:` is a failure of Vent itself (its caller LLM, STT/TTS or worker): rerun, it says nothing about the agent. Any other `error` comes from the agent's platform or your configuration. `end_note` says how a completed call ended when Vent ended it or the connection closed (e.g. `No agent speech for 30s after the caller's turn; Vent hung up.`): read the transcript to judge whether that's an agent bug.
 
 Most result fields are always present; `latency`, `component_latency`, `call_metadata`, and `emotion` may be `null` when the underlying analysis didn't run; `debug` is absent without `--verbose`. Branch on null before reading nested fields. Use `--verbose` only when the default doesn't explain a failure — when you need `platform_transcript` (to check Vent's STT), per-turn or component-level latency breakdowns, the raw tool-call timeline, or provider-native artifacts in `debug.provider_metadata`. Otherwise skip — it just adds noise.
 
-Vent's transcript is ground truth. Judge on semantic intent: ignore homophones and minor mis-hears (`"check teach hat"` for `"check that"`, missing question marks on short tails) — those are streaming-STT noise on Vent's caller side, not agent bugs, and **don't surface them in the report** (they're Vent-side artifacts, not actionable for the user). But clear gibberish or word-soup (e.g. `"Cristoxin"` where the agent should have said `"Of course, talk soon"`) is **not** a Vent artifact — Vent's STT does not invent words like that. It means the platform's TTS produced corrupted audio or the agent's STT/LLM generated the wrong text, and the fix lives there (TTS voice config, agent prompt, model temperature, codec issue). Never dismiss the run as a "Vent harness STT" issue; iterate on the agent or flag the platform.
+Vent's transcript is ground truth. Judge on semantic intent: ignore homophones and minor mis-hears (`"check teach hat"` for `"check that"`, missing question marks on short tails) — those are streaming-STT noise on Vent's caller side, not agent bugs, and **don't surface them in the report** (they're Vent-side artifacts, not actionable for the user). But clear gibberish or word-soup (e.g. `"Cristoxin"` where the agent should have said `"Of course, talk soon"`) is **not** a Vent artifact — Vent's STT does not invent words like that. It means the platform's TTS produced corrupted audio or the agent's STT/LLM generated the wrong text, and the fix lives there (TTS voice config, agent prompt, model temperature, codec issue). Missing or cut-off agent text, unlike word-soup, can come from Vent's STT stream dropping: check the recording before blaming the agent.
 
-For transfers: `call_metadata.transfer_attempted` (provider claimed) and `transfer_completed` (Vent-verified) can disagree — report both. `transfers[]` carries destination, type, and per-attempt status.
+For transfers: `call_metadata.transfer_attempted` (provider claimed) and `transfer_completed` (from the platform's call data) can disagree — report both. `transfers[]` carries destination, type, and per-attempt status.
 
 ### Saved history
 
@@ -235,6 +234,6 @@ Hard rules:
 - Always include the recording from `call_metadata.recording_url` as an inline `[Recording](url)` link, placed in **one block at the very end of the report** — never sprinkled through the prose. Single call: one link as the last line. Multi-call: one labeled link per call (e.g. `reschedule-appointment: [Recording](url)`). Never paste a bare URL.
 - Mission success is your judgment, not Vent's. The per-call `status` is only `"completed"` (pipeline ran) or `"error"` (pipeline failed); decide whether the agent actually accomplished the scenario from the transcript and tool calls.
 - Similar-sounding word substitutions (e.g. "ocean" for "OSHA") are STT ambiguity, not comprehension failure. The fix lives in STT keyword hints, custom vocabulary, or a prompt-level term list — not the agent's reasoning.
-- Surface only what the user can act on in their own agent's code or config — never `warnings[]` (infrastructure noise), Vent-side artifacts (caller wait modes, harness timing, internal pipeline quirks), or `cost_usd` unless asked.
+- Surface only what the user can act on in their own agent's code or config — never Vent-side artifacts (caller wait modes, harness timing, internal pipeline quirks), or `cost_usd` unless asked.
 
 For multi-call runs, lead with your own judgment of what happened across the calls (e.g. "3 of 4 did what they were supposed to; `cancel-appointment` never actually canceled"), not a parroted pass/fail count. Then cover each call with whatever depth it needs.

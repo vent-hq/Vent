@@ -39,7 +39,9 @@ export async function recordingRoutes(app: FastifyInstance) {
   // CLI's `gh_<id>` user namespace doesn't reconcile with WorkOS user IDs,
   // so even after signing in users hit a "wrong account" 403.
   // Defenses we DO have: 256-bit HMAC token (unguessable), 1h TTL, audit log.
-  app.get<{ Params: { token: string } }>("/recordings/:token", async (request, reply) => {
+  app.get<{ Params: { token: string } }>("/recordings/:token", {
+    config: { rateLimit: { max: 120, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
     const downloadUrl = await resolveRecordingDownloadUrl(request.params.token, request);
     if (!downloadUrl) {
       return reply.status(404).send({ error: "Recording not found or link expired" });
@@ -53,7 +55,9 @@ export async function recordingRoutes(app: FastifyInstance) {
       .send(html);
   });
 
-  app.get<{ Params: { token: string } }>("/recordings/:token/audio", async (request, reply) => {
+  app.get<{ Params: { token: string } }>("/recordings/:token/audio", {
+    config: { rateLimit: { max: 600, timeWindow: "1 minute" } },
+  }, async (request, reply) => {
     const downloadUrl = await resolveRecordingDownloadUrl(request.params.token, request);
     if (!downloadUrl) {
       return reply.status(404).send({ error: "Recording not found" });

@@ -4,7 +4,7 @@
  * clarity, packet loss, jitter, and accent (via TTS voice selection).
  */
 
-import type { CallerAudioEffects } from "@vent/shared";
+import type { CallerAccent, CallerAudioEffects } from "@vent/shared";
 import { resample } from "./format.js";
 import {
   generateBabbleNoise,
@@ -26,7 +26,7 @@ function clamp(value: number): number {
 // Accent presets — Deepgram Aura-2 voice IDs
 // ============================================================
 
-export const ACCENT_VOICES: Record<string, string> = {
+export const ACCENT_VOICES: Record<CallerAccent, string> = {
   // English accents
   american: "aura-2-thalia-en",
   british: "aura-2-draco-en",
@@ -45,13 +45,9 @@ export const ACCENT_VOICES: Record<string, string> = {
   japanese: "aura-2-ebisu-ja",
 };
 
-/**
- * Resolve an accent preset name to a Deepgram voice ID.
- * If the string is already a voice ID (contains "aura-"), pass through.
- */
-export function resolveAccentVoiceId(accent: string): string {
-  if (accent.includes("aura-")) return accent;
-  return ACCENT_VOICES[accent] ?? ACCENT_VOICES["american"]!;
+/** Resolve an accent (validated against CALLER_ACCENTS) to a Deepgram voice ID. */
+export function resolveAccentVoiceId(accent: CallerAccent): string {
+  return ACCENT_VOICES[accent];
 }
 
 // ============================================================
