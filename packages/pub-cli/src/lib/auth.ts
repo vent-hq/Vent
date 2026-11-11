@@ -6,7 +6,7 @@ import { printError, printInfo } from "./output.js";
 const POLL_INTERVAL_MS = 2000;
 
 export type AuthResult =
-  | { ok: true; accessToken: string }
+  | { ok: true }
   | { ok: false; error: string };
 
 function sleep(ms: number): Promise<void> {
@@ -61,7 +61,7 @@ export async function deviceAuthFlow(): Promise<AuthResult> {
         const parsed = AccessCredentialsSchema.safeParse(data);
         if (!parsed.success) return { ok: false, error: "Vent returned invalid sign-in credentials." };
         await saveCredentials(parsed.data);
-        return { ok: true, accessToken: parsed.data.access_token };
+        return { ok: true };
       }
 
       if (data.status === "expired") {

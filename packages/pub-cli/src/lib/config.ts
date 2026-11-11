@@ -9,7 +9,6 @@ const CONFIG_DIR = path.join(homedir(), ".vent");
 const CREDENTIALS_FILE = path.join(CONFIG_DIR, "credentials");
 
 export const API_BASE = process.env.VENT_API_URL ?? "https://api.venthq.dev";
-export const DASHBOARD_URL = process.env.VENT_DASHBOARD_URL ?? "https://venthq.dev";
 
 interface CredentialsSource {
   accessToken?: string;
@@ -82,6 +81,12 @@ export async function loadAccessToken(): Promise<string | null> {
   if (!source) return null;
   if (source.refreshToken && !usableAccessToken(source.accessToken, 60_000)) return refresh(source);
   return usableAccessToken(source.accessToken) ? source.accessToken : null;
+}
+
+export async function requireAccessToken(): Promise<string> {
+  const token = await loadAccessToken();
+  if (!token) throw new Error("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
+  return token;
 }
 
 export async function refreshAccessToken(rejectedToken: string): Promise<string | null> {

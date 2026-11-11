@@ -2,14 +2,10 @@ export interface RelayClientConfig {
   apiUrl: string;
   relayToken: string;
   agentPort: number;
-  healthEndpoint: string;
   sessionId: string;
 }
 
-interface LocalConnection {
-  local: WebSocket;
-  connId: string;
-}
+const CONNECT_TIMEOUT_MS = 30_000;
 
 export interface RelayDisconnectedInfo {
   code: number;
@@ -19,9 +15,14 @@ export interface RelayDisconnectedInfo {
 
 type RelayEventHandler = (...args: unknown[]) => void;
 
+/** Node's WebSocket emits an ErrorEvent (not in Node's type definitions) carrying `message`. */
+function errorEventMessage(ev: Event): string | undefined {
+  return (ev as Event & { message?: string }).message;
+}
+
 export class RelayClient {
   private controlWs: WebSocket | null = null;
-  private localConnections = new Map<string, LocalConnection>();
+  private localConnections = new Map<string, WebSocket>();
   private config: RelayClientConfig;
   private closed = false;
   private handlers = new Map<string, RelayEventHandler[]>();
@@ -42,7 +43,7 @@ export class RelayClient {
     }
   }
 
-  async connect(timeoutMs = 30_000): Promise<void> {
+  async connect(): Promise<void> {
     const wsBase = this.config.apiUrl.replace(/^http/, "ws");
     const controlUrl = `${wsBase}/relay/control?session_id=${this.config.sessionId}&token=${this.config.relayToken}`;
 
@@ -63,14 +64,13 @@ export class RelayClient {
       const hardTimeout = setTimeout(() => {
         settle(() => {
           ws.close();
-          reject(new Error(`Relay connection timed out after ${timeoutMs}ms — check network connectivity to ${this.config.apiUrl}`));
+          reject(new Error(`Relay connection timed out after ${CONNECT_TIMEOUT_MS}ms — check network connectivity to ${this.config.apiUrl}`));
         });
-      }, timeoutMs);
+      }, CONNECT_TIMEOUT_MS);
 
       ws.addEventListener("open", () => {
         this.controlWs = ws;
         this.setupControlHandlers(ws);
-        this.emit("connected");
       });
 
       // Connected once the server confirms the session (handshake after auth).
@@ -84,7 +84,7 @@ export class RelayClient {
 
       ws.addEventListener("error", (ev) => {
         if (!this.controlWs) {
-          settle(() => reject(new Error(`Failed to connect to relay: ${(ev as ErrorEvent).message ?? "connection error"}`)));
+          settle(() => reject(new Error(`Failed to connect to relay: ${errorEventMessage(ev) ?? "connection error"}`)));
         }
       });
     });
@@ -93,8 +93,8 @@ export class RelayClient {
   async disconnect(): Promise<void> {
     this.closed = true;
 
-    for (const [connId, conn] of this.localConnections) {
-      if (conn.local.readyState !== WebSocket.CLOSED) conn.local.close();
+    for (const [connId, local] of this.localConnections) {
+      if (local.readyState !== WebSocket.CLOSED) local.close();
       this.localConnections.delete(connId);
     }
 
@@ -133,13 +133,13 @@ export class RelayClient {
         const connId = new TextDecoder().decode(data.subarray(1, 37));
         const payload = data.subarray(37);
 
-        const conn = this.localConnections.get(connId);
-        if (conn?.local.readyState === WebSocket.OPEN) {
+        const local = this.localConnections.get(connId);
+        if (local?.readyState === WebSocket.OPEN) {
           if (frameType === 0x02) {
             // Text frame: forward as string so local agent receives a text WS message
-            conn.local.send(new TextDecoder().decode(payload));
+            local.send(new TextDecoder().decode(payload));
           } else {
-            conn.local.send(payload);
+            local.send(payload);
           }
         }
         return;
@@ -155,8 +155,8 @@ export class RelayClient {
         } else if (msg.type === "new_connection" && msg.conn_id) {
           this.handleNewConnection(msg.conn_id);
         } else if (msg.type === "close" && msg.conn_id) {
-          const conn = this.localConnections.get(msg.conn_id);
-          if (conn?.local.readyState !== WebSocket.CLOSED) conn?.local.close();
+          const local = this.localConnections.get(msg.conn_id);
+          if (local && local.readyState !== WebSocket.CLOSED) local.close();
           this.localConnections.delete(msg.conn_id);
         }
       } catch {
@@ -176,53 +176,40 @@ export class RelayClient {
     });
 
     ws.addEventListener("error", (ev) => {
-      this.emit("error", new Error((ev as ErrorEvent).message ?? "WebSocket error"));
+      this.emit("error", new Error(errorEventMessage(ev) ?? "WebSocket error"));
     });
   }
 
   private handleNewConnection(connId: string): void {
-    const agentUrl = `ws://localhost:${this.config.agentPort}`;
-    this.emit("log", `[relay] new_connection ${connId} → connecting to ${agentUrl}`);
+    const localWs = new WebSocket(`ws://localhost:${this.config.agentPort}`);
+    localWs.binaryType = "arraybuffer";
 
-    try {
-      const localWs = new WebSocket(agentUrl);
-      localWs.binaryType = "arraybuffer";
+    localWs.addEventListener("open", () => {
+      // Tell server we're ready to receive data for this conn_id
+      this.sendControlMessage({ type: "open_ack", conn_id: connId });
+      this.localConnections.set(connId, localWs);
+    });
 
-      localWs.addEventListener("open", () => {
-        this.emit("log", `[relay] local WS open for ${connId}`);
-        // Tell server we're ready to receive data for this conn_id
-        this.sendControlMessage({ type: "open_ack", conn_id: connId });
-        this.localConnections.set(connId, { local: localWs, connId });
-      });
+    // Forward local agent messages to server, preserving text/binary distinction
+    localWs.addEventListener("message", (event) => {
+      if (event.data instanceof ArrayBuffer) {
+        this.sendDataFrame(connId, new Uint8Array(event.data), 0x01);
+      } else {
+        this.sendDataFrame(connId, new TextEncoder().encode(event.data as string), 0x02);
+      }
+    });
 
-      // Forward local agent messages to server, preserving text/binary distinction
-      localWs.addEventListener("message", (event) => {
-        if (event.data instanceof ArrayBuffer) {
-          this.sendDataFrame(connId, new Uint8Array(event.data), 0x01);
-        } else {
-          this.sendDataFrame(connId, new TextEncoder().encode(event.data as string), 0x02);
-        }
-      });
+    let cleaned = false;
+    const cleanup = () => {
+      if (cleaned) return;
+      cleaned = true;
+      if (localWs.readyState !== WebSocket.CLOSED) localWs.close();
+      this.localConnections.delete(connId);
+      // Notify server that this connection is done
+      this.sendControlMessage({ type: "close", conn_id: connId });
+    };
 
-      let cleaned = false;
-      const cleanup = (reason?: string) => {
-        if (cleaned) return;
-        cleaned = true;
-        this.emit("log", `[relay] local WS cleanup for ${connId}: ${reason ?? "unknown"}`);
-        if (localWs.readyState !== WebSocket.CLOSED) localWs.close();
-        this.localConnections.delete(connId);
-        // Notify server that this connection is done
-        this.sendControlMessage({ type: "close", conn_id: connId });
-      };
-
-      localWs.addEventListener("close", () => cleanup("close"));
-      localWs.addEventListener("error", (ev) => {
-        const msg = (ev as ErrorEvent).message ?? "unknown error";
-        this.emit("log", `[relay] local WS error for ${connId}: ${msg}`);
-        cleanup(`error: ${msg}`);
-      });
-    } catch (err) {
-      this.emit("log", `[relay] Failed to connect local agent for ${connId}: ${err}`);
-    }
+    localWs.addEventListener("close", cleanup);
+    localWs.addEventListener("error", cleanup);
   }
 }

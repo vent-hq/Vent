@@ -1,22 +1,15 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
+import { DEFAULT_AGENT_PORT } from "@vent/shared";
 import { printSuccess } from "./output.js";
-
-// @ts-ignore — embedded at build time via esbuild text loader
-import claudeCodeSkill from "../skills/claude-code.md";
-// @ts-ignore
-import cursorSkill from "../skills/cursor.md";
-// @ts-ignore
-import codexSkill from "../skills/codex.md";
-// @ts-ignore
-import windsurfSkill from "../skills/windsurf.md";
+import { claudeCodeSkill, codexSkill, cursorSkill, windsurfSkill } from "../skills/index.js";
 
 export const SUITE_SCAFFOLD = JSON.stringify(
   {
     connection: {
       adapter: "websocket",
       start_command: "TODO: command to start your agent (e.g. npm run start)",
-      agent_port: 3001,
+      agent_port: DEFAULT_AGENT_PORT,
     },
     calls: {
       "happy-path": {
@@ -86,8 +79,7 @@ async function installCodex(cwd: string): Promise<void> {
 }
 
 /**
- * Detect editors and install skill files, then scaffold .vent/suite.json if missing.
- * Used by both `init` and `agent-setup` commands.
+ * Install skill files for every supported editor, then scaffold .vent/suite.json if missing.
  */
 export async function installSkillsAndScaffold(cwd: string): Promise<void> {
   // Always install skill files for all supported editors

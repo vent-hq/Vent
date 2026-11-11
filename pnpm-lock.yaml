@@ -352,6 +352,9 @@ importers:
       jose:
         specifier: ^6.2.15
         version: 6.2.15
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
 
   packages/pub-livekit-node:
     devDependencies:

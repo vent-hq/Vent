@@ -1,4 +1,4 @@
-import { API_BASE, loadAccessToken, refreshAccessToken } from "./config.js";
+import { API_BASE, refreshAccessToken, requireAccessToken } from "./config.js";
 
 export class ApiError extends Error {
   constructor(
@@ -9,13 +9,9 @@ export class ApiError extends Error {
   }
 }
 
-export async function authenticatedFetch(
-  path: string,
-  apiKey: string,
-  options: RequestInit = {},
-): Promise<Response> {
+export async function authenticatedFetch(path: string, options: RequestInit = {}): Promise<Response> {
   const url = `${API_BASE}${path}`;
-  const token = await loadAccessToken() ?? apiKey;
+  const token = await requireAccessToken();
   const send = (accessToken: string) => {
     const headers = new Headers(options.headers);
     headers.set("Authorization", `Bearer ${accessToken}`);
@@ -30,12 +26,8 @@ export async function authenticatedFetch(
   return send(refreshed);
 }
 
-export async function apiFetch(
-  path: string,
-  apiKey: string,
-  options: RequestInit = {},
-): Promise<Response> {
-  const res = await authenticatedFetch(path, apiKey, options);
+export async function apiFetch(path: string, options: RequestInit = {}): Promise<Response> {
+  const res = await authenticatedFetch(path, options);
 
   if (!res.ok) {
     const text = await res.text();

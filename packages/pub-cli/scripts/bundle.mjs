@@ -16,7 +16,7 @@ await build({
   outExtension: { ".js": ".mjs" },
   entryNames: "[name]",
   chunkNames: "[name]-[hash]",
-  loader: { ".md": "text", ".txt": "text" },
+  loader: { ".md": "text" },
   alias: {
     "@vent/shared": path.resolve(__dirname, "../../shared/src/index.ts"),
   },

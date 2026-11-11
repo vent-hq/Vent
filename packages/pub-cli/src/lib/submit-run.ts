@@ -10,9 +10,9 @@ const RETRY_DELAY_MS = 2_000;
  * the first one did create the run, the API returns that run instead of
  * starting a second call.
  */
-export async function submitRun(accessToken: string, payload: Record<string, unknown>): Promise<Response> {
+export async function submitRun(payload: Record<string, unknown>): Promise<Response> {
   const body = JSON.stringify({ ...payload, idempotency_key: randomUUID() });
-  const send = () => apiFetch("/runs/submit", accessToken, { method: "POST", body });
+  const send = () => apiFetch("/runs/submit", { method: "POST", body });
 
   try {
     return await send();

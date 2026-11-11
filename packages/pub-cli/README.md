@@ -69,37 +69,46 @@ Run `vent-hq <command> --help` for command-specific options.
 
 ## What you get back
 
-Every `run` returns a single JSON object on stdout. Shape:
+Every `run` places one call and returns a single JSON object on stdout. Shape:
 
 ```json
 {
-  "run_id": "01J...",
-  "status": "complete",
+  "run_id": "4ceb8e0a-...",
+  "status": "pass",
+  "total": 1,
   "calls": [
     {
       "name": "happy-path",
-      "status": "complete",
-      "duration_ms": 42180,
-      "latency": { "p50_ms": 612, "p95_ms": 1180, "time_to_first_audio_ms": 540 },
+      "status": "completed",
+      "duration_ms": 75562,
       "transcript": [
-        { "role": "agent", "text": "Hi, this is Acme Salon, how can I help?" },
+        { "role": "agent", "text": "Hi, thanks for calling Acme Salon. How can I help?" },
         { "role": "caller", "text": "Hey, I'd like to book a haircut for Friday." }
       ],
-      "tool_calls": [{ "name": "check_availability", "args": {...}, "result": {...} }],
-      "recording_url": "https://...",
-      "call_metadata": { ... }
+      "latency": { "response_time_ms": 3154, "p50_response_time_ms": 2980, "max_response_time_ms": 4890, "first_response_time_ms": 4920 },
+      "tool_calls": {
+        "total": 1, "successful": 1, "failed": 0,
+        "observed": [{ "name": "check_availability", "arguments": { ... }, "result": { ... }, "successful": true }]
+      },
+      "component_latency": { "mean_stt_ms": 648, "mean_llm_ms": 1033, "mean_tts_ms": 321 },
+      "signal_quality": { "mean_snr_db": 31.2, "max_clipping_ratio": 0 },
+      "call_metadata": {
+        "platform": "vapi", "provider_call_id": "...", "recording_url": "https://...",
+        "cost": { "total_usd": 0.13, "breakdown": { "stt": 0.01, "llm": 0.03, "tts": 0.02, "transport": 0.02, "vapi": 0.05 } },
+        "provider_debug_urls": { "dashboard": "https://dashboard.vapi.ai/calls/..." }
+      }
     }
   ]
 }
 ```
 
-Verbose fields are gated behind `--verbose` to keep agent context lean.
+`status` is `"error"` (with an `error` message) when Vent could not complete the call, and `end_note` explains an early hang-up.
 
 ## Platform notes
 
 - **Vapi, Retell, ElevenLabs** — hosted only. Set the API key + assistant/agent ID in `.env`.
 - **LiveKit** — works against local dev agents and LiveKit Cloud with the same config (different `LIVEKIT_URL`). Install [`@vent-hq/livekit`](https://www.npmjs.com/package/@vent-hq/livekit) (Node) or [`vent-livekit`](https://pypi.org/project/vent-livekit/) (Python) for tool-call and component-latency observability.
-- **Bland** — supports pathways (`bland_pathway_id`), personas (`persona_id`), or inline `task` prompts.
+- **Bland** — supports pathways (`bland_pathway_id`) or inline `task` prompts, optionally with a persona (`persona_id`).
 - **Custom (WebSocket)** — point at a hosted endpoint with `agent_url`, or run a local agent with `start_command` + `agent_port`. Vent tunnels audio through a relay so your machine doesn't need a public IP.
 
 Platform credentials are encrypted at rest (AES-256-GCM) and never appear in chat logs or run payloads.

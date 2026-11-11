@@ -27,7 +27,7 @@ Vent is a CLI for coding agents that lets them place calls and evaluate voice ag
 
 When your coding agent runs `vent-hq run`, Vent places a real call to your voice agent, measures the entire call from inside, and returns a structured result. Most voice eval tools probe from outside; Vent runs inside. Think of it as a CLI version of Hamming, Roark, or Coval.
 
-Under the hood, a Claude Haiku 4.5 caller LLM drives the conversation, speaking via Deepgram Aura-2 over WebSocket or WebRTC. Vent listens through a vendored TEN VAD WASM module (no external service call) and Deepgram nova-3 STT across seven languages. Everything that happened inside the call comes back — transcript, audio quality, latency at every layer (percentiles + per-turn TTS/STT/LLM breakdown), every tool and MCP call, every transfer, pathway and flow decisions, agent state transitions, provider warnings, cost and usage, debug URLs, and the recording — as structured JSON in `.vent/runs/` with the audio in Tigris (S3-compatible storage), accessible through a signed URL.
+Under the hood, a Claude Haiku 4.5 caller LLM drives the conversation, speaking via Deepgram Aura-2 over WebSocket or WebRTC. Vent listens through a vendored TEN VAD WASM module (no external service call) and Deepgram nova-3 STT across seven languages. Everything that happened inside the call comes back — transcript, audio quality, latency at every layer (per reply, with its STT/LLM/TTS breakdown), every tool and MCP call, every transfer, pathway and flow decisions, agent state transitions, provider warnings, cost, debug URLs, and the recording — as structured JSON in `.vent/runs/` with the audio in Tigris (S3-compatible storage), accessible through a signed URL.
 
 ### Install
 
@@ -43,7 +43,6 @@ The `init` command lets the agent automatically log in via GitHub, generate an a
 npx vent-hq@latest init                             # Auto-setup
 npx vent-hq run -f .vent/suite.json                 # Run all calls, stream SSE
 npx vent-hq run -f .vent/suite.json --call foo      # Run a specific call
-npx vent-hq run -f .vent/suite.json -v              # Verbose result JSON
 npx vent-hq stop <run-id>                           # Cancel a queued or active run
 ```
 
@@ -91,7 +90,7 @@ const vent = instrumentLiveKitAgent({ ctx, session });
 vent = instrument_livekit_agent(ctx=ctx, session=session)
 ```
 
-Both packages hook the LiveKit Agents `AgentSession` lifecycle (`metrics_collected`, `function_tools_executed`, `conversation_item_added`, `user_input_transcribed`, `session_usage_updated`, `close`) and publish to 10 dedicated Vent DataChannel topics. Session report auto-publishes on `session.close` — the last safe window before `room.disconnect`. Without the instrumentation, Vent still captures agent state transitions and transcripts directly from the Agents SDK.
+Both packages hook the LiveKit Agents `AgentSession` lifecycle (`metrics_collected`, `function_tools_executed`, `conversation_item_added`, `close`) and publish to 6 dedicated Vent DataChannel topics. Without the instrumentation, Vent still captures agent state transitions and transcripts directly from the Agents SDK.
 
 #### Bland
 

@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as net from "node:net";
+import { AgentSessionResponseSchema, type AgentSessionResponse } from "@vent/shared";
 import { apiFetch } from "../lib/api.js";
-import { loadAccessToken } from "../lib/config.js";
 import { printError, printInfo, printSuccess } from "../lib/output.js";
 import { startAgentSession, type RelayHandle } from "../lib/relay.js";
 import type { RelayDisconnectedInfo } from "../lib/relay-client.js";
@@ -15,22 +15,7 @@ interface AgentStopArgs {
   sessionId: string;
 }
 
-interface AgentSessionResponse {
-  session_id: string;
-  relay_token: string;
-  api_url: string;
-  agent_port: number;
-  start_command: string | null;
-  health_endpoint: string;
-}
-
 export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
-  const accessToken = await loadAccessToken();
-  if (!accessToken) {
-    printError("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
-    return 2;
-  }
-
   let parsedConfig: unknown;
   try {
     if (args.file) {
@@ -70,7 +55,7 @@ export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
   const closeSession = async () => {
     if (!session) return;
     try {
-      await apiFetch(`/agent-sessions/${session.session_id}/close`, accessToken, {
+      await apiFetch(`/agent-sessions/${session.session_id}/close`, {
         method: "POST",
       });
     } catch {
@@ -80,11 +65,11 @@ export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
 
   try {
     printInfo("Creating agent session…");
-    const createRes = await apiFetch("/agent-sessions", accessToken, {
+    const createRes = await apiFetch("/agent-sessions", {
       method: "POST",
       body: JSON.stringify({ config: connection }),
     });
-    session = (await createRes.json()) as AgentSessionResponse;
+    session = AgentSessionResponseSchema.parse(await createRes.json());
 
     printInfo("Connecting relay for local agent…");
     relay = await startAgentSession(session);
@@ -114,14 +99,8 @@ export async function agentStartCommand(args: AgentStartArgs): Promise<number> {
 }
 
 export async function agentStopCommand(args: AgentStopArgs): Promise<number> {
-  const accessToken = await loadAccessToken();
-  if (!accessToken) {
-    printError("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
-    return 2;
-  }
-
   try {
-    await apiFetch(`/agent-sessions/${args.sessionId}/close`, accessToken, {
+    await apiFetch(`/agent-sessions/${args.sessionId}/close`, {
       method: "POST",
     });
     printSuccess(`Agent session closed: ${args.sessionId}`, { force: true });

@@ -2,6 +2,9 @@
   "name": "vent-hq",
   "version": "0.14.0",
   "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
   "description": "Vent CLI — CI/CD for voice AI agents",
   "bin": {
     "vent-hq": "dist/index.mjs"
@@ -12,6 +15,7 @@
   "scripts": {
     "test": "tsx --test --experimental-test-module-mocks tests/lib/credentials.test.ts tests/lib/submit-run.test.ts",
     "build": "node scripts/bundle.mjs",
+    "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "prepack": "pnpm clean && pnpm build"
   },
@@ -36,6 +40,7 @@
   "devDependencies": {
     "@vent/shared": "workspace:*",
     "esbuild": "catalog:",
-    "jose": "^6.2.15"
+    "jose": "^6.2.15",
+    "typescript": "catalog:"
   }
 }

@@ -1,4 +1,3 @@
-import { loadAccessToken } from "../lib/config.js";
 import { apiFetch, ApiError } from "../lib/api.js";
 import { printError, printSuccess } from "../lib/output.js";
 
@@ -7,14 +6,8 @@ interface StopArgs {
 }
 
 export async function stopCommand(args: StopArgs): Promise<number> {
-  const accessToken = await loadAccessToken();
-  if (!accessToken) {
-    printError("Not authenticated. Run `npx vent-hq init` first.");
-    return 2;
-  }
-
   try {
-    const res = await apiFetch(`/runs/${args.runId}/stop`, accessToken, {
+    const res = await apiFetch(`/runs/${args.runId}/stop`, {
       method: "POST",
     });
     const data = (await res.json()) as { id: string; status: "cancelled" | "cancelling" };

@@ -89,8 +89,8 @@ test("an unauthorized API request refreshes and retries at most once", async () 
       if (requests === 2) assert.equal(new Headers(init?.headers).get("authorization"), `Bearer ${fresh}`);
       return Response.json({ ok: false }, { status: requests === 1 ? 401 : finalStatus });
     };
-    if (finalStatus === 200) assert.equal((await api.apiFetch("/runs/test", "unused")).status, 200);
-    else await assert.rejects(api.apiFetch("/runs/test", "unused"), (error: unknown) => error instanceof api.ApiError && error.status === 401);
+    if (finalStatus === 200) assert.equal((await api.apiFetch("/runs/test")).status, 200);
+    else await assert.rejects(api.apiFetch("/runs/test"), (error: unknown) => error instanceof api.ApiError && error.status === 401);
     assert.equal(renewals, 1);
     assert.equal(requests, 2);
   }
@@ -119,7 +119,7 @@ test("SSE uses renewed access credentials instead of reconnecting forever with a
   };
   const { streamRunEvents } = await import("../../src/lib/sse.js");
   const events = [];
-  for await (const event of streamRunEvents("run-test", "unused")) events.push(event);
+  for await (const event of streamRunEvents("run-test", false)) events.push(event);
   assert.deepEqual(events, [{ event_type: "run_complete" }]);
   assert.equal(opens, 2);
 });

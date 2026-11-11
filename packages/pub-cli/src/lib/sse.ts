@@ -1,3 +1,4 @@
+import type { RunOutput } from "@vent/shared";
 import { authenticatedFetch } from "./api.js";
 
 export interface SSEEvent {
@@ -7,6 +8,8 @@ export interface SSEEvent {
   message?: string;
   metadata_json?: Record<string, unknown> | null;
   created_at?: string;
+  /** On run_complete: the run result, exactly as the coding agent receives it. */
+  result?: RunOutput;
 }
 
 const MAX_RETRIES = 5;
@@ -20,11 +23,7 @@ const RETRY_DELAY_MS = 2000;
  * Automatically reconnects if the stream drops before run_complete,
  * deduplicating events by ID so callers never see duplicates.
  */
-export async function* streamRunEvents(
-  runId: string,
-  apiKey: string,
-  signal?: AbortSignal,
-): AsyncGenerator<SSEEvent> {
+export async function* streamRunEvents(runId: string, signal?: AbortSignal): AsyncGenerator<SSEEvent> {
   const path = `/runs/${runId}/stream`;
   const seenIds = new Set<string>();
   let retries = 0;
@@ -36,9 +35,7 @@ export async function* streamRunEvents(
 
     let res: Response;
     try {
-      res = await authenticatedFetch(path, apiKey, {
-        signal,
-      });
+      res = await authenticatedFetch(path, { signal });
     } catch (err) {
       if ((err as Error).name === "AbortError") throw err;
       retries++;

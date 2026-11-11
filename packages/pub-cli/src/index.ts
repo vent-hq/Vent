@@ -18,18 +18,23 @@ Commands:
   login        Authenticate via browser
   logout       Remove saved credentials
 Options:
-  --help    Show help
-  --version Show version
+  --help, -h     Show help
+  --version, -v  Show version
 
 Run 'npx vent-hq <command> --help' for command-specific help.`;
+
+const INIT_USAGE = `Usage: vent-hq init
+
+Authenticate (GitHub CLI token or browser sign-in), install the Vent skill
+files for Claude Code, Cursor, Codex and Windsurf, and scaffold
+.vent/suite.json if it does not exist.`;
 
 const RUN_USAGE = `Usage: vent-hq run -f <suite.json> [options]
 
 Options:
   --file, -f     Path to suite JSON file (required)
   --call         Name of the call to run (required if suite has multiple calls)
-  --session, -s  Reuse an existing local agent session
-  --verbose, -v  Include verbose fields in the result JSON`;
+  --session, -s  Reuse an existing local agent session`;
 
 const AGENT_USAGE = `Usage: vent-hq agent <command> [options]
 
@@ -44,14 +49,36 @@ Start options:
 Stop options:
   vent-hq agent stop <session-id>`;
 
+const STOP_USAGE = `Usage: vent-hq stop <run-id>
+
+Cancel a queued or running call.`;
+
+const LOGIN_USAGE = `Usage: vent-hq login [options]
+
+Options:
+  --status       Check whether you are logged in (exit code 1 if not)`;
+
+const LOGOUT_USAGE = `Usage: vent-hq logout
+
+Remove saved credentials from ~/.vent/credentials.`;
+
+const COMMAND_USAGE: Record<string, string> = {
+  init: INIT_USAGE,
+  run: RUN_USAGE,
+  agent: AGENT_USAGE,
+  stop: STOP_USAGE,
+  login: LOGIN_USAGE,
+  logout: LOGOUT_USAGE,
+};
+
 async function main(): Promise<number> {
   loadDotenv();
 
   const args = process.argv.slice(2);
   const command = args[0];
 
-  if (!command || command === "--help" || command === "-h") {
-    console.log(USAGE);
+  if (!command || args.includes("--help") || args.includes("-h")) {
+    console.log(COMMAND_USAGE[command ?? ""] ?? USAGE);
     return 0;
   }
 
@@ -70,17 +97,12 @@ async function main(): Promise<number> {
     }
 
     case "run": {
-      if (commandArgs.includes("--help")) {
-        console.log(RUN_USAGE);
-        return 0;
-      }
       const { values } = parseArgs({
         args: commandArgs,
         options: {
           file: { type: "string", short: "f" },
           call: { type: "string" },
           session: { type: "string", short: "s" },
-          verbose: { type: "boolean", short: "v", default: false },
         },
         strict: true,
       });
@@ -95,13 +117,12 @@ async function main(): Promise<number> {
         file: values.file,
         call: values.call,
         session: values.session,
-        verbose: values.verbose,
       });
     }
 
     case "agent": {
       const subcommand = commandArgs[0];
-      if (!subcommand || subcommand === "--help" || subcommand === "-h") {
+      if (!subcommand) {
         console.log(AGENT_USAGE);
         return 0;
       }
@@ -137,9 +158,9 @@ async function main(): Promise<number> {
 
     case "stop": {
       const runId = commandArgs[0];
-      if (!runId || commandArgs.includes("--help")) {
-        console.log("Usage: vent-hq stop <run-id>");
-        return runId ? 0 : 2;
+      if (!runId) {
+        console.log(STOP_USAGE);
+        return 2;
       }
       return stopCommand({ runId });
     }

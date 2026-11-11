@@ -1,4 +1,4 @@
-import { PlatformConfigSchema, type PlatformConfig } from "@vent/shared";
+import { PlatformConfigSchema, missingPlatformFields, type PlatformConfig } from "@vent/shared";
 
 const PLATFORM_ENV_MAP = {
   vapi: { vapi_api_key: "VAPI_API_KEY", vapi_assistant_id: "VAPI_ASSISTANT_ID" },
@@ -18,56 +18,18 @@ function looksLikeEnvReference(value: unknown): boolean {
   return typeof value === "string" && /^[A-Z][A-Z0-9_]+$/.test(value);
 }
 
-function isMissingResolvedValue(value: unknown): boolean {
-  return !value || looksLikeEnvReference(value);
+/** Names a required config key the way the user sets it: its env var, or `platform.<key>` for inline-only fields. */
+function describeField(adapter: RemotePlatformAdapter, field: string): string {
+  if (adapter === "vapi" && field === "vapi_assistant_id") return "VAPI_ASSISTANT_ID or VAPI_AGENT_ID";
+  const envFields: Record<string, string> = PLATFORM_ENV_MAP[adapter];
+  return envFields[field] ?? `platform.${field}`;
 }
 
-function requireField(platform: PlatformConfig): void {
-  switch (platform.provider) {
-    case "vapi":
-      if (isMissingResolvedValue(platform.vapi_api_key)) {
-        throw new Error("Missing VAPI_API_KEY in .env");
-      }
-      if (isMissingResolvedValue(platform.vapi_assistant_id)) {
-        throw new Error("Missing VAPI_ASSISTANT_ID or VAPI_AGENT_ID in .env");
-      }
-      return;
-    case "retell":
-      if (isMissingResolvedValue(platform.retell_api_key)) {
-        throw new Error("Missing RETELL_API_KEY in .env");
-      }
-      if (isMissingResolvedValue(platform.retell_agent_id)) {
-        throw new Error("Missing RETELL_AGENT_ID in .env");
-      }
-      return;
-    case "elevenlabs":
-      if (isMissingResolvedValue(platform.elevenlabs_api_key)) {
-        throw new Error("Missing ELEVENLABS_API_KEY in .env");
-      }
-      if (isMissingResolvedValue(platform.elevenlabs_agent_id)) {
-        throw new Error("Missing ELEVENLABS_AGENT_ID in .env");
-      }
-      return;
-    case "livekit":
-      if (isMissingResolvedValue(platform.livekit_api_key)) {
-        throw new Error("Missing LIVEKIT_API_KEY in .env");
-      }
-      if (isMissingResolvedValue(platform.livekit_api_secret)) {
-        throw new Error("Missing LIVEKIT_API_SECRET in .env");
-      }
-      if (isMissingResolvedValue(platform.livekit_url)) {
-        throw new Error("Missing LIVEKIT_URL in .env");
-      }
-      return;
-    case "bland":
-      if (isMissingResolvedValue(platform.bland_api_key)) {
-        throw new Error("Missing BLAND_API_KEY in .env");
-      }
-      if (isMissingResolvedValue(platform.bland_pathway_id) && isMissingResolvedValue(platform.task) && isMissingResolvedValue(platform.persona_id)) {
-        throw new Error("Missing BLAND_PATHWAY_ID, BLAND_PERSONA_ID, or platform.task in .env");
-      }
-      return;
-  }
+function requireFields(adapter: RemotePlatformAdapter, platform: PlatformConfig): void {
+  const missing = missingPlatformFields(platform);
+  if (missing.length === 0) return;
+  const list = missing.map((anyOf) => anyOf.map((field) => describeField(adapter, field)).join(" or ")).join(", ");
+  throw new Error(`Missing ${list} (set it in .env, .env.local or the environment)`);
 }
 
 export function resolveRemotePlatformConfig(config: unknown): PlatformConfig | null {
@@ -94,12 +56,9 @@ export function resolveRemotePlatformConfig(config: unknown): PlatformConfig | n
   const envFields = PLATFORM_ENV_MAP[adapter];
   for (const [field, envVar] of Object.entries(envFields)) {
     const currentValue = resolved[field];
-    const needsResolve = !currentValue || currentValue === envVar || looksLikeEnvReference(currentValue);
-    if (needsResolve) {
-      const envValue = process.env[envVar];
-      if (envValue) {
-        resolved[field] = envValue;
-      }
+    if (!currentValue || looksLikeEnvReference(currentValue)) {
+      // An unresolved env reference counts as missing.
+      resolved[field] = process.env[envVar] || undefined;
     }
   }
 
@@ -110,6 +69,6 @@ export function resolveRemotePlatformConfig(config: unknown): PlatformConfig | n
   }
 
   const platform = PlatformConfigSchema.parse(resolved);
-  requireField(platform);
+  requireFields(adapter, platform);
   return platform;
 }

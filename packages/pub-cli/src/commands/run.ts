@@ -3,11 +3,10 @@ import type { PlatformConfig } from "@vent/shared";
 import { apiFetch, ApiError } from "../lib/api.js";
 import { submitRun } from "../lib/submit-run.js";
 import { streamRunEvents } from "../lib/sse.js";
-import { printEvent, printError, printInfo, printSummary, printWarn } from "../lib/output.js";
-import { loadAccessToken } from "../lib/config.js";
+import { printEvent, printError, printInfo, printRunOutput, printWarn } from "../lib/output.js";
 import { saveRunHistory } from "../lib/run-history.js";
 import { resolveRemotePlatformConfig } from "../lib/platform-config.js";
-import type { SSEEvent } from "../lib/sse.js";
+import type { RunOutput } from "@vent/shared";
 
 const isTTY = process.stdout.isTTY;
 
@@ -15,7 +14,6 @@ interface RunArgs {
   file: string;
   call?: string;
   session?: string;
-  verbose?: boolean;
 }
 
 export async function runCommand(args: RunArgs): Promise<number> {
@@ -90,12 +88,6 @@ export async function runCommand(args: RunArgs): Promise<number> {
     return 2;
   }
 
-  const accessToken = await loadAccessToken();
-  if (!accessToken) {
-    printError("No Vent credentials found. Set VENT_REFRESH_TOKEN or run `npx vent-hq login`.");
-    return 2;
-  }
-
   // 3. Submit run
   printInfo("Submitting run…");
   let submitResult: {
@@ -104,7 +96,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   };
 
   try {
-    const res = await submitRun(accessToken, { config, agent_session_id: args.session });
+    const res = await submitRun({ config, agent_session_id: args.session });
     submitResult = await res.json() as typeof submitResult;
   } catch (err) {
     if (err instanceof ApiError && err.status === 401) {
@@ -126,8 +118,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   printInfo(`Streaming results for run ${run_id}…`);
   const abortController = new AbortController();
   let exitCode = 0;
-  const callResults: SSEEvent[] = [];
-  let runCompleteData: Record<string, unknown> | null = null;
+  let runOutput: RunOutput | null = null;
 
   // Fire-and-forget cancel POST when the user hits Ctrl+C / receives SIGTERM.
   // Without this, aborting the SSE stream leaves the worker running the call
@@ -142,7 +133,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   const onSignal = () => {
     if (!stopRequested) {
       stopRequested = true;
-      stopPromise = apiFetch(`/runs/${run_id}/stop`, accessToken, {
+      stopPromise = apiFetch(`/runs/${run_id}/stop`, {
         method: "POST",
         signal: AbortSignal.timeout(5_000),
       }).catch(() => {});
@@ -153,22 +144,11 @@ export async function runCommand(args: RunArgs): Promise<number> {
   process.on("SIGTERM", onSignal);
 
   try {
-    for await (const event of streamRunEvents(run_id, accessToken, abortController.signal)) {
-      const meta = (event.metadata_json ?? {}) as Record<string, unknown>;
+    for await (const event of streamRunEvents(run_id, abortController.signal)) {
       printEvent(event);
 
-      if (event.event_type === "call_completed") {
-        callResults.push(event);
-      }
-
       if (event.event_type === "run_complete") {
-        runCompleteData = meta;
-        // Exit code reflects pipeline completion only, not mission success:
-        // 0 = the run passed (every call ran end to end), 1 = it didn't
-        // (a call errored, the run failed or was cancelled), 2 = the result
-        // stream was lost (set below). Mission success is the coding agent's
-        // judgment from the transcript.
-        exitCode = meta["status"] === "pass" ? 0 : 1;
+        runOutput = event.result ?? null;
       }
 
       if (event.event_type === "error") {
@@ -186,40 +166,29 @@ export async function runCommand(args: RunArgs): Promise<number> {
     process.off("SIGTERM", onSignal);
   }
 
-  // 5. Print summary
-  if (runCompleteData) {
-    let rawRunDetails: Record<string, unknown> | null = null;
-    // The stored run is the source of truth: fetch it when asked for detail,
-    // or when the call result never arrived on the stream.
-    if ((args.verbose && !isTTY) || callResults.length === 0) {
-      try {
-        const res = await apiFetch(`/runs/${run_id}`, accessToken);
-        rawRunDetails = (await res.json()) as Record<string, unknown>;
-      } catch {
-        printWarn("Run result fetch failed; showing the streamed summary only.");
-      }
+  // 5. The stream was lost before the result arrived: read it from the run.
+  if (!runOutput && !stopRequested) {
+    try {
+      const res = await apiFetch(`/runs/${run_id}`);
+      const stored = (await res.json()) as RunOutput;
+      if (["pass", "fail", "cancelled"].includes(String(stored.status))) runOutput = stored;
+    } catch {
+      printWarn("Run result fetch failed.");
     }
-
-    printSummary(callResults, runCompleteData, run_id, {
-      verbose: args.verbose,
-      rawCalls: Array.isArray(rawRunDetails?.["results"]) ? rawRunDetails["results"] as unknown[] : undefined,
-      runDetails: rawRunDetails ? {
-        created_at: rawRunDetails["created_at"],
-        started_at: rawRunDetails["started_at"],
-        finished_at: rawRunDetails["finished_at"],
-        duration_ms: rawRunDetails["duration_ms"],
-        error_text: rawRunDetails["error_text"],
-        aggregate: rawRunDetails["aggregate"],
-      } : undefined,
-    });
   }
 
-  // 6. Save run history locally
-  if (runCompleteData) {
-    const savedPath = await saveRunHistory(run_id, callResults, runCompleteData);
-    if (savedPath) {
-      printInfo(`Run saved to ${savedPath}`);
-    }
+  // 6. Print the result and save it locally
+  if (runOutput) {
+    // Exit code reflects pipeline completion only, not mission success:
+    // 0 = the run passed (the call ran end to end), 1 = it didn't (the call
+    // errored, the run failed or was cancelled), 2 = no result (stream lost).
+    // Mission success is the coding agent's judgment from the transcript.
+    exitCode = runOutput.status === "pass" ? 0 : 1;
+    printRunOutput(runOutput);
+    const savedPath = await saveRunHistory(runOutput);
+    if (savedPath) printInfo(`Run saved to ${savedPath}`);
+  } else if (exitCode === 0) {
+    exitCode = 2;
   }
 
   // If a SIGINT/SIGTERM kicked off a stop POST, wait for it to finish

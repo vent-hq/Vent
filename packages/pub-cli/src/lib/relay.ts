@@ -1,5 +1,6 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { RelayClient, type RelayClientConfig } from "./relay-client.js";
+import type { AgentSessionResponse } from "@vent/shared";
+import { RelayClient } from "./relay-client.js";
 
 export interface RelayHandle {
   client: RelayClient;
@@ -10,23 +11,13 @@ export interface RelayHandle {
 /**
  * Start a persistent agent session relay and optionally spawn the agent process.
  */
-export async function startAgentSession(relayConfig: {
-  session_id: string;
-  relay_token: string;
-  api_url: string;
-  agent_port: number;
-  start_command: string | null;
-  health_endpoint: string;
-}): Promise<RelayHandle> {
-  const clientConfig: RelayClientConfig = {
+export async function startAgentSession(relayConfig: AgentSessionResponse): Promise<RelayHandle> {
+  const client = new RelayClient({
     apiUrl: relayConfig.api_url,
     sessionId: relayConfig.session_id,
     relayToken: relayConfig.relay_token,
     agentPort: relayConfig.agent_port,
-    healthEndpoint: relayConfig.health_endpoint,
-  };
-
-  const client = new RelayClient(clientConfig);
+  });
 
   // 1. Connect relay WebSocket — establishes the tunnel to Vent cloud
   await client.connect();
@@ -49,10 +40,8 @@ export async function startAgentSession(relayConfig: {
     agentProcess.on("error", (err) => {
       process.stdout.write(`Agent process error: ${err.message}\n`);
     });
-  }
 
-  // 3. Wait for agent to be healthy before exposing the session as ready
-  if (relayConfig.start_command) {
+    // 3. Wait for agent to be healthy before exposing the session as ready
     await waitForHealth(relayConfig.agent_port, relayConfig.health_endpoint);
   }
 
