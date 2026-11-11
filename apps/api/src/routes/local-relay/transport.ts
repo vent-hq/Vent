@@ -270,7 +270,7 @@ async function relayRoutes(app: FastifyInstance) {
       cleanupSession(sessionKey);
       void app.db
         .update(schema.agentSessions)
-        .set({ status: "closed", closed_at: new Date() })
+        .set({ status: "closed" })
         .where(eq(schema.agentSessions.id, sessionId))
         .catch((err) => {
           app.log.error({ sessionId, err }, "relay/control: failed to mark agent session closed");

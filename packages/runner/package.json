@@ -8,7 +8,8 @@
     "./executor": "./src/executor.ts"
   },
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc -p tests",
+    "test": "tsx --test tests/*.test.ts",
     "clean": "rm -rf dist"
   },
   "dependencies": {
@@ -19,6 +20,7 @@
     "@vent/voice": "workspace:*"
   },
   "devDependencies": {
+    "tsx": "catalog:",
     "typescript": "catalog:"
   }
 }

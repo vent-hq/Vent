@@ -12,14 +12,15 @@
  * used while the call runs: agent speech start, tool-call-in-progress, and end.
  */
 
-import WebSocket from "ws";
+import { gunzipSync } from "node:zlib";
 import { VapiClient, type Vapi } from "@vapi-ai/server-sdk";
-import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, UsageEntry } from "@vent/shared";
-import { resample } from "@vent/voice";
-import { BaseAudioChannel, CONNECT_TIMEOUT_MS } from "../shared/audio-channel.js";
+import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency } from "@vent/shared";
+import { WebSocketAudioChannel } from "../shared/websocket-channel.js";
+import type { PlatformUtterance } from "../shared/audio-channel.js";
 import { pollUntilReady, callDataUnavailableWarning } from "../shared/post-call.js";
+import { compactNumberRecord, compactStringRecord } from "../shared/record-utils.js";
 
-export interface VapiAudioChannelConfig {
+interface VapiAudioChannelConfig {
   apiKey: string;
   assistantId: string;
 }
@@ -34,12 +35,11 @@ interface VapiCallMessage {
   role: string;
   message?: string;
   toolCalls?: Array<{
-    id?: string;
+    id: string;
     type?: string;
     function: {
       name: string;
       arguments: string;
-      type?: string;
     };
   }>;
   toolCallId?: string;
@@ -58,10 +58,6 @@ interface VapiCallResponse {
   status: string;
   endedReason?: string;
   duration?: number;
-  monitor?: {
-    listenUrl?: string;
-    controlUrl?: string;
-  };
   costBreakdown?: {
     stt?: number;
     llm?: number;
@@ -70,53 +66,33 @@ interface VapiCallResponse {
     vapi?: number;
     chat?: number;
     total?: number;
-    llmPromptTokens?: number;
-    llmCompletionTokens?: number;
-    llmCachedPromptTokens?: number;
-    ttsCharacters?: number;
-    analysisCostBreakdown?: Record<string, unknown>;
-  };
-  analysis?: {
-    summary?: string;
-    successEvaluation?: string;
-    structuredData?: Record<string, unknown>;
-    structuredDataMulti?: Array<Record<string, unknown>>;
+    analysisCostBreakdown?: {
+      summary?: number;
+      structuredData?: number;
+      successEvaluation?: number;
+      structuredOutput?: number;
+    };
   };
   artifact?: {
     messages?: VapiCallMessage[];
-    messagesOpenAIFormatted?: unknown[];
-    transcript?: string;
-    recording?: unknown;
+    recording?: { stereoUrl?: string; videoUrl?: string; mono?: { combinedUrl?: string } };
     recordingUrl?: string;
     stereoRecordingUrl?: string;
     videoRecordingUrl?: string;
     pcapUrl?: string;
     logUrl?: string;
-    nodes?: unknown[];
-    variableValues?: Record<string, unknown>;
     performanceMetrics?: { turnLatencies?: VapiTurnLatency[] } & Record<string, unknown>;
-    structuredOutputs?: Record<string, unknown>;
-    scorecards?: Record<string, unknown>;
-  };
-  assistant?: {
-    model?: {
-      provider?: string;
-      model?: string;
-    };
   };
 }
 
-type VapiToolCall = NonNullable<VapiCallMessage["toolCalls"]>[number];
-
 const TOOL_RESULT_PENDING_SENTINEL = "Tool Result Still Pending But Proceed Further If Possible.";
 
-
-export class VapiAudioChannel extends BaseAudioChannel {
+export class VapiAudioChannel extends WebSocketAudioChannel {
+  protected readonly label = "Vapi";
   protected override outputSampleRate = 16000;
-  protected override pacingIntervalMs = 10; // 2x real-time (Pipecat: chunk_duration / 2)
+  protected override agentSampleRate = 16000;
 
   private config: VapiAudioChannelConfig;
-  private ws: WebSocket | null = null;
   private callId: string | null = null;
   private controlUrl: string | null = null;
   private cachedCallResponse: VapiCallResponse | null = null;
@@ -126,28 +102,21 @@ export class VapiAudioChannel extends BaseAudioChannel {
    *  runtime end-of-turn source. Vent keeps VAD as the authority for Vapi turn endings. */
   hasPlatformEndOfTurn = false;
 
-  // Call start timestamp for relative timing
-  private connectTimestamp = 0;
-
   // Tool call tracking — cleared when conversation history shows the real tool result.
   private toolCallStartedAt = 0;
   private pendingToolCallIds = new Set<string>();
+  // Collected live: Vapi's stored call messages hold a transcription of the
+  // agent's audio, not the text it was set to say.
+  private liveTranscript: PlatformUtterance[] = [];
+  private toolDurations = new Map<string, number>();
 
   constructor(config: VapiAudioChannelConfig) {
     super();
     this.config = config;
   }
 
-  get connected(): boolean {
-    return this.ws?.readyState === WebSocket.OPEN;
-  }
-
   async connect(): Promise<void> {
     const connectStart = Date.now();
-    this.connectTimestamp = connectStart;
-    this._connectTimestampMs = connectStart;
-    this._connectMonotonicMs = performance.now();
-    this.enableRecordingCapture();
 
     // Create call via Vapi SDK with WebSocket transport. The customer's saved
     // assistant runs unmodified, so measured timing matches what their callers get.
@@ -186,24 +155,12 @@ export class VapiAudioChannel extends BaseAudioChannel {
       throw new Error("Vapi response missing websocketCallUrl");
     }
 
-    // Connect to WebSocket for audio exchange.
-    await this.connectWebSocket(wsUrl);
+    // Connect for audio exchange. Vapi's first server message proves the call is fully provisioned.
+    await this.openSocket(wsUrl, {}, (text) => this.handleControlMessage(text), true);
     this._stats.connectLatencyMs = Date.now() - connectStart;
 
     // Start comfort noise to keep the WebSocket active while waiting for agent greeting
     this.startComfortNoise();
-  }
-
-  protected async writeAudioFrame(samples: Int16Array, sampleRate: number): Promise<void> {
-    if (!this.ws) return;
-    this.ws.send(Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength));
-  }
-
-  override sendAudio(pcm: Buffer): void {
-    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
-      throw new Error("Vapi WebSocket not connected");
-    }
-    super.sendAudio(pcm);
   }
 
   async disconnect(): Promise<void> {
@@ -212,7 +169,7 @@ export class VapiAudioChannel extends BaseAudioChannel {
     // End the call on Vapi's side by sending end-call over WebSocket.
     // Per Vapi docs: send {"type": "end-call"} as a text frame to terminate the call cleanly.
     // Also try controlUrl as fallback for cases where WS is already closed.
-    if (this.ws?.readyState === WebSocket.OPEN) {
+    if (this.ws && this.connected) {
       try {
         this.ws.send(JSON.stringify({ type: "end-call" }));
       } catch {
@@ -281,7 +238,7 @@ export class VapiAudioChannel extends BaseAudioChannel {
 
   async getCallData(): Promise<ObservedToolCall[]> {
     const data = await this.fetchCallResponse();
-    return data ? parseToolCalls(data) : [];
+    return data ? parseToolCalls(data, this.toolDurations) : [];
   }
 
   async getCallMetadata(): Promise<CallMetadata | null> {
@@ -296,22 +253,16 @@ export class VapiAudioChannel extends BaseAudioChannel {
     }
 
     const cb = data.costBreakdown;
+    const toolCalls = parseToolCalls(data, this.toolDurations);
     return {
       platform: "vapi",
       provider_call_id: data.id || this.callId || undefined,
       ended_reason: data.endedReason,
-      cost_usd: cb?.total,
-      cost_breakdown: buildVapiCostBreakdown(cb),
-      usage: buildVapiUsage(cb, data.assistant),
+      cost: buildVapiCost(cb),
       recording_url: getPrimaryRecordingUrl(data.artifact),
       recording_variants: buildVapiRecordingVariants(data.artifact),
       provider_debug_urls: buildVapiDebugUrls(data),
-      variables: data.artifact?.variableValues,
-      provider_metadata: compactUnknownRecord({
-        duration_s: data.duration,
-        performance_metrics: data.artifact?.performanceMetrics,
-      }),
-      transfers: extractVapiTransfers(data),
+      transfers: extractVapiTransfers(toolCalls, data.endedReason),
     };
   }
 
@@ -325,12 +276,16 @@ export class VapiAudioChannel extends BaseAudioChannel {
     }));
   }
 
-  /** What Vapi heard the caller say, in order, one entry per caller message. */
-  getTranscripts(): Array<{ turnIndex: number; text: string }> {
-    const messages = this.cachedCallResponse?.artifact?.messages ?? [];
-    return messages
-      .filter((message) => message.role === "user" && message.message)
-      .map((message, turnIndex) => ({ turnIndex, text: message.message! }));
+  /** What Vapi heard the caller say, and the text it sent to the voice, in call order. */
+  getTranscripts(): PlatformUtterance[] {
+    // Vapi starts a fixed first message (the default mode) before Vent's socket connects and
+    // sends no voice-input for it; its text is the assistant's firstMessage. Vapi reports the
+    // text of its tool wait messages ("Just a sec") nowhere, so those are missing.
+    const config = this.cachedAssistantRuntimeConfig;
+    const fixedFirstMessage = (config?.firstMessageMode ?? "assistant-speaks-first") === "assistant-speaks-first"
+      ? config?.firstMessage
+      : undefined;
+    return fixedFirstMessage ? [{ role: "agent", text: fixedFirstMessage }, ...this.liveTranscript] : this.liveTranscript;
   }
 
   private callData?: Promise<VapiCallResponse | null>;
@@ -344,7 +299,11 @@ export class VapiAudioChannel extends BaseAudioChannel {
       "vapi-postcall",
       async () => await client.calls.get({ id: callId }) as unknown as VapiCallResponse,
       (data) => data.status === "ended",
-    ).then((data) => (this.cachedCallResponse = data));
+    ).then(async (data) => {
+      this.cachedCallResponse = data;
+      if (data) this.toolDurations = await fetchVapiToolDurations(this.config.apiKey, callId);
+      return data;
+    });
     return this.callData;
   }
 
@@ -365,7 +324,7 @@ export class VapiAudioChannel extends BaseAudioChannel {
     const resolvedIds = this.extractResolvedToolCallIds(msg);
     if (resolvedIds.size === 0) return;
 
-    if (resolvedIds.has("__unknown__") || this.pendingToolCallIds.size === 0) {
+    if (this.pendingToolCallIds.size === 0) {
       this.clearToolCallActive("Conversation update contains resolved tool result(s)");
       return;
     }
@@ -381,120 +340,17 @@ export class VapiAudioChannel extends BaseAudioChannel {
     }
   }
 
+  /** Ids of tools whose result is in a `conversation-update`; an async tool's placeholder result doesn't count. */
   private extractResolvedToolCallIds(msg: Record<string, unknown>): Set<string> {
     const resolved = new Set<string>();
-    const artifact = msg.artifact as Record<string, unknown> | undefined;
-    const sources = [
-      msg.messages,
-      artifact?.messages,
-      msg.messagesOpenAIFormatted,
-      artifact?.messagesOpenAIFormatted,
-    ];
-
-    for (const source of sources) {
-      if (!Array.isArray(source)) continue;
-
-      for (const entry of source) {
-        if (!entry || typeof entry !== "object") continue;
-        const message = entry as Record<string, unknown>;
-        const role = typeof message.role === "string" ? message.role : "";
-
-        if (role === "tool_call_result") {
-          const toolCallId = typeof message.toolCallId === "string"
-            ? message.toolCallId
-            : typeof message.tool_call_id === "string"
-              ? message.tool_call_id
-              : "";
-          resolved.add(toolCallId || "__unknown__");
-          continue;
-        }
-
-        if (role === "tool") {
-          const content = typeof message.content === "string"
-            ? message.content
-            : typeof message.result === "string"
-              ? message.result
-              : "";
-          if (!content || content.includes(TOOL_RESULT_PENDING_SENTINEL)) continue;
-
-          const toolCallId = typeof message.tool_call_id === "string"
-            ? message.tool_call_id
-            : typeof message.toolCallId === "string"
-              ? message.toolCallId
-              : "";
-          resolved.add(toolCallId || "__unknown__");
-        }
+    for (const message of (msg.messages ?? []) as VapiCallMessage[]) {
+      if (message.role === "tool_call_result" && message.toolCallId && !message.result?.includes(TOOL_RESULT_PENDING_SENTINEL)) {
+        resolved.add(message.toolCallId);
       }
     }
-
     return resolved;
   }
 
-  private async connectWebSocket(wsUrl: string): Promise<void> {
-    return new Promise<void>((resolve, reject) => {
-      const ws = new WebSocket(wsUrl);
-      ws.binaryType = "nodebuffer";
-      let resolved = false;
-
-      // Timeout if WebSocket doesn't complete handshake
-      const timeout = setTimeout(() => {
-        if (!resolved) {
-          resolved = true;
-          ws.close();
-          reject(new Error(`Vapi WebSocket connection timed out after ${CONNECT_TIMEOUT_MS}ms`));
-        }
-      }, CONNECT_TIMEOUT_MS);
-
-      ws.on("open", () => {
-        this.ws = ws;
-        console.log(`    [vapi-ws] open t=${this.relativeNowMs()}ms`);
-
-        ws.on("message", (data: WebSocket.RawData, isBinary: boolean) => {
-          if (isBinary) {
-            const chunk = data instanceof Buffer ? data : Buffer.from(data as ArrayBuffer);
-            this._stats.bytesReceived += chunk.length;
-            const resampled = resample(chunk, 16000, 24000);
-            this.captureAgentAudio(resampled, performance.now() - this._connectMonotonicMs);
-            this.emit("audio", resampled);
-          } else {
-            this.handleControlMessage(data.toString());
-
-            // Resolve on first server message — proves the call is fully provisioned
-            if (!resolved) {
-              resolved = true;
-              clearTimeout(timeout);
-              resolve();
-            }
-          }
-        });
-
-        ws.on("error", (err) => {
-          this._stats.errorEvents.push(err.message);
-          this.emit("error", err);
-        });
-
-        ws.on("close", () => {
-          this.stopComfortNoise();
-          this.ws = null;
-          if (!resolved) {
-            resolved = true;
-            clearTimeout(timeout);
-            reject(new Error("Vapi WebSocket closed before call was provisioned"));
-            return;
-          }
-          this.emit("disconnected");
-        });
-      });
-
-      ws.on("error", (err) => {
-        if (!resolved) {
-          resolved = true;
-          clearTimeout(timeout);
-          reject(new Error(`Vapi WebSocket connection failed: ${err.message}`));
-        }
-      });
-    });
-  }
 
   private handleControlMessage(raw: string): void {
     let msg: Record<string, unknown>;
@@ -537,6 +393,16 @@ export class VapiAudioChannel extends BaseAudioChannel {
         this.maybeResolveToolCall(msg);
         break;
 
+      case "transcript":
+        if (msg.role === "user" && msg.transcriptType === "final" && typeof msg.transcript === "string") {
+          this.liveTranscript.push({ role: "caller", text: msg.transcript });
+        }
+        break;
+
+      case "voice-input":
+        if (typeof msg.input === "string") this.liveTranscript.push({ role: "agent", text: msg.input });
+        break;
+
       case "status-update":
         if (msg.status === "ended") this.emit("disconnected");
         break;
@@ -546,31 +412,48 @@ export class VapiAudioChannel extends BaseAudioChannel {
         break;
     }
   }
-
-  private relativeNowMs(): number {
-    return this.connectTimestamp > 0 ? Date.now() - this.connectTimestamp : 0;
-  }
 }
 
-function parseToolCalls(data: VapiCallResponse): ObservedToolCall[] {
+/**
+ * How long each tool ran, from the call's logs (GET /call/{id}/call-logs, gzipped
+ * JSONL). The call record only shows when a result joined the conversation, which
+ * waits for the "one moment" message to finish playing. A run of several tools has
+ * one duration, so only single-tool runs are kept. Without logs (Logging off): none.
+ */
+async function fetchVapiToolDurations(apiKey: string, callId: string): Promise<Map<string, number>> {
+  const durations = new Map<string, number>();
+  const res = await fetch(`https://api.vapi.ai/call/${callId}/call-logs`, {
+    headers: { Authorization: `Bearer ${apiKey}` },
+  });
+  if (!res.ok) return durations;
+  const lines = gunzipSync(Buffer.from(await res.arrayBuffer())).toString("utf8").split("\n");
+  for (const line of lines) {
+    if (!line) continue;
+    const { attributes } = JSON.parse(line) as {
+      attributes?: { event?: string; duration?: number; results?: Array<{ toolCallId: string }> };
+    };
+    // `duration` covers the whole batch, so it is one call's latency only when the batch held one call.
+    if (attributes?.event !== "assistant.tool.completed" || attributes.results?.length !== 1) continue;
+    if (typeof attributes.duration === "number") durations.set(attributes.results[0]!.toolCallId, attributes.duration);
+  }
+  return durations;
+}
+
+function parseToolCalls(data: VapiCallResponse, toolDurations: Map<string, number>): ObservedToolCall[] {
   const messages = data.artifact?.messages ?? [];
   const toolCalls: ObservedToolCall[] = [];
 
   // Build a map of tool call results keyed by toolCallId
   // Vapi format: { role: "tool_call_result", toolCallId: "...", result: "..." }
-  const resultMap = new Map<string, { result?: string; secondsFromStart?: number }>();
-  const resultsByPosition: Array<{ result?: string; secondsFromStart?: number }> = [];
+  const resultMap = new Map<string, { result?: string }>();
   for (const msg of messages) {
     if (msg.role === "tool_call_result" && msg.toolCallId) {
-      const entry = { result: msg.result, secondsFromStart: msg.secondsFromStart };
-      resultMap.set(msg.toolCallId, entry);
-      resultsByPosition.push(entry);
+      resultMap.set(msg.toolCallId, { result: msg.result });
     }
   }
 
-  let toolCallIndex = 0;
   for (const msg of messages) {
-    if ((msg.role === "tool_calls" || msg.role === "tool-call") && msg.toolCalls) {
+    if (msg.role === "tool_calls" && msg.toolCalls) {
       for (const tc of msg.toolCalls) {
         let args: Record<string, unknown> = {};
         try {
@@ -579,12 +462,7 @@ function parseToolCalls(data: VapiCallResponse): ObservedToolCall[] {
           // keep empty
         }
 
-        // Try ID match first, fall back to positional match
-        let resultEntry = tc.id ? resultMap.get(tc.id) : undefined;
-        if (!resultEntry && toolCallIndex < resultsByPosition.length) {
-          console.log(`    [vapi-postcall] Tool call "${tc.function.name}" ID "${tc.id}" not in resultMap (${resultMap.size} entries), using positional match`);
-          resultEntry = resultsByPosition[toolCallIndex];
-        }
+        const resultEntry = resultMap.get(tc.id);
 
         let parsedResult: unknown;
         try {
@@ -594,7 +472,6 @@ function parseToolCalls(data: VapiCallResponse): ObservedToolCall[] {
         }
 
         const timestampMs = msg.secondsFromStart != null ? msg.secondsFromStart * 1000 : undefined;
-        const resultTimestampMs = resultEntry?.secondsFromStart != null ? resultEntry.secondsFromStart * 1000 : undefined;
         const hasResult = resultEntry != null;
 
         toolCalls.push({
@@ -602,15 +479,10 @@ function parseToolCalls(data: VapiCallResponse): ObservedToolCall[] {
           arguments: args,
           result: parsedResult,
           successful: hasResult,
-          provider_tool_type: typeof tc.type === "string"
-            ? tc.type
-            : typeof tc.function.type === "string"
-              ? tc.function.type
-              : undefined,
+          provider_tool_type: tc.type,
           timestamp_ms: timestampMs,
-          latency_ms: timestampMs != null && resultTimestampMs != null ? resultTimestampMs - timestampMs : undefined,
+          latency_ms: toolDurations.get(tc.id),
         });
-        toolCallIndex++;
       }
     }
   }
@@ -619,44 +491,23 @@ function parseToolCalls(data: VapiCallResponse): ObservedToolCall[] {
 }
 
 /**
- * Extract transfers from Vapi post-call API data.
- * Looks at transferCall tool calls in artifact.messages and endedReason.
+ * Transfers from Vapi post-call data: calls to the built-in transferCall tool,
+ * else an "assistant-forwarded-call" end reason.
  */
-function extractVapiTransfers(data: VapiCallResponse): CallTransfer[] | undefined {
-  const transfers: CallTransfer[] = [];
-  const messages = data.artifact?.messages;
-  const endedReason = data.endedReason;
+function extractVapiTransfers(toolCalls: ObservedToolCall[], endedReason: string | undefined): CallTransfer[] | undefined {
+  const forwarded = endedReason === "assistant-forwarded-call";
+  const transfers: CallTransfer[] = toolCalls
+    .filter((toolCall) => toolCall.name === "transferCall")
+    .map((toolCall) => ({
+      type: "transferCall",
+      // The model passes the stored number or SIP URI it picked as `destination`.
+      destination: typeof toolCall.arguments.destination === "string" ? toolCall.arguments.destination : undefined,
+      status: forwarded ? "completed" : "attempted",
+      sources: ["platform_metadata"],
+      ...(toolCall.timestamp_ms != null ? { timestamp_ms: toolCall.timestamp_ms } : {}),
+    }));
 
-  if (messages) {
-    const resultMap = new Map<string, { result?: string; secondsFromStart?: number }>();
-    for (const msg of messages) {
-      if (msg.role === "tool_call_result" && msg.toolCallId) {
-        resultMap.set(msg.toolCallId, { result: msg.result, secondsFromStart: msg.secondsFromStart });
-      }
-    }
-
-    for (const msg of messages) {
-      if ((msg.role !== "tool_calls" && msg.role !== "tool-call") || !msg.toolCalls) continue;
-      for (const tc of msg.toolCalls) {
-        if (!isVapiTransferToolCall(tc)) continue;
-        let args: Record<string, unknown> = {};
-        try { args = JSON.parse(tc.function.arguments) as Record<string, unknown>; } catch {}
-        const destination = extractVapiTransferDestination(args);
-        const resultEntry = tc.id ? resultMap.get(tc.id) : undefined;
-        const status = resolveVapiToolTransferStatus(resultEntry, endedReason);
-        const timestampMs = msg.secondsFromStart != null ? msg.secondsFromStart * 1000 : undefined;
-        transfers.push({
-          type: normalizeVapiTransferType(tc),
-          destination,
-          status,
-          sources: ["platform_metadata"],
-          ...(timestampMs != null ? { timestamp_ms: timestampMs } : {}),
-        });
-      }
-    }
-  }
-
-  if (transfers.length === 0 && endedReason === "assistant-forwarded-call") {
+  if (transfers.length === 0 && forwarded) {
     transfers.push({
       type: "assistant-forwarded-call",
       status: "completed",
@@ -667,163 +518,45 @@ function extractVapiTransfers(data: VapiCallResponse): CallTransfer[] | undefine
   return transfers.length > 0 ? transfers : undefined;
 }
 
-function isVapiTransferToolCall(toolCall: VapiToolCall): boolean {
-  const name = toolCall.function.name.toLowerCase();
-  const toolType = typeof toolCall.type === "string" ? toolCall.type.toLowerCase() : undefined;
-  const functionType = typeof toolCall.function.type === "string" ? toolCall.function.type.toLowerCase() : undefined;
-  return name === "transfercall"
-    || name === "transfer_call"
-    || name === "handoff"
-    || toolType === "handoff"
-    || functionType === "handoff";
-}
-
-function normalizeVapiTransferType(toolCall: VapiToolCall): string {
-  const name = toolCall.function.name.toLowerCase();
-  const toolType = typeof toolCall.type === "string" ? toolCall.type.toLowerCase() : undefined;
-  const functionType = typeof toolCall.function.type === "string" ? toolCall.function.type.toLowerCase() : undefined;
-  if (name === "handoff" || toolType === "handoff" || functionType === "handoff") {
-    return "handoff";
-  }
-  return "transferCall";
-}
-
-function extractVapiTransferDestination(args: Record<string, unknown>): string | undefined {
-  const destination = args.destination;
-  if (typeof destination === "string") return destination;
-  if (destination && typeof destination === "object") {
-    const value = destination as Record<string, unknown>;
-    if (typeof value.number === "string") return value.number;
-    if (typeof value.sipUri === "string") return value.sipUri;
-    if (typeof value.assistantName === "string") return value.assistantName;
-    if (typeof value.assistantId === "string") return value.assistantId;
-    if (typeof value.squadName === "string") return value.squadName;
-    if (typeof value.squadId === "string") return value.squadId;
-  }
-  if (typeof args.number === "string") return args.number;
-  if (typeof args.sipUri === "string") return args.sipUri;
-  if (typeof args.assistantName === "string") return args.assistantName;
-  if (typeof args.assistantId === "string") return args.assistantId;
-  if (typeof args.squadName === "string") return args.squadName;
-  if (typeof args.squadId === "string") return args.squadId;
-  return undefined;
-}
-
-function resolveVapiToolTransferStatus(
-  resultEntry: { result?: string } | undefined,
-  endedReason: string | undefined,
-): CallTransfer["status"] {
-  if (endedReason === "assistant-forwarded-call") return "completed";
-  if (!resultEntry) return "attempted";
-  if (resultEntry.result) {
-    try {
-      const parsed = JSON.parse(resultEntry.result) as Record<string, unknown>;
-      if (parsed.success === true) return "completed";
-      if (parsed.success === false) return "failed";
-    } catch {}
-  }
-  return "attempted";
-}
-
-
-
-function getRecordingUrl(recording: unknown): string | undefined {
-  if (!recording) return undefined;
-  if (typeof recording === "string") return recording;
-  if (typeof recording !== "object") return undefined;
-
-  const rec = recording as Record<string, unknown>;
-
-  const direct = rec.url;
-  if (typeof direct === "string") return direct;
-
-  for (const value of Object.values(rec)) {
-    if (typeof value === "string" && /^https?:\/\//.test(value)) {
-      return value;
-    }
-    if (value && typeof value === "object") {
-      const nested = (value as Record<string, unknown>).url;
-      if (typeof nested === "string") return nested;
-    }
-  }
-
-  return undefined;
-}
-
-function buildVapiUsage(
-  costBreakdown: VapiCallResponse["costBreakdown"] | undefined,
-  assistant: VapiCallResponse["assistant"] | undefined,
-): UsageEntry[] | undefined {
-  if (!costBreakdown) return undefined;
-  const { llmPromptTokens, llmCompletionTokens, llmCachedPromptTokens } = costBreakdown;
-  if (llmPromptTokens == null && llmCompletionTokens == null) return undefined;
-  const entry: UsageEntry = {
-    type: "llm",
-    provider: assistant?.model?.provider ?? "unknown",
-    model: assistant?.model?.model ?? "unknown",
-    input_tokens: llmPromptTokens,
-    output_tokens: llmCompletionTokens,
-  };
-  if (llmCachedPromptTokens != null && llmCachedPromptTokens > 0) {
-    (entry as unknown as Record<string, unknown>).cached_input_tokens = llmCachedPromptTokens;
-  }
-  return [entry];
-}
-
-function buildVapiCostBreakdown(costBreakdown: VapiCallResponse["costBreakdown"] | undefined): CallMetadata["cost_breakdown"] {
-  if (!costBreakdown) return undefined;
-  return {
-    stt_usd: costBreakdown.stt,
-    llm_usd: costBreakdown.llm,
-    tts_usd: costBreakdown.tts,
-    transport_usd: costBreakdown.transport,
-    platform_usd: costBreakdown.vapi,
-    total_usd: costBreakdown.total,
-    llm_prompt_tokens: costBreakdown.llmPromptTokens,
-    llm_completion_tokens: costBreakdown.llmCompletionTokens,
-  };
+/** Vapi's own cost categories, in USD. The analysis sub-costs are summed into `analysis`. */
+function buildVapiCost(costBreakdown: VapiCallResponse["costBreakdown"] | undefined): CallMetadata["cost"] {
+  if (costBreakdown?.total == null) return undefined;
+  const analysisCosts = Object.values(costBreakdown.analysisCostBreakdown ?? {})
+    .filter((v): v is number => typeof v === "number");
+  const breakdown = compactNumberRecord({
+    stt: costBreakdown.stt,
+    llm: costBreakdown.llm,
+    tts: costBreakdown.tts,
+    transport: costBreakdown.transport,
+    vapi: costBreakdown.vapi,
+    chat: costBreakdown.chat,
+    analysis: analysisCosts.length > 0 ? analysisCosts.reduce((a, b) => a + b, 0) : undefined,
+  });
+  return { total_usd: costBreakdown.total, ...(breakdown ? { breakdown } : {}) };
 }
 
 function getPrimaryRecordingUrl(artifact: VapiCallResponse["artifact"] | undefined): string | undefined {
   if (!artifact) return undefined;
-  return artifact.recordingUrl
-    ?? getRecordingUrl(artifact.recording)
-    ?? artifact.stereoRecordingUrl
-    ?? artifact.videoRecordingUrl;
+  return artifact.recordingUrl ?? artifact.stereoRecordingUrl ?? artifact.videoRecordingUrl;
 }
 
 function buildVapiRecordingVariants(artifact: VapiCallResponse["artifact"] | undefined): CallMetadata["recording_variants"] {
   if (!artifact) return undefined;
   return compactStringRecord({
     primary: artifact.recordingUrl,
-    mono: getRecordingUrl(artifact.recording),
+    mono: artifact.recording?.mono?.combinedUrl,
     stereo: artifact.stereoRecordingUrl,
     video: artifact.videoRecordingUrl,
   });
 }
 
+/** Links that still work after the call; the live monitor sockets don't. */
 function buildVapiDebugUrls(
-  data: Pick<VapiCallResponse, "artifact" | "monitor">,
+  data: Pick<VapiCallResponse, "id" | "artifact">,
 ): CallMetadata["provider_debug_urls"] {
   return compactStringRecord({
-    listen: data.monitor?.listenUrl,
-    control: data.monitor?.controlUrl,
+    dashboard: data.id ? `https://dashboard.vapi.ai/calls/${data.id}` : undefined,
     log: data.artifact?.logUrl,
     pcap: data.artifact?.pcapUrl,
   });
-}
-
-function compactStringRecord(record: Record<string, string | undefined>): Record<string, string> | undefined {
-  const compacted: Record<string, string> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if (typeof value === "string" && value.length > 0) {
-      compacted[key] = value;
-    }
-  }
-  return Object.keys(compacted).length > 0 ? compacted : undefined;
-}
-
-function compactUnknownRecord(record: Record<string, unknown>): Record<string, unknown> | undefined {
-  const entries = Object.entries(record).filter(([, value]) => value != null);
-  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
 }

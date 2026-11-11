@@ -3,12 +3,12 @@ import { Queue } from "bullmq";
 import IORedis from "ioredis";
 import { finalizeRun } from "../lib/finalize-run.js";
 import { RunQueueMonitor } from "../lib/run-queue-monitor.js";
-import { RUN_QUEUE_NAME, requireEnv } from "@vent/shared";
+import { RUN_QUEUE_NAME, requireEnv, type RunJob } from "@vent/shared";
 
 declare module "fastify" {
   interface FastifyInstance {
     /** The one queue every run's job goes to (worker machines take from it). */
-    runQueue: Queue;
+    runQueue: Queue<RunJob>;
     redis: IORedis;
   }
 }
@@ -19,7 +19,7 @@ export const queuePlugin = fp(async (app) => {
 
   app.decorate("redis", connection);
 
-  const runQueue = new Queue(RUN_QUEUE_NAME, {
+  const runQueue = new Queue<RunJob>(RUN_QUEUE_NAME, {
     connection,
     defaultJobOptions: {
       // Voice calls are non-idempotent (each execution = a real billed phone call).

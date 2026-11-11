@@ -1,5 +1,6 @@
 import type { FastifyInstance } from "fastify";
 import type { RunTestSpec } from "@vent/db";
+import { RunJobSchema, type RunJob } from "@vent/shared";
 
 /** The run columns a worker job is built from. */
 export interface EnqueueableRun {
@@ -15,19 +16,13 @@ export interface EnqueueableRun {
 // queueing the same run twice is harmless.
 export async function enqueueRun(app: FastifyInstance, run: EnqueueableRun): Promise<void> {
   const spec = run.test_spec_json;
-  await app.runQueue.add(
-    "execute-run",
-    {
-      run_id: run.id,
-      user_id: run.user_id,
-      adapter: spec.adapter,
-      call_spec: { call: spec.call },
-      voice_config: spec.voice_config,
-      start_command: spec.start_command ?? undefined,
-      health_endpoint: spec.health_endpoint ?? undefined,
-      agent_url: spec.agent_url ?? undefined,
-      ...(run.agent_session_id ? { agent_session_id: run.agent_session_id } : {}),
-    },
-    { jobId: run.id },
-  );
+  const job: RunJob = RunJobSchema.parse({
+    run_id: run.id,
+    user_id: run.user_id,
+    adapter: spec.adapter,
+    call_spec: { call: spec.call },
+    agent_url: spec.agent_url ?? undefined,
+    agent_session_id: run.agent_session_id ?? undefined,
+  });
+  await app.runQueue.add("execute-run", job, { jobId: run.id });
 }

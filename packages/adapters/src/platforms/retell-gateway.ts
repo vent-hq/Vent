@@ -8,7 +8,7 @@
  * hooks.audio as 24kHz mono PCM.
  */
 const wrtc: typeof import("@roamhq/wrtc") = require("@roamhq/wrtc");
-import { resample } from "@vent/voice";
+import { resample } from "@vent/shared";
 import { CONNECT_TIMEOUT_MS } from "../shared/audio-channel.js";
 
 const API = "https://api.retellai.com";
@@ -39,7 +39,7 @@ interface DataChannel {
 }
 interface AudioData { samples: Int16Array; numberOfFrames: number; channelCount: number; sampleRate: number }
 
-export interface RetellGatewayHooks {
+interface RetellGatewayHooks {
   audio(pcm24k: Buffer): void;
   disconnected(): void;
   error(error: Error): void;

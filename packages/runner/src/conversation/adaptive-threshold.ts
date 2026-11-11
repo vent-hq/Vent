@@ -12,28 +12,17 @@
  * If pauses are consistently short → decrease toward base.
  */
 
-import type { CollectionStats } from "../audio-tests/helpers.js";
+import type { CollectionStats } from "./turn-taking.js";
 
-export interface AdaptiveThresholdConfig {
-  /** Starting/base threshold in ms. Default: 400 */
-  baseMs: number;
-  /** Minimum threshold — never go below this. Default: 200 */
-  minMs?: number;
-  /** Maximum threshold — never go above this. Default: 3000 */
-  maxMs?: number;
-}
+/** The threshold never goes below / above these. */
+const MIN_MS = 200;
+const MAX_MS = 3000;
 
 export class AdaptiveThreshold {
-  private readonly baseMs: number;
-  private readonly minMs: number;
-  private readonly maxMs: number;
   private currentMs: number;
 
-  constructor(config: AdaptiveThresholdConfig) {
-    this.baseMs = config.baseMs;
-    this.minMs = config.minMs ?? 200;
-    this.maxMs = config.maxMs ?? 3000;
-    this.currentMs = config.baseMs;
+  constructor(baseMs: number) {
+    this.currentMs = baseMs;
   }
 
   /** Current threshold to use for the next turn. */
@@ -77,6 +66,6 @@ export class AdaptiveThreshold {
     this.currentMs = this.currentMs * 0.7 + target * 0.3;
 
     // Clamp to bounds
-    this.currentMs = Math.max(this.minMs, Math.min(this.maxMs, this.currentMs));
+    this.currentMs = Math.max(MIN_MS, Math.min(MAX_MS, this.currentMs));
   }
 }

@@ -6,8 +6,6 @@ WORKDIR /app
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml* .npmrc ./
 COPY packages/shared/package.json packages/shared/package.json
 COPY packages/db/package.json packages/db/package.json
-COPY packages/voice/package.json packages/voice/package.json
-COPY packages/adapters/package.json packages/adapters/package.json
 COPY packages/platform-connections/package.json packages/platform-connections/package.json
 COPY packages/artifacts/package.json packages/artifacts/package.json
 COPY apps/api/package.json apps/api/package.json

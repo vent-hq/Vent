@@ -2,15 +2,18 @@ import { randomUUID } from "node:crypto";
 import type { FastifyInstance } from "fastify";
 import { eq, and } from "drizzle-orm";
 import { schema } from "@vent/db";
+import { DEFAULT_AGENT_PORT, requireEnv, type AgentSessionResponse } from "@vent/shared";
 import { cleanupSession, relaySessions } from "./transport.js";
 
 async function agentSessionRoutes(app: FastifyInstance) {
+  // The CLI connects to the relay from outside, so it gets the public URL.
+  const apiUrl = requireEnv("API_PUBLIC_URL");
+
   // POST /agent-sessions — Create a new agent session (relay tunnel)
   app.post("/agent-sessions", {
     preHandler: [app.verifyAccessToken],
   }, async (request, reply) => {
     const userId = request.userId!;
-    const accessTokenId = request.accessTokenId!;
 
     const body = request.body as {
       config?: {
@@ -26,13 +29,11 @@ async function agentSessionRoutes(app: FastifyInstance) {
     }
 
     const relayToken = randomUUID();
-    const apiUrl = process.env["API_URL"]!;
 
     const [session] = await app.db
       .insert(schema.agentSessions)
       .values({
         user_id: userId,
-        access_token_id: accessTokenId,
         relay_token: relayToken,
         status: "connecting",
       })
@@ -41,14 +42,15 @@ async function agentSessionRoutes(app: FastifyInstance) {
     const sessionId = session!.id;
     const config = body.config;
 
-    return reply.send({
+    const response: AgentSessionResponse = {
       session_id: sessionId,
       relay_token: relayToken,
       api_url: apiUrl,
-      agent_port: config.agent_port ?? 3001,
+      agent_port: config.agent_port ?? DEFAULT_AGENT_PORT,
       start_command: config.start_command ?? null,
       health_endpoint: config.health_endpoint ?? "/health",
-    });
+    };
+    return reply.send(response);
   });
 
   // POST /agent-sessions/:id/close — Close an agent session
@@ -75,7 +77,7 @@ async function agentSessionRoutes(app: FastifyInstance) {
 
     await app.db
       .update(schema.agentSessions)
-      .set({ status: "closed", closed_at: new Date() })
+      .set({ status: "closed" })
       .where(
         and(
           eq(schema.agentSessions.id, sessionId),

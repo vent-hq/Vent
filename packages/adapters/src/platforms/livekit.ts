@@ -16,15 +16,8 @@
  */
 
 import {
-  Room,
   RoomEvent,
-  AudioSource,
-  AudioStream,
-  AudioFrame,
-  LocalAudioTrack,
   TrackKind,
-  TrackPublishOptions,
-  TrackSource,
   ParticipantKind,
   DisconnectReason,
   IceTransportType,
@@ -33,70 +26,41 @@ import {
   type RemoteTrack,
   type RemoteTrackPublication,
   type RemoteParticipant,
-  dispose,
 } from "@livekit/rtc-node";
 import { RoomAgentDispatch, RoomConfiguration } from "@livekit/protocol";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
-import { resample } from "@vent/voice";
-import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, ProviderWarning, UsageEntry } from "@vent/shared";
-import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "../shared/audio-channel.js";
-
-interface WsToolCallEvent {
-  type: "tool_call";
-  name: string;
-  arguments?: Record<string, unknown>;
-  result?: unknown;
-  successful?: boolean;
-  provider_tool_type?: string;
-  tool_type?: string;
-  duration_ms?: number;
-}
-
-interface LiveKitTransferEvent {
-  type: "vent:transfer";
-  transfer?: CallTransfer;
-  destination?: string;
-  status?: CallTransfer["status"];
-  transfer_type?: string;
-  timestamp_ms?: number;
-  source?: CallTransfer["sources"][number];
-}
-
-interface LiveKitDebugUrlEvent {
-  type: "vent:debug-url";
-  label?: string;
-  url?: string;
-}
+import type { ObservedToolCall, CallMetadata, ComponentLatency } from "@vent/shared";
+import { CONNECT_TIMEOUT_MS, type PlatformUtterance } from "../shared/audio-channel.js";
+import { CALLER_IDENTITY, LiveKitRoomChannel } from "../shared/livekit-room.js";
+import { compactStringRecord } from "../shared/record-utils.js";
+import {
+  VENT_EVENTS,
+  mergeCallMetadata,
+  observedToolCall,
+  ventEventMetadata,
+  type VentToolCallEvent,
+} from "../shared/vent-events.js";
 
 interface LiveKitMetricsEvent {
   type?: "vent:metrics";
   event?: string;
-  metric_type?: string;
   metrics?: Record<string, unknown>;
   timestamp_ms?: number;
 }
 
+/** A `conversation_item_added` event: the JS SDK names fields in camelCase, Python in snake_case. */
 interface LiveKitConversationItemEvent {
-  type?: "vent:conversation-item";
-  event?: string;
-  item?: Record<string, unknown>;
-  conversation_item?: Record<string, unknown>;
-  timestamp_ms?: number;
+  item: Record<string, unknown>;
 }
 
-/** Per-turn timing from LiveKit agent state transitions + transcription streams */
+/** Per-turn state from LiveKit agent state transitions + transcription streams */
 interface LiveKitTurnTiming {
-  audioSentAt?: number;
-  /** Agent state → "thinking" (STT done, LLM processing) */
-  thinkingAt?: number;
-  /** First agent transcription chunk on lk.transcription (LLM first token) */
-  firstAgentTextAt?: number;
   /** Agent state → "speaking" (TTS started) */
   speakingAt?: number;
-  /** Agent state → "listening" (speech ended) */
-  listeningAt?: number;
   /** User STT transcript from lk.transcription */
   userTranscript?: string;
+  /** Agent LLM text from lk.transcription */
+  agentTranscript?: string;
 }
 
 interface LiveKitAgentStateTransition {
@@ -108,31 +72,15 @@ interface LiveKitAgentStateTransition {
   emitToolCallActive: boolean | null;
 }
 
-interface LiveKitRoomDisconnectState {
-  disconnectTimestamp: number;
-  disconnectReasonStr: string;
-}
-
 interface LiveKitMetricTiming {
   speechId?: string;
   timing: ComponentLatency;
 }
 
-const LIVEKIT_TOOL_CALL_TOPIC = "vent:tool-calls";
-const LIVEKIT_SESSION_TOPIC = "vent:session";
-const LIVEKIT_CALL_METADATA_TOPIC = "vent:call-metadata";
-const LIVEKIT_TRANSFER_TOPIC = "vent:transfer";
-const LIVEKIT_DEBUG_URL_TOPIC = "vent:debug-url";
-const LIVEKIT_WARNING_TOPIC = "vent:warning";
-const LIVEKIT_SESSION_REPORT_TOPIC = "vent:session-report";
-const LIVEKIT_METRICS_TOPIC = "vent:metrics";
-const LIVEKIT_CONVERSATION_ITEM_TOPIC = "vent:conversation-item";
-const LIVEKIT_USER_INPUT_TRANSCRIBED_TOPIC = "vent:user-input-transcribed";
-const LIVEKIT_SESSION_USAGE_TOPIC = "vent:session-usage";
 const LIVEKIT_TRANSCRIPTION_TOPIC = "lk.transcription";
 const LIVEKIT_AGENT_STATE_ATTR = "lk.agent.state";
 
-export function applyLiveKitAgentStateChange(
+function applyLiveKitAgentStateChange(
   previousState: string | null,
   turn: LiveKitTurnTiming | undefined,
   agentState: string,
@@ -140,9 +88,6 @@ export function applyLiveKitAgentStateChange(
 ): LiveKitAgentStateTransition {
   switch (agentState) {
     case "thinking":
-      if (turn && !turn.thinkingAt) {
-        turn.thinkingAt = now;
-      }
       return {
         nextLastAgentState: agentState,
         emitPlatformSpeechStart: false,
@@ -163,9 +108,6 @@ export function applyLiveKitAgentStateChange(
 
     case "listening": {
       const wasSpeaking = previousState === "speaking" || !!turn?.speakingAt;
-      if (turn && turn.speakingAt && !turn.listeningAt) {
-        turn.listeningAt = now;
-      }
       return {
         nextLastAgentState: agentState,
         emitPlatformSpeechStart: false,
@@ -184,59 +126,38 @@ export function applyLiveKitAgentStateChange(
   }
 }
 
-export function resolveLiveKitRoomDisconnectState(
-  reason: DisconnectReason,
-  now: number,
-  existingDisconnectTimestamp = 0,
-): LiveKitRoomDisconnectState {
-  return {
-    disconnectTimestamp: existingDisconnectTimestamp || now,
-    disconnectReasonStr: DisconnectReason[reason] ?? "UNKNOWN",
-  };
-}
-
-export interface WebRtcAudioChannelConfig {
+interface WebRtcAudioChannelConfig {
   livekitUrl: string;
   apiKey: string;
   apiSecret: string;
   roomName: string;
-  /** Sample rate for LiveKit audio. Default: 48000 */
-  livekitSampleRate?: number;
   /** Optional agent name for explicit dispatch (required if agent uses agent_name registration) */
   agentName?: string;
 }
 
-export class WebRtcAudioChannel extends BaseAudioChannel {
+export class WebRtcAudioChannel extends LiveKitRoomChannel {
   /** LiveKit emits platformEndOfTurn via agent state transitions. */
   hasPlatformEndOfTurn = true;
 
   private config: WebRtcAudioChannelConfig;
-  private room: Room | null = null;
-  private audioSource: AudioSource | null = null;
-  private localTrack: LocalAudioTrack | null = null;
-  private livekitSampleRate: number;
-  private collecting = false;
   private toolCalls: ObservedToolCall[] = [];
   private connectTimestamp = 0;
 
   // Component latency tracking from agent state transitions + transcriptions
   private turnTimings: LiveKitTurnTiming[] = [];
   private currentTurnIndex = -1;
-  private disconnectTimestamp = 0;
+  /** Agent LLM text before the caller's first turn */
+  private greetingTranscript = "";
   private agentIdentity: string | null = null;
   private disconnectReasonStr: string | null = null;
+  private roomSid: string | null = null;
   private lastAgentState: string | null = null;
-  private roomDisconnected = false;
 
-  // Cumulative receive-path stats, for diagnosing "agent went silent" failures.
-  // Surfaced via getReceiveDiagnostics() and logged by the executor when a
-  // collection times out with no speech detected.
+  // Receive-path state, surfaced via getReceiveDiagnostics() when a collection
+  // times out with no speech detected.
   private rxTracks = 0;
-  private rxFrames = 0;
-  private rxSumAbs = 0;
-  private rxSampleCount = 0;
-  private rxPeakAbs = 0;
-  private rxLastFrameAt: number | null = null;
+  private rxLastAssistantItemAt: number | null = null;
+  private rxLastAgentStateAt: number | null = null;
   // Primary track lock for multi-track agents — see Retell adapter for the
   // detailed rationale. Defaults null (no lock); first track to exceed the
   // amplitude threshold becomes primary, others are dropped.
@@ -247,8 +168,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
   // readers on one track compete for frames and corrupt the receive path.
   private startedTrackSids = new Set<string>();
   private static readonly PRIMARY_TRACK_MEAN_ABS_THRESHOLD = 100;
-  private rxLastAssistantItemAt: number | null = null;
-  private rxLastAgentStateAt: number | null = null;
   private callMetadata: CallMetadata = { platform: "livekit" };
   private livekitMetricTimings: LiveKitMetricTiming[] = [];
   private livekitMetricTimingIndexBySpeechId = new Map<string, number>();
@@ -261,13 +180,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
   constructor(config: WebRtcAudioChannelConfig) {
     super();
     this.config = config;
-    this.livekitSampleRate = config.livekitSampleRate ?? 48000;
-    this.outputSampleRate = this.livekitSampleRate;
-    this.enableRecordingCapture();
-  }
-
-  get connected(): boolean {
-    return this.room !== null && !this.roomDisconnected;
   }
 
   async connect(): Promise<void> {
@@ -275,7 +187,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     const token = new AccessToken(
       this.config.apiKey,
       this.config.apiSecret,
-      { identity: "vent-tester" }
+      { identity: CALLER_IDENTITY }
     );
     token.addGrant({
       roomJoin: true,
@@ -297,82 +209,32 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
 
     const jwt = await token.toJwt();
 
-    this.room = new Room();
-    this.roomDisconnected = false;
-    this.disconnectTimestamp = 0;
-    this.disconnectReasonStr = null;
-    this.agentIdentity = null;
-    this.lastAgentState = null;
-    this.rxTracks = 0;
-    this.rxFrames = 0;
-    this.rxSumAbs = 0;
-    this.rxSampleCount = 0;
-    this.rxPeakAbs = 0;
-    this.rxLastFrameAt = null;
-    this.rxLastAssistantItemAt = null;
-    this.rxLastAgentStateAt = null;
-    this.callMetadata = { platform: "livekit" };
-
     // On Fly.io (and other containerized environments), direct UDP is unreliable
     // because containers sit behind WireGuard tunnels and HTTP proxies. Force
     // TURN relay so LiveKit uses TURN/TLS (TCP:443) which works through any proxy.
     const isFlyIo = !!process.env["FLY_MACHINE_ID"];
-    const rtcConfig = isFlyIo
+    const room = await this.joinRoom(this.config.livekitUrl, jwt, isFlyIo
       ? {
           iceTransportType: IceTransportType.TRANSPORT_RELAY,
           continualGatheringPolicy: ContinualGatheringPolicy.GATHER_CONTINUALLY,
           iceServers: [],
         }
-      : undefined;
-
-    await this.room.connect(this.config.livekitUrl, jwt, {
-      autoSubscribe: true,
-      dynacast: true,
-      rtcConfig,
-    });
-    this.collecting = true;
+      : undefined);
     this.connectTimestamp = Date.now();
-    this._connectTimestampMs = this.connectTimestamp;
-    this._connectMonotonicMs = performance.now();
-    this.toolCalls = [];
-    this.turnTimings = [];
-    this.currentTurnIndex = -1;
-    this.segmentTurnMap.clear();
-    this.livekitMetricTimings = [];
-    this.livekitMetricTimingIndexBySpeechId.clear();
-    this.toolCallFingerprints.clear();
-    this.startedTrackSids.clear();
+    // The room SID keys the session's Agent Insights page in LiveKit Cloud.
+    void room.getSid().then((sid) => { this.roomSid = sid; }, () => {});
 
-    // ── Tool call capture via DataChannel ──────────────────────
-    this.room.on(
+    // ── Vent observability via DataChannel ─────────────────────
+    room.on(
       RoomEvent.DataReceived,
       (payload: Uint8Array, participant?: RemoteParticipant, _kind?: unknown, topic?: string) => {
-        if (!this.isObservabilityParticipant(participant)) return;
-        if (topic === LIVEKIT_TOOL_CALL_TOPIC) {
-          this.handleToolCallData(payload);
-          return;
-        }
-        if (topic) {
-          this.handleObservabilityData(payload, topic);
-        }
+        if (!this.isObservabilityParticipant(participant) || !topic) return;
+        this.handleObservabilityData(payload, topic);
       }
     );
 
-    this.room.registerTextStreamHandler(LIVEKIT_TOOL_CALL_TOPIC, async (reader) => {
-      const text = await reader.readAll();
-      this.handleToolCallText(text);
-    });
-
-    for (const topic of LIVEKIT_OBSERVABILITY_TOPICS) {
-      this.room.registerTextStreamHandler(topic, async (reader, participantInfo) => {
-        if (this.agentIdentity && participantInfo.identity !== this.agentIdentity) return;
-        const text = await reader.readAll();
-        this.handleObservabilityText(text, topic);
-      });
-    }
-
     // ── Agent state transitions (lk.agent.state) ──────────────
-    this.room.on(
+    room.on(
       RoomEvent.ParticipantAttributesChanged,
       (changedAttributes: Record<string, string>, participant: Participant) => {
         const agentState = changedAttributes[LIVEKIT_AGENT_STATE_ATTR];
@@ -390,10 +252,10 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     );
 
     // ── Transcription streams (lk.transcription) ──────────────
-    this.room.registerTextStreamHandler(
+    room.registerTextStreamHandler(
       LIVEKIT_TRANSCRIPTION_TOPIC,
       async (reader, participantInfo) => {
-        const isUser = participantInfo.identity === "vent-tester";
+        const isUser = participantInfo.identity === CALLER_IDENTITY;
         const turn = this.currentTurnIndex >= 0 ? this.turnTimings[this.currentTurnIndex] : undefined;
 
         if (isUser) {
@@ -403,47 +265,39 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
           // while the correct turn is still active. The final stream may
           // arrive later during a different turn. We lock the segment to
           // the turn on first sight, then assign the final text there.
-          const segmentId = reader.info?.attributes?.["lk.segment_id"];
+          // LiveKit agents set lk.segment_id on every transcription stream.
+          const segmentId = reader.info?.attributes?.["lk.segment_id"] ?? "";
           const isFinal = reader.info?.attributes?.["lk.transcription_final"] === "true";
 
-          if (segmentId) {
-            // Lock segment to current turn on first observation
-            if (!this.segmentTurnMap.has(segmentId)) {
-              this.segmentTurnMap.set(segmentId, this.currentTurnIndex);
-            }
+          // Lock segment to current turn on first observation
+          if (!this.segmentTurnMap.has(segmentId)) {
+            this.segmentTurnMap.set(segmentId, this.currentTurnIndex);
+          }
 
-            if (!isFinal) return; // Skip interim — only need text from final
+          if (!isFinal) return; // Skip interim — only need text from final
 
-            const anchoredTurnIdx = this.segmentTurnMap.get(segmentId)!;
-            const anchoredTurn = anchoredTurnIdx >= 0 ? this.turnTimings[anchoredTurnIdx] : undefined;
-            const text = await reader.readAll();
-            if (anchoredTurn && text) {
-              anchoredTurn.userTranscript = anchoredTurn.userTranscript
-                ? `${anchoredTurn.userTranscript} ${text}`
-                : text;
-            }
-          } else {
-            // Fallback: no segment_id — use current turn (old behavior)
-            if (!isFinal) return;
-            const text = await reader.readAll();
-            if (turn && text) {
-              turn.userTranscript = turn.userTranscript
-                ? `${turn.userTranscript} ${text}`
-                : text;
-            }
+          const anchoredTurnIdx = this.segmentTurnMap.get(segmentId)!;
+          const anchoredTurn = anchoredTurnIdx >= 0 ? this.turnTimings[anchoredTurnIdx] : undefined;
+          const text = await reader.readAll();
+          if (anchoredTurn && text) {
+            anchoredTurn.userTranscript = anchoredTurn.userTranscript
+              ? `${anchoredTurn.userTranscript} ${text}`
+              : text;
           }
         } else {
-          // Agent transcription: only the time of its first chunk is used,
-          // to split LLM from TTS latency. Vent transcribes the agent itself.
-          for await (const _chunk of reader) {
-            if (turn && !turn.firstAgentTextAt) turn.firstAgentTextAt = Date.now();
-          }
+          // Agent transcription: the LLM's text.
+          let text = "";
+          for await (const chunk of reader) text += chunk;
+          text = text.trim();
+          if (!text) return;
+          if (turn) turn.agentTranscript = turn.agentTranscript ? `${turn.agentTranscript} ${text}` : text;
+          else this.greetingTranscript = this.greetingTranscript ? `${this.greetingTranscript} ${text}` : text;
         }
       }
     );
 
     // ── Disconnect reason capture ─────────────────────────────
-    this.room.once(RoomEvent.Disconnected, (reason: DisconnectReason) => {
+    room.once(RoomEvent.Disconnected, (reason: DisconnectReason) => {
       this.handleRoomDisconnected(reason);
     });
 
@@ -455,7 +309,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     // attached, the event would be dropped, and the receive path would never
     // start reading the track — manifesting as an empty transcript on the
     // second of two parallel calls.
-    this.room.on(
+    room.on(
       RoomEvent.TrackSubscribed,
       (track: RemoteTrack, pub: RemoteTrackPublication, participant: RemoteParticipant) => {
         if (participant.kind === ParticipantKind.AGENT && !this.agentIdentity) {
@@ -471,17 +325,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     );
 
     // ── Audio source for publishing ───────────────────────────
-    this.audioSource = new AudioSource(this.livekitSampleRate, 1);
-    this.localTrack = LocalAudioTrack.createAudioTrack(
-      "vent-tester",
-      this.audioSource
-    );
-    const publishOptions = new TrackPublishOptions();
-    publishOptions.source = TrackSource.SOURCE_MICROPHONE;
-    await this.room.localParticipant!.publishTrack(
-      this.localTrack,
-      publishOptions
-    );
+    await this.publishCallerTrack();
 
     // ── Comfort noise — keep Opus codec warm ────────────────
     // Without continuous audio frames, Opus enters DTX (silence) mode.
@@ -491,7 +335,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     this.startComfortNoise();
 
     // Subscribe to existing remote audio tracks
-    for (const participant of this.room.remoteParticipants.values()) {
+    for (const participant of room.remoteParticipants.values()) {
       console.log(
         `[livekit] pre-existing remote participant identity=${participant.identity} kind=${participant.kind} tracks=${participant.trackPublications.size}`
       );
@@ -516,112 +360,37 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     // fires AFTER the greeting finishes, which means gating on it hides the
     // greeting and opens a first-listener race in our early-audio buffer.
     // agent.state transitions are still used for per-turn EOT elsewhere.
-    const agentReady = await new Promise<boolean>((resolve) => {
-      const alreadyHasAudio = (p: RemoteParticipant) => {
-        if (p.kind !== ParticipantKind.AGENT) return false;
-        for (const pub of p.trackPublications.values()) {
-          if (pub.track && pub.kind === TrackKind.KIND_AUDIO) return true;
-        }
-        return false;
-      };
-
-      const onTrackSubscribed = (
-        _t: RemoteTrack,
-        pub: RemoteTrackPublication,
-        participant: RemoteParticipant,
-      ) => {
-        if (participant.kind !== ParticipantKind.AGENT) return;
-        if (pub.kind !== TrackKind.KIND_AUDIO) return;
-        this.agentIdentity = participant.identity;
-        clearTimeout(timer);
-        this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
-        resolve(true);
-      };
-
-      const timer = setTimeout(() => {
-        this.room?.off(RoomEvent.TrackSubscribed, onTrackSubscribed);
-        resolve(false);
-      }, CONNECT_TIMEOUT_MS);
-
-      // Fast-path: agent already published audio before we got here.
-      for (const p of this.room!.remoteParticipants.values()) {
-        if (alreadyHasAudio(p)) {
-          this.agentIdentity = p.identity;
-          clearTimeout(timer);
-          resolve(true);
-          return;
-        }
-      }
-
-      this.room!.on(RoomEvent.TrackSubscribed, onTrackSubscribed);
-    });
-
-    if (!agentReady) {
+    const agent = await this.waitForAgentTrack((participant) => participant.kind === ParticipantKind.AGENT);
+    if (!agent) {
       throw new Error(
         `LiveKit agent did not publish an audio track in room "${this.config.roomName}" within ${CONNECT_TIMEOUT_MS / 1000}s. ` +
         `Ensure your agent is running and connected to ${this.config.livekitUrl}. ` +
         `If your agent uses agent_name in WorkerOptions, set "agent_name" in the platform config.`
       );
     }
+    this.agentIdentity = agent.identity;
 
     this._stats.connectLatencyMs = Date.now() - connectStart;
   }
 
-  protected override clearTransportQueue(): void {
-    this.audioSource?.clearQueue();
-  }
-
-  /** Write a single 20ms audio frame to LiveKit's AudioSource. */
-  protected async writeAudioFrame(samples: Int16Array, sampleRate: number): Promise<void> {
-    if (!this.audioSource || !this.collecting) return;
-    const copied = new Int16Array(samples);
-    const frame = new AudioFrame(copied, sampleRate, 1, copied.length);
-    await this.audioSource.captureFrame(frame);
-  }
-
-  override sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
-    if (!this.audioSource || !this.collecting) return;
+  override sendAudio(pcm: Buffer): void {
+    if (!this.publishing) return;
 
     // Track turn timing
     this.currentTurnIndex++;
-    this.turnTimings[this.currentTurnIndex] = { audioSentAt: Date.now() };
+    this.turnTimings[this.currentTurnIndex] = {};
     this.lastAgentState = null;
 
-    super.sendAudio(pcm, opts);
+    super.sendAudio(pcm);
   }
 
   async disconnect(): Promise<void> {
-    this.collecting = false;
-    this.roomDisconnected = true;
-    this.stopComfortNoise();
-    this.disconnectTimestamp = Date.now();
-    if (this.room) {
-      this.room.unregisterTextStreamHandler(LIVEKIT_TOOL_CALL_TOPIC);
-      try {
-        this.room.unregisterTextStreamHandler(LIVEKIT_TRANSCRIPTION_TOPIC);
-      } catch {
-        // May not be registered if connect() failed partway
-      }
-      for (const topic of LIVEKIT_OBSERVABILITY_TOPICS) {
-        try {
-          this.room.unregisterTextStreamHandler(topic);
-        } catch {
-          // May not be registered if connect() failed partway
-        }
-      }
+    try {
+      this.room?.unregisterTextStreamHandler(LIVEKIT_TRANSCRIPTION_TOPIC);
+    } catch {
+      // May not be registered if connect() failed partway
     }
-    if (this.audioSource) {
-      await this.audioSource.close();
-      this.audioSource = null;
-    }
-    if (this.localTrack) {
-      await this.localTrack.close();
-      this.localTrack = null;
-    }
-    if (this.room) {
-      await this.room.disconnect();
-      this.room = null;
-    }
+    await this.leaveRoom();
     // Delete the room so lingering agent sessions don't consume quota
     try {
       const roomSvc = new RoomServiceClient(
@@ -633,9 +402,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     } catch {
       // Best-effort cleanup — don't fail the call if this errors
     }
-    // NOTE: Do NOT call dispose() here — it destroys the global FFI runtime
-    // and kills all other concurrent LiveKit sessions in this process.
-    // Let process exit handle native cleanup.
   }
 
   // ── Post-call data ──────────────────────────────────────────
@@ -645,320 +411,125 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
   }
 
   async getCallMetadata(): Promise<CallMetadata | null> {
-    const durationS = this.disconnectTimestamp && this.connectTimestamp
-      ? (this.disconnectTimestamp - this.connectTimestamp) / 1000
-      : undefined;
-
-    const providerMetadata = compactUnknownRecord({
-      ...(this.callMetadata.provider_metadata ?? {}),
-      room_name: this.config.roomName,
-      agent_identity: this.agentIdentity,
-      tool_call_instrumentation: this.toolCalls.length > 0 ? "custom_data_channel" : undefined,
-    });
-
     return {
       ...this.callMetadata,
       platform: "livekit",
       provider_session_id: this.callMetadata.provider_session_id ?? this.config.roomName,
+      provider_debug_urls: compactStringRecord({
+        ...this.callMetadata.provider_debug_urls,
+        agent_insights: this.agentInsightsUrl(),
+      }),
       ended_reason: this.callMetadata.ended_reason ?? this.disconnectReasonStr ?? undefined,
-      provider_metadata: {
-        ...providerMetadata,
-        duration_s: (this.callMetadata.provider_metadata?.["duration_s"] as number | undefined) ?? durationS,
-      },
     };
   }
 
+  /** LiveKit Cloud only. `p_` stands for the signed-in user's project; the dashboard resolves it. */
+  private agentInsightsUrl(): string | undefined {
+    if (!this.roomSid) return undefined;
+    const host = new URL(this.config.livekitUrl).hostname;
+    if (!host.endsWith(".livekit.cloud")) return undefined;
+    return `https://cloud.livekit.io/projects/p_/sessions/${this.roomSid}/observability`;
+  }
+
+  /** STT/LLM/TTS latency per agent reply, from the metrics Vent's LiveKit helper forwards. */
   getComponentTimings(): ComponentLatency[] {
-    const roomDerived = this.turnTimings.map((t) => {
-      const stt_ms = t.audioSentAt != null && t.thinkingAt != null
-        ? t.thinkingAt - t.audioSentAt : undefined;
-
-      // If transcription stream provided first-token timing, split LLM and TTS
-      const llm_ms = t.thinkingAt != null && t.firstAgentTextAt != null
-        ? t.firstAgentTextAt - t.thinkingAt : undefined;
-      const tts_ms = t.firstAgentTextAt != null && t.speakingAt != null
-        ? Math.max(0, t.speakingAt - t.firstAgentTextAt) : undefined;
-
-      const speech_duration_ms = t.speakingAt != null && t.listeningAt != null
-        ? t.listeningAt - t.speakingAt : undefined;
-
-      return { stt_ms, llm_ms, tts_ms, speech_duration_ms };
-    });
-
-    if (this.livekitMetricTimings.length === 0) {
-      return roomDerived;
-    }
-
-    const metricDerived = this.livekitMetricTimings.map((entry) => entry.timing);
-    const maxLength = Math.max(roomDerived.length, metricDerived.length);
-    const merged: ComponentLatency[] = [];
-    for (let i = 0; i < maxLength; i++) {
-      const roomTiming = roomDerived[i];
-      const metricTiming = metricDerived[i];
-      merged.push({
-        stt_ms: metricTiming?.stt_ms ?? roomTiming?.stt_ms,
-        llm_ms: metricTiming?.llm_ms ?? roomTiming?.llm_ms,
-        tts_ms: metricTiming?.tts_ms ?? roomTiming?.tts_ms,
-        speech_duration_ms: metricTiming?.speech_duration_ms ?? roomTiming?.speech_duration_ms,
-      });
-    }
-    return merged;
+    return this.livekitMetricTimings.map((entry) => entry.timing);
   }
 
-  getTranscripts(): Array<{ turnIndex: number; text: string }> {
-    const transcripts: Array<{ turnIndex: number; text: string }> = [];
-    for (let i = 0; i < this.turnTimings.length; i++) {
-      const t = this.turnTimings[i]!;
-      if (t.userTranscript) {
-        transcripts.push({ turnIndex: i, text: t.userTranscript });
-      }
+  getTranscripts(): PlatformUtterance[] {
+    const utterances: PlatformUtterance[] = [];
+    if (this.greetingTranscript) utterances.push({ role: "agent", text: this.greetingTranscript });
+    for (const t of this.turnTimings) {
+      if (t.userTranscript) utterances.push({ role: "caller", text: t.userTranscript });
+      if (t.agentTranscript) utterances.push({ role: "agent", text: t.agentTranscript });
     }
-    return transcripts;
+    return utterances;
   }
 
-  /** Receive-path diagnostics. Used by executor to log rich context when a
+  /** Receive-path diagnostics. Used by executor to log context when a
    *  collection times out with no speech — lets us tell whether the LiveKit
-   *  agent never published a track, published a track with zeroed samples
-   *  (TTS failure), or produced audio that was too quiet for VAD. */
+   *  agent never published a track, went quiet, or never finished a reply. */
   getReceiveDiagnostics(): string {
     const now = Date.now();
-    const meanAbs = this.rxSampleCount > 0 ? Math.round(this.rxSumAbs / this.rxSampleCount) : 0;
-    const lastFrameAge = this.rxLastFrameAt !== null ? now - this.rxLastFrameAt : null;
     const lastAssistantAge = this.rxLastAssistantItemAt !== null ? now - this.rxLastAssistantItemAt : null;
     const lastAgentStateAge = this.rxLastAgentStateAt !== null ? now - this.rxLastAgentStateAt : null;
     return (
-      `[livekit-diag] tracks=${this.rxTracks} frames=${this.rxFrames} ` +
-      `meanAbs=${meanAbs} peakAbs=${this.rxPeakAbs} ` +
-      `lastFrameAge=${lastFrameAge ?? "n/a"}ms ` +
+      `[livekit-diag] tracks=${this.rxTracks} ` +
       `agentState="${this.lastAgentState ?? "?"}" agentStateAge=${lastAgentStateAge ?? "n/a"}ms ` +
       `lastAssistantItemAge=${lastAssistantAge ?? "n/a"}ms ` +
-      `agentIdentity="${this.agentIdentity ?? "?"}" roomDisconnected=${this.roomDisconnected}`
+      `agentIdentity="${this.agentIdentity ?? "?"}" connected=${this.connected}`
     );
   }
 
   // ── Private helpers ─────────────────────────────────────────
 
-  private handleToolCallData(payload: Uint8Array): void {
-    try {
-      const text = new TextDecoder().decode(payload);
-      this.handleToolCallText(text);
-    } catch {
-      // Ignore malformed data
-    }
-  }
-
-  private handleToolCallText(text: string): void {
-    try {
-      const event = JSON.parse(text) as WsToolCallEvent;
-      if (event.type === "tool_call" && event.name) {
-        this.recordObservedToolCall({
-          name: event.name,
-          arguments: event.arguments ?? {},
-          result: event.result,
-          successful: event.successful,
-          provider_tool_type: event.provider_tool_type ?? event.tool_type,
-          timestamp_ms: Date.now() - this.connectTimestamp,
-          latency_ms: event.duration_ms,
-        });
-      }
-    } catch {
-      // Ignore malformed JSON
-    }
-  }
-
   private handleObservabilityData(payload: Uint8Array, topic: string): void {
     try {
-      const text = new TextDecoder().decode(payload);
-      this.handleObservabilityText(text, topic);
+      const event = JSON.parse(new TextDecoder().decode(payload)) as Record<string, unknown>;
+      this.handleObservabilityEvent(event, topic);
     } catch {
       // Ignore malformed data
     }
   }
 
-  private handleObservabilityText(text: string, topic: string): void {
-    let event: Record<string, unknown>;
-    try {
-      event = JSON.parse(text) as Record<string, unknown>;
-    } catch {
-      return;
-    }
-
+  private handleObservabilityEvent(event: Record<string, unknown>, topic: string): void {
     switch (topic) {
-      case LIVEKIT_SESSION_TOPIC:
-      case LIVEKIT_CALL_METADATA_TOPIC:
-        this.mergeCallMetadata(normalizeLiveKitMetadata(event));
+      case VENT_EVENTS.toolCalls: {
+        const toolCall = event as unknown as VentToolCallEvent;
+        if (toolCall.type === "tool_call" && toolCall.name) {
+          this.recordObservedToolCall(observedToolCall(toolCall, Date.now() - this.connectTimestamp));
+        }
         break;
-      case LIVEKIT_TRANSFER_TOPIC:
-        this.handleTransferEvent(event as unknown as LiveKitTransferEvent);
-        break;
-      case LIVEKIT_DEBUG_URL_TOPIC:
-        this.handleDebugUrlEvent(event as unknown as LiveKitDebugUrlEvent);
-        break;
-      case LIVEKIT_WARNING_TOPIC:
-        this.handleWarningEvent(event);
-        break;
-      case LIVEKIT_SESSION_REPORT_TOPIC:
-        this.handleSessionReportEvent(event);
-        break;
-      case LIVEKIT_METRICS_TOPIC:
+      }
+      case VENT_EVENTS.metrics:
         this.handleMetricsEvent(event as unknown as LiveKitMetricsEvent);
         break;
-      case LIVEKIT_CONVERSATION_ITEM_TOPIC:
+      case VENT_EVENTS.conversationItem:
         this.handleConversationItemEvent(event as unknown as LiveKitConversationItemEvent);
         break;
-      case LIVEKIT_USER_INPUT_TRANSCRIBED_TOPIC:
-        // Redundant — transcript comes from lk.transcription room signals
-        break;
-      case LIVEKIT_SESSION_USAGE_TOPIC:
-        this.handleSessionUsageEvent(event);
-        break;
+      default: {
+        // vent:call-metadata, vent:transfer, vent:debug-url, vent:warning
+        const metadata = ventEventMetadata(topic, event, "livekit");
+        if (metadata) this.addCallMetadata(metadata);
+      }
     }
   }
 
-  private mergeCallMetadata(metadata: Partial<CallMetadata>): void {
-    if (!metadata.platform) {
-      metadata.platform = this.callMetadata.platform;
-    }
-
-    this.callMetadata = {
-      ...this.callMetadata,
-      ...metadata,
-      recording_variants: {
-        ...(this.callMetadata.recording_variants ?? {}),
-        ...(metadata.recording_variants ?? {}),
-      },
-      provider_debug_urls: {
-        ...(this.callMetadata.provider_debug_urls ?? {}),
-        ...(metadata.provider_debug_urls ?? {}),
-      },
-      provider_metadata: {
-        ...(this.callMetadata.provider_metadata ?? {}),
-        ...(metadata.provider_metadata ?? {}),
-      },
-      variables: {
-        ...(this.callMetadata.variables ?? {}),
-        ...(metadata.variables ?? {}),
-      },
-      provider_warnings: mergeProviderWarnings(this.callMetadata.provider_warnings, metadata.provider_warnings),
-      transfers: mergeTransfers(this.callMetadata.transfers, metadata.transfers),
-    };
-  }
-
-  private handleTransferEvent(event: LiveKitTransferEvent): void {
-    const transfer = event.transfer ?? {
-      type: event.transfer_type ?? "transfer",
-      destination: event.destination,
-      status: event.status ?? "unknown",
-      sources: [event.source ?? "platform_event"],
-      timestamp_ms: event.timestamp_ms,
-    };
-    this.mergeCallMetadata({ transfers: [transfer] });
+  private addCallMetadata(metadata: Partial<CallMetadata>): void {
+    this.callMetadata = mergeCallMetadata(this.callMetadata, metadata);
   }
 
   private handleMetricsEvent(event: LiveKitMetricsEvent): void {
-    const eventRecord = event as unknown as Record<string, unknown>;
-    const metrics = firstRecord(event.metrics, eventRecord) ?? eventRecord;
-    const metricType = inferLiveKitMetricType(metrics, event.metric_type, event.event);
-    this.appendProviderMetadataListItem("livekit_metrics_events", compactUnknownRecord({
-      metric_type: metricType,
-      ...eventRecord,
-    }) ?? eventRecord);
-
-    const extracted = extractLiveKitMetricTiming(metrics, metricType);
+    const extracted = event.metrics ? extractLiveKitMetricTiming(event.metrics) : undefined;
     if (extracted) {
       this.upsertMetricTiming(extracted);
     }
   }
 
   private handleConversationItemEvent(event: LiveKitConversationItemEvent): void {
-    this.appendProviderMetadataListItem("livekit_conversation_items", event);
-    const derivedTransfer = extractTransferFromConversationItemEvent(event);
-    if (derivedTransfer) {
-      this.mergeCallMetadata({ transfers: [derivedTransfer] });
+    const { item } = event;
+    if (item["type"] === "agent_handoff") {
+      // JS stamps createdAt in ms, Python created_at in seconds, both since the epoch.
+      const createdAtMs = typeof item["createdAt"] === "number"
+        ? item["createdAt"]
+        : typeof item["created_at"] === "number" ? item["created_at"] * 1000 : undefined;
+      this.addCallMetadata({
+        transfers: [{
+          type: "agent_handoff",
+          destination: (item["newAgentId"] ?? item["new_agent_id"]) as string,
+          status: "completed",
+          sources: ["platform_event"],
+          timestamp_ms: createdAtMs != null ? Math.max(0, Math.round(createdAtMs - this.connectTimestamp)) : undefined,
+        }],
+      });
     }
     // conversation_item_added(role=="assistant") is the canonical "this
     // assistant turn is complete" signal — the message has been committed to
     // conversation history. More reliable than agent.state→listening, which
     // can flicker on barge-in or chained say() calls.
-    const item = firstRecord(event.item, event.conversation_item);
-    const role = item ? firstString(item["role"])?.toLowerCase() : undefined;
-    if (role === "assistant") {
+    if (item["role"] === "assistant") {
       this.rxLastAssistantItemAt = Date.now();
       this.emit("platformEndOfTurn");
-    }
-  }
-
-  private handleSessionUsageEvent(event: Record<string, unknown>): void {
-    const usage = firstRecord(event.usage, event.session_usage, event.data) ?? event;
-    this.mergeCallMetadata({
-      provider_metadata: compactUnknownRecord({
-        livekit_session_usage: usage,
-      }),
-    });
-
-    // Extract LLM usage entries only (token counts that matter for cost)
-    const modelUsage = usage["model_usage"] as Array<Record<string, unknown>> | undefined;
-    if (Array.isArray(modelUsage) && modelUsage.length > 0) {
-      const entries: UsageEntry[] = modelUsage
-        .filter((m) => firstString(m["type"]) === "llm_usage")
-        .map((m) => ({
-          type: "llm_usage",
-          provider: firstString(m["provider"]) ?? "",
-          model: firstString(m["model"]) ?? "",
-          input_tokens: firstNumber(m["input_tokens"]),
-          output_tokens: firstNumber(m["output_tokens"]),
-        }));
-
-      if (entries.length > 0) {
-        this.mergeCallMetadata({
-          usage: entries,
-        });
-      }
-    }
-  }
-
-  private handleDebugUrlEvent(event: LiveKitDebugUrlEvent): void {
-    if (!event.label || !event.url) return;
-    this.mergeCallMetadata({
-      provider_debug_urls: {
-        [event.label]: event.url,
-      },
-    });
-  }
-
-  private handleWarningEvent(event: Record<string, unknown>): void {
-    const warning = compactProviderWarning({
-      message: typeof event.message === "string" ? event.message : undefined,
-      code: typeof event.code === "string" ? event.code : undefined,
-      detail: event.detail,
-    });
-    if (!warning) return;
-
-    this.mergeCallMetadata({
-      provider_warnings: [warning],
-    });
-  }
-
-  private handleSessionReportEvent(event: Record<string, unknown>): void {
-    const report = firstRecord(event.report) ?? event;
-    const providerSessionId = firstString(
-      event.provider_session_id,
-      event.session_id,
-      report["provider_session_id"],
-      report["session_id"],
-      report["room_name"],
-      report["roomName"],
-    );
-
-    this.mergeCallMetadata({
-      provider_session_id: providerSessionId,
-      provider_metadata: compactUnknownRecord({
-        session_report: report,
-      }),
-    });
-
-    for (const transfer of extractTransfersFromSessionReport(report)) {
-      this.mergeCallMetadata({ transfers: [transfer] });
     }
   }
 
@@ -995,18 +566,6 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     this.toolCalls.push(toolCall);
   }
 
-  private appendProviderMetadataListItem(key: string, value: unknown): void {
-    const existing = Array.isArray(this.callMetadata.provider_metadata?.[key])
-      ? [...(this.callMetadata.provider_metadata?.[key] as unknown[])]
-      : [];
-    existing.push(value);
-    this.mergeCallMetadata({
-      provider_metadata: {
-        [key]: existing,
-      },
-    });
-  }
-
   private isObservabilityParticipant(participant?: RemoteParticipant): boolean {
     if (!participant) return true;
     if (participant.kind === ParticipantKind.AGENT) {
@@ -1036,12 +595,9 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
 
   private handleRoomDisconnected(reason: DisconnectReason): void {
     this.collecting = false;
-    this.roomDisconnected = true;
     this.primaryAgentTrackSid = null;
     this.stopComfortNoise();
-    const state = resolveLiveKitRoomDisconnectState(reason, Date.now(), this.disconnectTimestamp);
-    this.disconnectTimestamp = state.disconnectTimestamp;
-    this.disconnectReasonStr = state.disconnectReasonStr;
+    this.disconnectReasonStr = DisconnectReason[reason] ?? "UNKNOWN";
     this.emit("disconnected");
   }
 
@@ -1051,7 +607,7 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     participantKind?: ParticipantKind,
   ): void {
     const who = `participant=${participantIdentity ?? "?"} kind=${participantKind ?? "?"}`;
-    const sid = (track as { sid?: string }).sid ?? null;
+    const sid = track.sid ?? null;
     if (sid && this.startedTrackSids.has(sid)) {
       console.log(`[livekit] startReadingTrack skipped (already started) ${who} sid=${sid}`);
       return;
@@ -1059,403 +615,66 @@ export class WebRtcAudioChannel extends BaseAudioChannel {
     if (sid) this.startedTrackSids.add(sid);
     console.log(`[livekit] startReadingTrack ${who}`);
     this.rxTracks++;
-    const stream = new AudioStream(track, this.livekitSampleRate, 1);
-    const reader = stream.getReader();
-    let frameCount = 0;
-    let sumAbs = 0;
-    let sampleCount = 0;
-    let peakAbs = 0;
-    let lastDiagFrame = 0;
+    void this.readAgentTrack(track, (samples) => this.isPrimaryTrackFrame(sid, samples, who))
+      .then(() => console.log(`[livekit] Audio read loop ended ${who}`));
+  }
 
-    const readLoop = async () => {
-      try {
-        while (this.collecting) {
-          const { value: frame, done } = await reader.read();
-          if (done || !frame) break;
-
-          frameCount++;
-
-          // Sample-level diagnostics on raw pre-resample frame
-          const rawSamples = new Int16Array(
-            frame.data.buffer,
-            frame.data.byteOffset,
-            frame.data.byteLength / 2,
-          );
-          let frameSumAbs = 0;
-          let framePeak = 0;
-          for (let i = 0; i < rawSamples.length; i++) {
-            const v = Math.abs(rawSamples[i]!);
-            frameSumAbs += v;
-            if (v > framePeak) framePeak = v;
-          }
-          sumAbs += frameSumAbs;
-          sampleCount += rawSamples.length;
-          if (framePeak > peakAbs) peakAbs = framePeak;
-          // Accumulate into instance stats so getReceiveDiagnostics() can expose
-          // them after the fact (used by executor when a collection timeout
-          // fires with no speech, to distinguish "no audio track" from "all
-          // zero samples" from "audio exists but below VAD threshold").
-          this.rxFrames++;
-          this.rxSumAbs += frameSumAbs;
-          this.rxSampleCount += rawSamples.length;
-          if (framePeak > this.rxPeakAbs) this.rxPeakAbs = framePeak;
-          this.rxLastFrameAt = Date.now();
-
-          if (frameCount === 1) {
-            console.log(
-              `[livekit] first_frame ${who} bytes=${frame.data.byteLength} samples=${rawSamples.length} sampleRate=${frame.sampleRate} peak=${framePeak} meanAbs=${Math.round(frameSumAbs / rawSamples.length)}`
-            );
-          }
-          // Every 100 frames (~1s at 10ms), log cumulative stats to detect
-          // whether signal is truly silent or just below VAD threshold.
-          if (frameCount - lastDiagFrame >= 100) {
-            lastDiagFrame = frameCount;
-            console.log(
-              `[livekit] frame=${frameCount} ${who} cumMeanAbs=${Math.round(sumAbs / Math.max(1, sampleCount))} cumPeak=${peakAbs}`
-            );
-          }
-
-          const frameBuffer = Buffer.from(
-            frame.data.buffer,
-            frame.data.byteOffset,
-            frame.data.byteLength
-          );
-          this._stats.bytesReceived += frameBuffer.length;
-          // Resample from LiveKit rate → 24kHz for consumers
-          const pcm24k = resample(frameBuffer, this.livekitSampleRate, 24000);
-
-          // Defense against multi-track agents (rare in stock LiveKit Agents
-          // but possible with chained STT/TTS pipelines): lock onto the first
-          // track that emits non-silent audio. Other tracks are read (drained)
-          // but their PCM is dropped to avoid 50Hz interleave aliasing.
-          const frameMeanAbs = frameSumAbs / Math.max(1, rawSamples.length);
-          const trackSid = (track as { sid?: string }).sid ?? null;
-          if (
-            this.primaryAgentTrackSid === null
-            && frameMeanAbs > WebRtcAudioChannel.PRIMARY_TRACK_MEAN_ABS_THRESHOLD
-          ) {
-            this.primaryAgentTrackSid = trackSid;
-            console.log(`[livekit] locked primary agent track ${who} sid=${trackSid}`);
-          }
-          // Allow through if we haven't locked yet (single-track case) OR
-          // this is the locked track. Drop secondary track audio post-lock.
-          if (this.primaryAgentTrackSid !== null && this.primaryAgentTrackSid !== trackSid) {
-            continue;
-          }
-
-          this.captureAgentAudio(pcm24k, performance.now() - this._connectMonotonicMs);
-          this.emit("audio", pcm24k);
-        }
-      } catch (err) {
-        // Stream closed
-        if (err instanceof Error) {
-          this._stats.errorEvents.push(err.message);
-        }
+  /**
+   * Defense against multi-track agents (rare in stock LiveKit Agents but
+   * possible with chained STT/TTS pipelines): lock onto the first track that
+   * emits non-silent audio. Other tracks are still read (drained) but their
+   * audio is dropped to avoid 50Hz interleave aliasing.
+   */
+  private isPrimaryTrackFrame(trackSid: string | null, samples: Int16Array, who: string): boolean {
+    if (this.primaryAgentTrackSid === null) {
+      let sumAbs = 0;
+      for (let i = 0; i < samples.length; i++) sumAbs += Math.abs(samples[i]!);
+      if (sumAbs / Math.max(1, samples.length) > WebRtcAudioChannel.PRIMARY_TRACK_MEAN_ABS_THRESHOLD) {
+        this.primaryAgentTrackSid = trackSid;
+        console.log(`[livekit] locked primary agent track ${who} sid=${trackSid}`);
       }
-      const finalMean = sampleCount > 0 ? Math.round(sumAbs / sampleCount) : 0;
-      console.log(
-        `[livekit] Audio read loop ended ${who} frames=${frameCount} meanAbs=${finalMean} peak=${peakAbs}`
-      );
-    };
-
-    readLoop();
-  }
-}
-
-function compactUnknownRecord(record: Record<string, unknown>): Record<string, unknown> | undefined {
-  const entries = Object.entries(record).filter(([, value]) => value != null);
-  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
-}
-
-function compactStringRecord(record: Record<string, unknown> | undefined): Record<string, string> | undefined {
-  if (!record) return undefined;
-  const compacted: Record<string, string> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if (typeof value === "string" && value.length > 0) {
-      compacted[key] = value;
     }
+    // Allow through if we haven't locked yet (single-track case) OR this is the locked track.
+    return this.primaryAgentTrackSid === null || this.primaryAgentTrackSid === trackSid;
   }
-  return Object.keys(compacted).length > 0 ? compacted : undefined;
 }
 
-function firstString(...values: unknown[]): string | undefined {
-  for (const value of values) {
-    if (typeof value === "string" && value.length > 0) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-function firstNumber(...values: unknown[]): number | undefined {
-  for (const value of values) {
-    if (typeof value === "number" && Number.isFinite(value)) {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-function firstBoolean(...values: unknown[]): boolean | undefined {
-  for (const value of values) {
-    if (typeof value === "boolean") {
-      return value;
-    }
-  }
-  return undefined;
-}
-
-function firstRecord(...values: unknown[]): Record<string, unknown> | undefined {
-  for (const value of values) {
-    if (value && typeof value === "object" && !Array.isArray(value)) {
-      return value as Record<string, unknown>;
-    }
-  }
-  return undefined;
-}
-
-function normalizeLiveKitMetadata(payload: Record<string, unknown>): Partial<CallMetadata> {
-  const nested = firstRecord(payload["call_metadata"]);
-  const source = nested ?? payload;
-  const providerDebugUrls = firstRecord(source["provider_debug_urls"], source["debug_urls"]);
-  const recordingVariants = firstRecord(source["recording_variants"]);
-  const providerMetadata = firstRecord(source["provider_metadata"]);
-  const variables = firstRecord(source["variables"]);
-  const providerWarnings = normalizeProviderWarnings(source["provider_warnings"], source["warnings"]);
-
-  return compactUnknownRecord({
-    platform: firstString(source["platform"]) ?? "livekit",
-    provider_call_id: firstString(source["provider_call_id"], source["call_id"]),
-    provider_session_id: firstString(source["provider_session_id"], source["session_id"]),
-    ended_reason: firstString(source["ended_reason"]),
-    cost_usd: firstNumber(source["cost_usd"]),
-    cost_breakdown: firstRecord(source["cost_breakdown"]),
-    recording_url: firstString(source["recording_url"]),
-    recording_variants: compactStringRecord(firstRecord(source["recording_variants"]) ?? recordingVariants),
-    provider_debug_urls: compactStringRecord(firstRecord(source["provider_debug_urls"], source["debug_urls"]) ?? providerDebugUrls),
-    variables,
-    provider_warnings: providerWarnings,
-    provider_metadata: {
-      ...providerMetadata,
-      duration_s: firstNumber(source["duration_s"]),
-      summary: firstString(source["summary"]),
-      success_evaluation: firstString(source["success_evaluation"]),
-      user_sentiment: firstString(source["user_sentiment"]),
-      call_successful: firstBoolean(source["call_successful"]),
-      answered_by: firstString(source["answered_by"]),
-    },
-  }) as Partial<CallMetadata>;
-}
-
-function extractLiveKitMetricTiming(
-  metrics: Record<string, unknown>,
-  metricType?: string,
-): LiveKitMetricTiming | undefined {
-  const normalizedType = metricType?.toLowerCase();
-  const speechId = firstString(
-    metrics["speechId"],
-    metrics["speech_id"],
-  );
-
-  if (normalizedType === "eou" || normalizedType === "end_of_utterance" || normalizedType === "eoumetrics") {
-    const sttMs = firstNumber(metrics["endOfUtteranceDelayMs"], metrics["end_of_utterance_delay"], metrics["end_of_utterance_delay_ms"]);
-    return sttMs != null ? { speechId, timing: { stt_ms: Math.round(sttMs) } } : undefined;
-  }
-
-  if (normalizedType === "llm" || normalizedType === "llmmetrics") {
-    const llmMs = firstNumber(metrics["ttftMs"], metrics["ttft"], metrics["ttft_ms"]);
-    return llmMs != null ? { speechId, timing: { llm_ms: Math.round(llmMs) } } : undefined;
-  }
-
-  if (normalizedType === "realtime" || normalizedType === "realtimemodel" || normalizedType === "realtimemodelmetrics") {
-    const llmMs = firstNumber(metrics["ttftMs"], metrics["ttft"], metrics["ttft_ms"]);
-    const speechDurationMs = firstNumber(metrics["sessionDurationMs"], metrics["session_duration"], metrics["session_duration_ms"]);
-    return hasComponentLatencyContent({ llm_ms: llmMs, speech_duration_ms: speechDurationMs })
-      ? {
-          speechId,
-          timing: {
-            llm_ms: llmMs != null ? Math.round(llmMs) : undefined,
-            speech_duration_ms: speechDurationMs != null ? Math.round(speechDurationMs) : undefined,
-          },
-        }
-      : undefined;
-  }
-
-  if (normalizedType === "tts" || normalizedType === "ttsmetrics") {
-    const ttsMs = firstNumber(metrics["ttfbMs"], metrics["ttfb"], metrics["ttfb_ms"]);
-    const speechDurationMs = firstNumber(metrics["audioDurationMs"], metrics["audio_duration"], metrics["audio_duration_ms"]);
-    return hasComponentLatencyContent({ tts_ms: ttsMs, speech_duration_ms: speechDurationMs })
-      ? {
-          speechId,
-          timing: {
-            tts_ms: ttsMs != null ? Math.max(0, Math.round(ttsMs)) : undefined,
-            speech_duration_ms: speechDurationMs != null ? Math.round(speechDurationMs) : undefined,
-          },
-        }
-      : undefined;
-  }
-
-  if (normalizedType === "stt" || normalizedType === "sttmetrics") {
-    const sttMs = firstNumber(metrics["durationMs"], metrics["duration"], metrics["duration_ms"]);
-    return sttMs != null ? { speechId, timing: { stt_ms: Math.round(sttMs) } } : undefined;
-  }
-
-  return undefined;
-}
-
-function inferLiveKitMetricType(metrics: Record<string, unknown>, ...typeHints: Array<string | undefined>): string | undefined {
-  const hinted = typeHints.find((hint) => typeof hint === "string" && hint.length > 0);
-  if (hinted) return hinted;
-  if ("endOfUtteranceDelayMs" in metrics || "transcriptionDelayMs" in metrics || "end_of_utterance_delay" in metrics) return "eou";
-  if ("sessionDurationMs" in metrics || "session_duration" in metrics || "inputTokens" in metrics || "outputTokens" in metrics) return "realtime";
-  if ("charactersCount" in metrics || "ttfbMs" in metrics || "audioDurationMs" in metrics) return "tts";
-  if ("completionTokens" in metrics || "promptTokens" in metrics || ("ttftMs" in metrics && "totalTokens" in metrics)) return "llm";
-  if ("detectionDelay" in metrics || "numInterruptions" in metrics) return "interruption";
-  if ("idleTimeMs" in metrics || "inferenceCount" in metrics) return "vad";
-  if ("streamed" in metrics || "audioDurationMs" in metrics) return "stt";
-  return undefined;
-}
-
-function extractTransferFromConversationItemEvent(event: LiveKitConversationItemEvent): CallTransfer | undefined {
-  const item = firstRecord(event.item, event.conversation_item);
-  if (!item) return undefined;
-
-  const itemType = firstString(item["type"], item["kind"], item["item_type"])?.toLowerCase();
-  if (itemType !== "agent_handoff" && itemType !== "handoff") {
+/**
+ * Timing from one LiveKit metrics payload, matched on its `type`. The JS Agents
+ * SDK reports milliseconds (ttftMs, ttfbMs, transcriptionDelayMs, speechId); the
+ * Python SDK reports seconds (ttft, ttfb, transcription_delay, speech_id). A
+ * negative value means the SDK had none.
+ */
+function extractLiveKitMetricTiming(metrics: Record<string, unknown>): LiveKitMetricTiming | undefined {
+  const ms = (jsMs: unknown, pythonSeconds: unknown): number | undefined => {
+    if (typeof jsMs === "number") return jsMs >= 0 ? Math.round(jsMs) : undefined;
+    if (typeof pythonSeconds === "number") return pythonSeconds >= 0 ? Math.round(pythonSeconds * 1000) : undefined;
     return undefined;
-  }
-
-  return {
-    type: itemType,
-    destination: firstString(
-      item["new_agent_id"],
-      item["newAgentId"],
-      item["new_agent_type"],
-      item["newAgentType"],
-      item["to_agent"],
-      item["toAgent"],
-    ),
-    status: "completed",
-    sources: ["platform_event"],
-    timestamp_ms: firstNumber(event.timestamp_ms, item["timestamp_ms"], item["timestampMs"]),
   };
-}
-
-function extractTransfersFromSessionReport(report: Record<string, unknown>): CallTransfer[] {
-  const transfers: CallTransfer[] = [];
-  for (const record of firstRecordArray(report["events"], report["history"])) {
-    const derived = extractTransferFromConversationItemEvent({
-      item: record,
-      timestamp_ms: firstNumber(record["timestamp_ms"], record["timestampMs"]),
-    });
-    if (derived) {
-      transfers.push(derived);
-    }
+  const speechId = (metrics["speechId"] ?? metrics["speech_id"]) as string | undefined;
+  let timing: ComponentLatency;
+  switch (metrics["type"]) {
+    case "eou_metrics":
+      timing = { stt_ms: ms(metrics["transcriptionDelayMs"], metrics["transcription_delay"]) };
+      break;
+    case "llm_metrics":
+    case "realtime_model_metrics":
+      timing = { llm_ms: ms(metrics["ttftMs"], metrics["ttft"]) };
+      break;
+    case "tts_metrics":
+      timing = {
+        tts_ms: ms(metrics["ttfbMs"], metrics["ttfb"]),
+        speech_duration_ms: ms(metrics["audioDurationMs"], metrics["audio_duration"]),
+      };
+      break;
+    default:
+      return undefined;
   }
-  return transfers;
-}
-
-function firstRecordArray(...values: unknown[]): Record<string, unknown>[] {
-  for (const value of values) {
-    if (!Array.isArray(value)) continue;
-    const records = value.filter((item): item is Record<string, unknown> => !!item && typeof item === "object" && !Array.isArray(item));
-    if (records.length > 0) {
-      return records;
-    }
-  }
-  return [];
+  return { speechId, timing };
 }
 
 function hasComponentLatencyContent(timing: Partial<ComponentLatency>): boolean {
   return timing.stt_ms != null || timing.llm_ms != null || timing.tts_ms != null || timing.speech_duration_ms != null;
-}
-
-function compactProviderWarning(warning: ProviderWarning): ProviderWarning | undefined {
-  const entries = Object.entries(warning).filter(([, value]) => value != null);
-  return entries.length > 0 ? Object.fromEntries(entries) as ProviderWarning : undefined;
-}
-
-function normalizeProviderWarnings(...values: unknown[]): ProviderWarning[] | undefined {
-  const warnings: ProviderWarning[] = [];
-  for (const value of values) {
-    if (typeof value === "string" && value.length > 0) {
-      warnings.push({ message: value });
-      continue;
-    }
-    if (!Array.isArray(value)) continue;
-    for (const item of value) {
-      if (typeof item === "string" && item.length > 0) {
-        warnings.push({ message: item });
-        continue;
-      }
-      if (!item || typeof item !== "object" || Array.isArray(item)) continue;
-      const record = item as Record<string, unknown>;
-      const warning = compactProviderWarning({
-        message: firstString(record["message"], record["warning"], record["text"]),
-        code: firstString(record["code"], record["type"]),
-        detail: record["detail"] ?? record["data"],
-      });
-      if (warning) warnings.push(warning);
-    }
-  }
-  return warnings.length > 0 ? warnings : undefined;
-}
-
-function mergeProviderWarnings(
-  existing: ProviderWarning[] | undefined,
-  incoming: ProviderWarning[] | undefined,
-): ProviderWarning[] | undefined {
-  if ((!existing || existing.length === 0) && (!incoming || incoming.length === 0)) return undefined;
-  const merged = new Map<string, ProviderWarning>();
-  for (const warning of [...(existing ?? []), ...(incoming ?? [])]) {
-    const normalized = compactProviderWarning(warning);
-    if (!normalized) continue;
-    merged.set(stableProviderWarningFingerprint(normalized), normalized);
-  }
-  return merged.size > 0 ? [...merged.values()] : undefined;
-}
-
-function stableProviderWarningFingerprint(warning: ProviderWarning): string {
-  return JSON.stringify({
-    message: warning.message,
-    code: warning.code,
-    detail: warning.detail,
-  });
-}
-
-function mergeTransfers(
-  existing: CallTransfer[] | undefined,
-  incoming: CallTransfer[] | undefined,
-): CallTransfer[] | undefined {
-  if ((!existing || existing.length === 0) && (!incoming || incoming.length === 0)) return undefined;
-  const merged = new Map<string, CallTransfer>();
-  for (const transfer of [...(existing ?? []), ...(incoming ?? [])]) {
-    const key = stableTransferFingerprint(transfer);
-    const prior = merged.get(key);
-    if (!prior) {
-      merged.set(key, {
-        ...transfer,
-        sources: [...new Set(transfer.sources)],
-      });
-      continue;
-    }
-
-    merged.set(key, {
-      ...prior,
-      sources: [...new Set([...prior.sources, ...transfer.sources])],
-      timestamp_ms: prior.timestamp_ms ?? transfer.timestamp_ms,
-    });
-  }
-  return merged.size > 0 ? [...merged.values()] : undefined;
-}
-
-function stableTransferFingerprint(transfer: CallTransfer): string {
-  return JSON.stringify({
-    type: transfer.type,
-    destination: transfer.destination,
-    status: transfer.status,
-    timestamp_ms: transfer.timestamp_ms,
-  });
 }
 
 function stableToolCallFingerprint(toolCall: ObservedToolCall): string {
@@ -1469,16 +688,3 @@ function stableToolCallFingerprint(toolCall: ObservedToolCall): string {
     timestamp_ms: toolCall.timestamp_ms,
   });
 }
-
-const LIVEKIT_OBSERVABILITY_TOPICS = [
-  LIVEKIT_SESSION_TOPIC,
-  LIVEKIT_CALL_METADATA_TOPIC,
-  LIVEKIT_TRANSFER_TOPIC,
-  LIVEKIT_DEBUG_URL_TOPIC,
-  LIVEKIT_WARNING_TOPIC,
-  LIVEKIT_SESSION_REPORT_TOPIC,
-  LIVEKIT_METRICS_TOPIC,
-  LIVEKIT_CONVERSATION_ITEM_TOPIC,
-  LIVEKIT_USER_INPUT_TRANSCRIBED_TOPIC,
-  LIVEKIT_SESSION_USAGE_TOPIC,
-] as const;

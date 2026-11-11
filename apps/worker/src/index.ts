@@ -10,8 +10,9 @@ import {
   RUN_QUEUE_NAME,
   envPositiveInt,
   requireEnv,
+  type RunJob,
 } from "@vent/shared";
-import { checkDatabase, executeRun, LostCallLock, type RunJob } from "./jobs/run-executor.js";
+import { checkDatabase, executeRun, LostCallLock } from "./jobs/run-executor.js";
 import { cancelAllCalls } from "./call-supervisor.js";
 import { createWorkerMetrics } from "./metrics.js";
 
@@ -60,7 +61,7 @@ async function processRun(job: Job<RunJob>): Promise<void> {
   const lost = new AbortController();
   lockLost.set(job.id!, lost);
   console.log(
-    `Processing run ${data.run_id} (adapter: ${data.adapter ?? "unknown"}${data.agent_session_id ? ", session" : ""})`,
+    `Processing run ${data.run_id} (adapter: ${data.adapter}${data.agent_session_id ? ", session" : ""})`,
   );
 
   // Capture all console output for the run so we can dump it at the end.

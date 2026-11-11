@@ -1,7 +1,25 @@
 /**
- * Audio format conversion utilities.
- * Handles sample rate conversion and PCM/WAV encoding.
+ * PCM helpers. Vent's audio is 16-bit signed little-endian mono at SAMPLE_RATE.
  */
+
+export const SAMPLE_RATE = 24000;
+
+/** Round and clamp a sample value to the int16 range. */
+export function clamp16(value: number): number {
+  return Math.max(-32768, Math.min(32767, Math.round(value)));
+}
+
+/** RMS level of Int16LE PCM on the int16 scale (0 for an empty buffer). */
+export function pcmRms(pcm: Buffer): number {
+  const samples = pcm.length >> 1;
+  if (samples === 0) return 0;
+  let sumSq = 0;
+  for (let i = 0; i < samples; i++) {
+    const s = pcm.readInt16LE(i * 2);
+    sumSq += s * s;
+  }
+  return Math.sqrt(sumSq / samples);
+}
 
 /**
  * Resample PCM 16-bit mono from one sample rate to another using linear interpolation.
@@ -26,42 +44,10 @@ export function resample(
 
     const a = input.readInt16LE(srcFloor * 2);
     const b = input.readInt16LE(srcCeil * 2);
-    const sample = Math.round(a + (b - a) * frac);
-    output.writeInt16LE(
-      Math.max(-32768, Math.min(32767, sample)),
-      i * 2
-    );
+    output.writeInt16LE(clamp16(a + (b - a) * frac), i * 2);
   }
 
   return output;
-}
-
-/**
- * Wrap raw PCM 16-bit signed mono data in a WAV container.
- */
-export function pcmToWav(pcm: Buffer, sampleRate = 24000): Buffer {
-  const numChannels = 1;
-  const bitsPerSample = 16;
-  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
-  const blockAlign = numChannels * (bitsPerSample / 8);
-  const dataSize = pcm.length;
-
-  const header = Buffer.alloc(44);
-  header.write("RIFF", 0);
-  header.writeUInt32LE(36 + dataSize, 4);
-  header.write("WAVE", 8);
-  header.write("fmt ", 12);
-  header.writeUInt32LE(16, 16);
-  header.writeUInt16LE(1, 20);
-  header.writeUInt16LE(numChannels, 22);
-  header.writeUInt32LE(sampleRate, 24);
-  header.writeUInt32LE(byteRate, 28);
-  header.writeUInt16LE(blockAlign, 32);
-  header.writeUInt16LE(bitsPerSample, 34);
-  header.write("data", 36);
-  header.writeUInt32LE(dataSize, 40);
-
-  return Buffer.concat([header, pcm]);
 }
 
 /**

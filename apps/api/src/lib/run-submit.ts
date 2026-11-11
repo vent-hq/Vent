@@ -7,14 +7,15 @@ import {
   ConversationCallSpecSchema,
   CallerAudioEffectsSchema,
   PlatformConfigSchema,
-  requireEnv,
+  envPositiveInt,
+  missingPlatformFields,
+  isPlatformProvider,
 } from "@vent/shared";
-import { encryptPlatformConfig, validateResolvedPlatformConfig } from "@vent/platform-connections";
+import { encryptPlatformConfig } from "@vent/platform-connections";
 import type { FastifyInstance } from "fastify";
 import { finalizeRun } from "./finalize-run.js";
 import { enqueueRun, type EnqueueableRun } from "./enqueue-run.js";
 
-const PLATFORM_ADAPTERS = new Set(["livekit", "vapi", "retell", "elevenlabs", "bland"]);
 
 export class FleetCapacityError extends Error {
   constructor() {
@@ -40,8 +41,6 @@ export const RunSubmitConfigSchema = z.object({
     adapter: AdapterTypeSchema.default("websocket"),
     agent_url: z.string().optional(),
     agent_port: z.number().int().min(1).max(65535).optional(),
-    start_command: z.string().optional(),
-    health_endpoint: z.string().optional(),
     caller_audio: CallerAudioEffectsSchema.optional(),
     platform: PlatformConfigSchema.optional(),
   }),
@@ -49,7 +48,7 @@ export const RunSubmitConfigSchema = z.object({
 }).superRefine((d, ctx) => {
   const adapter = d.connection.adapter;
   const platform = d.connection.platform;
-  const requiresPlatform = PLATFORM_ADAPTERS.has(adapter);
+  const requiresPlatform = isPlatformProvider(adapter);
 
   if (requiresPlatform && !platform) {
     ctx.addIssue({
@@ -67,13 +66,11 @@ export const RunSubmitConfigSchema = z.object({
     });
   }
   if (platform) {
-    try {
-      validateResolvedPlatformConfig(platform);
-    } catch (error) {
+    for (const anyOf of missingPlatformFields(platform)) {
       ctx.addIssue({
         code: z.ZodIssueCode.custom,
         path: ["connection", "platform"],
-        message: (error as Error).message,
+        message: `${platform.provider} configuration requires ${anyOf.join(" or ")}`,
       });
     }
   }
@@ -99,28 +96,24 @@ export function buildCallSpec(cfg: Record<string, unknown>): { callSpecJson: Run
 
   // Merge root-level caller_audio as default onto the call spec
   const callerAudio = cfg.caller_audio as Record<string, unknown> | undefined;
-  let call = cfg.call as Record<string, unknown> | null | undefined;
-  if (callerAudio && call && call.caller_audio === undefined) {
+  let call = cfg.call as Record<string, unknown>;
+  if (callerAudio && call.caller_audio === undefined) {
     call = { ...call, caller_audio: callerAudio };
   }
 
   return {
     callSpecJson: {
-      call: call ?? null,
+      call,
       adapter,
-      voice_config: { adapter },
-      start_command: (cfg.start_command as string | undefined) ?? null,
-      health_endpoint: (cfg.health_endpoint as string | undefined) ?? null,
       agent_url: agentUrl ?? null,
     },
-    isRemote: PLATFORM_ADAPTERS.has(adapter) || !!agentUrl,
+    isRemote: isPlatformProvider(adapter) || !!agentUrl,
   };
 }
 
 // ---- Core submit function ----
 
 export interface SubmitRunParams {
-  accessTokenId: string;
   userId: string;
   config: RunSubmitInput["config"];
   idempotencyKey?: string;
@@ -137,7 +130,7 @@ export async function submitRun(
   app: FastifyInstance,
   params: SubmitRunParams,
 ): Promise<SubmitRunResult> {
-  const { accessTokenId, userId, config, idempotencyKey, agentSessionId } = params;
+  const { userId, config, idempotencyKey, agentSessionId } = params;
 
   const hashedIdempotencyKey = idempotencyKey
     ? hashIdempotencyKey(idempotencyKey)
@@ -149,10 +142,7 @@ export async function submitRun(
 
   const { callSpecJson, isRemote } = buildCallSpec(cfg);
 
-  const fleetMax = Number(requireEnv("FLEET_MAX_ACTIVE_RUNS"));
-  if (!Number.isSafeInteger(fleetMax) || fleetMax < 1) {
-    throw new Error("FLEET_MAX_ACTIVE_RUNS must be a positive integer");
-  }
+  const fleetMax = envPositiveInt("FLEET_MAX_ACTIVE_RUNS");
 
   if (!isRemote) {
     // Local agent via agent session — session must already be active
@@ -219,7 +209,6 @@ export async function submitRun(
     const [run] = await tx
       .insert(schema.runs)
       .values({
-        access_token_id: accessTokenId,
         user_id: userId,
         status: "queued",
         test_spec_json: callSpecJson,

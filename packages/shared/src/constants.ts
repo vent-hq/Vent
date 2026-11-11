@@ -1,8 +1,5 @@
-export const DEFAULT_HEALTH_TIMEOUT_MS = 60_000; // 1 minute
-export const DEFAULT_HEALTH_INTERVAL_MS = 2_000;
-export const DEFAULT_POLL_INTERVAL_MS = 3_000;
+/** Port a local agent listens on when the config doesn't set agent_port. */
 export const DEFAULT_AGENT_PORT = 3001;
-export const DEFAULT_API_PORT = 3000;
 
 // Plaintext-secret header for the worker's relay WebSocket (no body to sign).
 // POST callbacks use the HMAC headers below.

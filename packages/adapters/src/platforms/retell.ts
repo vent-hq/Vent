@@ -11,18 +11,19 @@
  *   3. disconnect() — closes media and deletes the gateway session
  *   4. getCallData() — tool calls
  *   5. getCallMetadata() — cost, recording, end reason, transfers
- *   6. getComponentTimings() — STT/LLM/TTS latency per turn
- *   7. getTranscripts() — what Retell heard the caller say
+ *   6. getComponentTimings() — STT/LLM/TTS latencies for the whole call
+ *   7. getTranscripts() — what Retell heard the caller say, and what its LLM wrote
  */
 
 import Retell from "retell-sdk";
 import type { CallResponse } from "retell-sdk/resources/call.js";
 import { RetellGateway, FRAME_SAMPLES } from "./retell-gateway.js";
 import { pollUntilReady, callDataUnavailableWarning } from "../shared/post-call.js";
-import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, CostBreakdown, UsageEntry } from "@vent/shared";
-import { BaseAudioChannel, type SendAudioOptions, type ComfortNoiseMode } from "../shared/audio-channel.js";
+import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency } from "@vent/shared";
+import { BaseAudioChannel, type ComfortNoiseMode, type PlatformUtterance } from "../shared/audio-channel.js";
+import { compactStringRecord } from "../shared/record-utils.js";
 
-export interface RetellAudioChannelConfig {
+interface RetellAudioChannelConfig {
   apiKey: string;
   agentId: string;
 }
@@ -40,8 +41,6 @@ export class RetellAudioChannel extends BaseAudioChannel {
   // Call state
   private callId: string | null = null;
   private cachedCallResponse: CallResponse | null = null;
-  private connectTimestamp = 0;
-  private disconnectTimestamp = 0;
 
   // The gateway's WebRTC source takes 10ms frames of 48kHz audio, at real time.
   protected override outputSampleRate = 48000;
@@ -68,32 +67,19 @@ export class RetellAudioChannel extends BaseAudioChannel {
 
   async connect(): Promise<void> {
     const started=Date.now();
-    this.enableRecordingCapture();
-    this._connectTimestampMs=Date.now();
-    this._connectMonotonicMs=performance.now();
     this.gateway=new RetellGateway({
-      audio: (pcm) => {
-        this._stats.bytesReceived+=pcm.length;
-        this.captureAgentAudio(pcm,performance.now()-this._connectMonotonicMs);
-        this.emit("audio",pcm);
-      },
+      audio: (pcm24k) => this.receiveAgentAudio(pcm24k,BaseAudioChannel.INPUT_SAMPLE_RATE),
       disconnected: () => {this.collecting=false;this.emit("disconnected");},
       error: (error) => {this._stats.errorEvents.push(error.message);this.emit("error",error);},
     });
     this.callId=await this.gateway.connect(this.config.apiKey,this.config.agentId);
     this.collecting=true;
-    this.connectTimestamp=Date.now();
     this._stats.connectLatencyMs=Date.now()-started;
   }
 
-  /** Retell agents always speak first. */
-  async getOpeningSpeaker(): Promise<"agent" | "caller" | null> {
-    return "agent";
-  }
-
-  override sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
+  override sendAudio(pcm: Buffer): void {
     if (!this.collecting) throw new Error("Retell gateway is not connected");
-    super.sendAudio(pcm,opts);
+    super.sendAudio(pcm);
   }
 
   async disconnect(): Promise<void> {
@@ -101,7 +87,6 @@ export class RetellAudioChannel extends BaseAudioChannel {
     this.clearAudioBuffer();
     await this.gateway?.close();
     this.gateway=null;
-    this.disconnectTimestamp=Date.now();
   }
 
   // ── Post-call data ─────────────────────────────────────────────
@@ -131,8 +116,7 @@ export class RetellAudioChannel extends BaseAudioChannel {
       provider_call_id: data.call_id ?? this.callId ?? undefined,
       provider_session_id: telephony?.twilio_call_sid,
       ended_reason: data.disconnection_reason ?? undefined,
-      cost_usd: cost?.combined_cost != null ? cost.combined_cost / 100 : undefined,
-      cost_breakdown: cost?.product_costs ? buildRetellCostBreakdown(cost.product_costs) : undefined,
+      cost: buildRetellCost(cost),
       recording_url: data.recording_url ?? undefined,
       recording_variants: compactStringRecord({
         multi_channel: data.recording_multi_channel_url ?? undefined,
@@ -143,14 +127,6 @@ export class RetellAudioChannel extends BaseAudioChannel {
         public_log: data.public_log_url ?? undefined,
         knowledge_base: data.knowledge_base_retrieved_contents_url ?? undefined,
       }),
-      usage: buildRetellUsage(data),
-      variables: data.collected_dynamic_variables ?? undefined,
-      provider_metadata: compactUnknownRecord({
-        duration_s: data.duration_ms != null ? data.duration_ms / 1000 : undefined,
-        in_voicemail: data.call_analysis?.in_voicemail,
-        telephony_identifier: telephony,
-        e2e_latency: extractRetellE2eLatency(data),
-      }),
       transfers: extractRetellTransfers(data),
     };
   }
@@ -159,20 +135,21 @@ export class RetellAudioChannel extends BaseAudioChannel {
     return extractRetellComponentTimings(this.cachedCallResponse);
   }
 
-  getTranscripts(): Array<{ turnIndex: number; text: string }> {
-    const data = this.cachedCallResponse;
-    const entries = data?.transcript_with_tool_calls;
-    if (!entries) return [];
-
-    const transcripts: Array<{ turnIndex: number; text: string }> = [];
-    let callerTurnIndex = 0;
-    for (const entry of entries) {
-      if (entry.role === "user" && "content" in entry) {
-        transcripts.push({ turnIndex: callerTurnIndex, text: entry.content });
-        callerTurnIndex++;
+  getTranscripts(): PlatformUtterance[] {
+    // Retell lists overlapping speech out of order (a caller's last word can come after
+    // the agent's reply started), so order utterances by when each one started.
+    const utterances: Array<PlatformUtterance & { start: number }> = [];
+    for (const entry of this.cachedCallResponse?.transcript_with_tool_calls ?? []) {
+      if ((entry.role === "user" || entry.role === "agent") && "content" in entry) {
+        utterances.push({
+          role: entry.role === "user" ? "caller" : "agent",
+          text: entry.content,
+          // Without word timings, an utterance keeps its place after the previous one.
+          start: entry.words?.[0]?.start ?? utterances.at(-1)?.start ?? 0,
+        });
       }
     }
-    return transcripts;
+    return utterances.sort((a, b) => a.start - b.start).map(({ role, text }) => ({ role, text }));
   }
 
   private callData?: Promise<CallResponse | null>;
@@ -201,13 +178,14 @@ export class RetellAudioChannel extends BaseAudioChannel {
 
 function parseRetellToolCallsFromEntries(entries: Record<string, unknown>[]): ObservedToolCall[] {
   const toolCalls: ObservedToolCall[] = [];
-  const resultMap = new Map<string, { content: string; successful?: boolean }>();
+  const resultMap = new Map<string, { content: string; successful?: boolean; timeSec?: number }>();
 
   for (const entry of entries) {
     if (entry["role"] === "tool_call_result" && typeof entry["tool_call_id"] === "string") {
       resultMap.set(entry["tool_call_id"], {
         content: typeof entry["content"] === "string" ? entry["content"] : "",
         successful: typeof entry["successful"] === "boolean" ? entry["successful"] : undefined,
+        timeSec: typeof entry["time_sec"] === "number" ? entry["time_sec"] : undefined,
       });
     }
   }
@@ -228,6 +206,8 @@ function parseRetellToolCallsFromEntries(entries: Record<string, unknown>[]): Ob
     }
 
     const result = resultMap.get(toolCallId);
+    // Retell stamps the invocation and its result with time_sec from call start.
+    const startSec = typeof entry["time_sec"] === "number" ? entry["time_sec"] : undefined;
     let parsedResult: unknown;
     if (result) {
       try {
@@ -242,52 +222,34 @@ function parseRetellToolCallsFromEntries(entries: Record<string, unknown>[]): Ob
       arguments: args,
       result: parsedResult,
       successful: result?.successful,
-      provider_tool_type: typeof entry["type"] === "string"
-        ? entry["type"]
-        : typeof entry["tool_type"] === "string"
-          ? entry["tool_type"]
-          : undefined,
+      timestamp_ms: startSec != null ? Math.round(startSec * 1000) : undefined,
+      latency_ms: startSec != null && result?.timeSec != null ? Math.round((result.timeSec - startSec) * 1000) : undefined,
+      provider_tool_type: typeof entry["type"] === "string" ? entry["type"] : undefined,
     });
   }
 
   return toolCalls;
 }
 
-export function extractRetellComponentTimings(data: CallResponse | null | undefined): ComponentLatency[] {
-  if (!data?.latency) return [];
-  const lat = data.latency as Record<string, { values?: number[] } | undefined>;
-  const sttValues = lat.asr?.values ?? [];
-  const llmValues = lat.llm?.values ?? [];
-  const ttsValues = lat.tts?.values ?? [];
-  const maxLen = Math.max(sttValues.length, llmValues.length, ttsValues.length);
-  if (maxLen === 0) return [];
-  const timings: ComponentLatency[] = [];
-  for (let i = 0; i < maxLen; i++) {
-    timings.push({
-      stt_ms: sttValues[i],
-      llm_ms: llmValues[i],
-      tts_ms: ttsValues[i],
-    });
-  }
-  return timings;
+/**
+ * Retell reports each stage's latencies for the whole call, not per reply: one
+ * STT value per caller turn, one LLM value per LLM request (a reply with a tool
+ * call makes two). So they are call-level samples, one stage each. When the
+ * agent opens the call, the first LLM and TTS values are its greeting, a fixed
+ * message (LLM 0 ms), and are left out like other platforms' greetings.
+ */
+function extractRetellComponentTimings(data: CallResponse | null | undefined): ComponentLatency[] {
+  const latency = data?.latency;
+  if (!latency) return [];
+  const greeting = data.transcript_object?.[0]?.role === "agent" ? 1 : 0;
+  return [
+    ...(latency.asr?.values ?? []).map((stt_ms) => ({ stt_ms })),
+    ...(latency.llm?.values ?? []).slice(greeting).map((llm_ms) => ({ llm_ms })),
+    ...(latency.tts?.values ?? []).slice(greeting).map((tts_ms) => ({ tts_ms })),
+  ];
 }
 
-function extractRetellE2eLatency(data: CallResponse): Record<string, unknown> | undefined {
-  const lat = data.latency as Record<string, { p50?: number; p90?: number; p95?: number; p99?: number; min?: number; max?: number; num?: number } | undefined> | undefined;
-  const e2e = lat?.e2e;
-  if (!e2e) return undefined;
-  return {
-    p50_ms: e2e.p50,
-    p90_ms: e2e.p90,
-    p95_ms: e2e.p95,
-    p99_ms: e2e.p99,
-    min_ms: e2e.min,
-    max_ms: e2e.max,
-    num_turns: e2e.num,
-  };
-}
-
-export function extractRetellTransfers(data: CallResponse): CallTransfer[] | undefined {
+function extractRetellTransfers(data: CallResponse): CallTransfer[] | undefined {
   const disconnectionReason = data.disconnection_reason ?? undefined;
   const destination = data.transfer_destination ?? undefined;
   const looksTransferred =
@@ -321,67 +283,27 @@ function resolveRetellTransferStatus(data: Pick<CallResponse, "disconnection_rea
   return "unknown";
 }
 
-export function resolveRetellTransferTimestampMs(data: Pick<CallResponse, "start_timestamp" | "transfer_end_timestamp">): number | undefined {
+function resolveRetellTransferTimestampMs(data: Pick<CallResponse, "start_timestamp" | "transfer_end_timestamp">): number | undefined {
   if (data.transfer_end_timestamp != null && data.start_timestamp != null && data.transfer_end_timestamp >= data.start_timestamp) {
     return Math.round(data.transfer_end_timestamp - data.start_timestamp);
   }
   return undefined;
 }
 
-export function buildRetellCostBreakdown(products: Array<{ product: string; cost: number }>): CostBreakdown {
-  const breakdown: CostBreakdown = {};
-  let total = 0;
-  for (const p of products) {
-    const usd = p.cost / 100;
-    total += usd;
-    const name = p.product.toLowerCase();
-    if (name.includes("stt") || name.includes("asr") || name.includes("deepgram") || name.includes("whisper")) {
-      breakdown.stt_usd = (breakdown.stt_usd ?? 0) + usd;
-    } else if (name.includes("tts") || name.includes("elevenlabs") || name.includes("playht") || name.includes("cartesia")) {
-      breakdown.tts_usd = (breakdown.tts_usd ?? 0) + usd;
-    } else if (name.includes("llm") || name.includes("gpt") || name.includes("claude") || name.includes("openai")) {
-      breakdown.llm_usd = (breakdown.llm_usd ?? 0) + usd;
-    } else if (name.includes("transport") || name.includes("telephony") || name.includes("twilio")) {
-      breakdown.transport_usd = (breakdown.transport_usd ?? 0) + usd;
-    } else if (name.includes("retell") || name.includes("platform")) {
-      breakdown.platform_usd = (breakdown.platform_usd ?? 0) + usd;
-    }
+/** Retell's own line items, keyed by its product name, in USD (Retell reports cents). */
+function buildRetellCost(
+  cost: { combined_cost?: number; product_costs?: Array<{ product: string; cost: number }> } | undefined,
+): CallMetadata["cost"] {
+  if (cost?.combined_cost == null) return undefined;
+  // A product can appear twice, e.g. once more for a transfer leg. Sum in cents, then convert.
+  const cents = new Map<string, number>();
+  for (const item of cost.product_costs ?? []) {
+    cents.set(item.product, (cents.get(item.product) ?? 0) + item.cost);
   }
-  breakdown.total_usd = total;
-  return breakdown;
+  const breakdown = Object.fromEntries([...cents].map(([product, c]) => [product, c / 100]));
+  return {
+    total_usd: cost.combined_cost / 100,
+    ...(cents.size > 0 ? { breakdown } : {}),
+  };
 }
 
-function buildRetellUsage(data: CallResponse): UsageEntry[] | undefined {
-  const tokenUsage = data.llm_token_usage as { prompt_tokens?: number; completion_tokens?: number } | undefined;
-  if (!tokenUsage) return undefined;
-  if (!tokenUsage.prompt_tokens && !tokenUsage.completion_tokens) return undefined;
-
-  // Try to get model name from the call config
-  const dataRecord = data as unknown as Record<string, unknown>;
-  const llmId = (dataRecord["llm_id"] as string | undefined)
-    ?? (dataRecord["agent_id"] as string | undefined)
-    ?? "";
-
-  return [{
-    type: "llm_usage",
-    provider: "retell",
-    model: llmId,
-    input_tokens: tokenUsage.prompt_tokens,
-    output_tokens: tokenUsage.completion_tokens,
-  }];
-}
-
-function compactStringRecord(record: Record<string, string | undefined>): Record<string, string> | undefined {
-  const compacted: Record<string, string> = {};
-  for (const [key, value] of Object.entries(record)) {
-    if (typeof value === "string" && value.length > 0) {
-      compacted[key] = value;
-    }
-  }
-  return Object.keys(compacted).length > 0 ? compacted : undefined;
-}
-
-function compactUnknownRecord(record: Record<string, unknown>): Record<string, unknown> | undefined {
-  const entries = Object.entries(record).filter(([, value]) => value != null);
-  return entries.length > 0 ? Object.fromEntries(entries) : undefined;
-}

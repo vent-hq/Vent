@@ -49,15 +49,6 @@ test("silence mode sends all-zero frames", async () => {
   assert.ok(ch.frames.every((f) => f.every((s) => s === 0)));
 });
 
-test("none mode sends nothing", async () => {
-  const ch = new FakeChannel("none");
-  ch.startComfortNoise();
-  await sleep(60);
-  await ch.disconnect();
-
-  assert.equal(ch.frames.length, 0);
-});
-
 test("caller speech stops the noise and drops buffered noise once", async () => {
   const ch = new FakeChannel("noise");
   ch.startComfortNoise();

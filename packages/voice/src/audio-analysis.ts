@@ -8,13 +8,12 @@
  * so conversation tests can run the same analysis on captured agent audio.
  */
 
-import type { SpeechSegment } from "./batch-vad.js";
+import { SAMPLE_RATE, pcmRms } from "@vent/shared";
 
 // ============================================================
 // Constants
 // ============================================================
 
-const SAMPLE_RATE = 24000;
 const CLIPPING_THRESHOLD = 32700;
 const WINDOW_MS = 100;
 const WINDOW_SAMPLES = Math.floor((SAMPLE_RATE * WINDOW_MS) / 1000);
@@ -45,14 +44,9 @@ export interface AudioQualityMetrics {
 /**
  * Analyze a raw Int16LE PCM audio buffer for signal-level quality issues.
  *
- * @param buffer - Raw Int16LE PCM audio at 24kHz
- * @param _speechSegments - VAD speech segments (reserved for future use)
- * @returns Audio quality metrics
+ * @param buffer - Raw Int16LE PCM audio at SAMPLE_RATE
  */
-export function analyzeAudioQuality(
-  buffer: Buffer,
-  _speechSegments?: SpeechSegment[],
-): AudioQualityMetrics {
+export function analyzeAudioQuality(buffer: Buffer): AudioQualityMetrics {
   const totalSamples = buffer.length / 2;
   if (totalSamples === 0) {
     return {
@@ -80,13 +74,8 @@ export function analyzeAudioQuality(
   const windowRms: number[] = [];
 
   for (let w = 0; w < windowCount; w++) {
-    let sum = 0;
-    const offset = w * WINDOW_SAMPLES;
-    for (let i = 0; i < WINDOW_SAMPLES; i++) {
-      const s = buffer.readInt16LE((offset + i) * 2);
-      sum += s * s;
-    }
-    windowRms.push(Math.sqrt(sum / WINDOW_SAMPLES));
+    const start = w * WINDOW_SAMPLES * 2;
+    windowRms.push(pcmRms(buffer.subarray(start, start + WINDOW_SAMPLES * 2)));
   }
 
   const speechWindows = windowRms.filter((r) => r >= SILENCE_RMS_THRESHOLD);

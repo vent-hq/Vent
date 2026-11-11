@@ -11,7 +11,6 @@
 
 import { fork, type ChildProcess } from "node:child_process";
 import path from "node:path";
-import type { ConversationCallResult } from "@vent/shared";
 import type { ExecuteCallResult } from "@vent/runner/executor";
 import type { CallInput, ChildMessage, ParentMessage } from "./call-messages.js";
 
@@ -51,7 +50,6 @@ export function runCallInProcess(
   call: CallInput,
   opts: {
     signal: AbortSignal;
-    onCallComplete: (result: ConversationCallResult) => void | Promise<void>;
     limits?: Partial<CallProcessLimits>;
   },
 ): Promise<ExecuteCallResult> {
@@ -102,9 +100,6 @@ export function runCallInProcess(
     switch (message.type) {
       case "pong":
         lastPong = Date.now();
-        break;
-      case "call_complete":
-        void opts.onCallComplete(message.result);
         break;
       case "result":
         result = message.result;

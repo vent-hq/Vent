@@ -107,13 +107,13 @@ importers:
       jose:
         specifier: ^6.2.15
         version: 6.2.15
-      ws:
-        specifier: 'catalog:'
-        version: 8.19.0
       zod:
         specifier: 'catalog:'
         version: 3.25.76
     devDependencies:
+      '@types/ws':
+        specifier: 'catalog:'
+        version: 8.18.1
       esbuild:
         specifier: 'catalog:'
         version: 0.24.2
@@ -253,8 +253,8 @@ importers:
   packages/adapters:
     dependencies:
       '@elevenlabs/elevenlabs-js':
-        specifier: ^2.39.0
-        version: 2.39.0
+        specifier: ^2.77.0
+        version: 2.77.0
       '@livekit/protocol':
         specifier: ^1.45.1
         version: 1.45.1
@@ -270,9 +270,6 @@ importers:
       '@vent/shared':
         specifier: workspace:*
         version: link:../shared
-      '@vent/voice':
-        specifier: workspace:*
-        version: link:../voice
       livekit-server-sdk:
         specifier: ^2.0.0
         version: 2.15.0
@@ -380,6 +377,9 @@ importers:
         specifier: workspace:*
         version: link:../voice
     devDependencies:
+      tsx:
+        specifier: 'catalog:'
+        version: 4.21.0
       typescript:
         specifier: 'catalog:'
         version: 5.9.3
@@ -692,8 +692,8 @@ packages:
   '@drizzle-team/brocli@0.10.2':
     resolution: {integrity: sha512-z33Il7l5dKjUgGULTqBsQBQwckHh5AbIuxhdsIxDDiZAzBOrZO6q9ogcWC65kU382AfynTfgNumVcNIjuIua6w==}
 
-  '@elevenlabs/elevenlabs-js@2.39.0':
-    resolution: {integrity: sha512-Yfh2wa5Y7wwoEHi2Na1YWrkc3z21oeHMo8qhGc5kcbQoWfgQfIxWuGfXHZSmUXOJz0mNL5bAfp3hHaJEX68DIA==}
+  '@elevenlabs/elevenlabs-js@2.77.0':
+    resolution: {integrity: sha512-eGe2pQIlgyqWvsTkhvejvNIzQ6gjNp1c9+CXuT18PspZcaSB5LKdGT05iRThuLwBaVBsAXFdPKm1hOkzhT+oOg==}
     engines: {node: '>=18.0.0'}
 
   '@emnapi/runtime@1.8.1':
@@ -5094,11 +5094,11 @@ snapshots:
 
   '@drizzle-team/brocli@0.10.2': {}
 
-  '@elevenlabs/elevenlabs-js@2.39.0':
+  '@elevenlabs/elevenlabs-js@2.77.0':
     dependencies:
       command-exists: 1.2.9
       node-fetch: 2.7.0
-      ws: 8.19.0
+      ws: 8.22.1
     transitivePeerDependencies:
       - bufferutil
       - encoding
@@ -6658,7 +6658,7 @@ snapshots:
 
   '@types/ws@8.18.1':
     dependencies:
-      '@types/node': 20.19.33
+      '@types/node': 22.20.5
 
   '@vapi-ai/server-sdk@0.11.0': {}
 

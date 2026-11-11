@@ -5,7 +5,13 @@
 // it can be killed at any moment without leaving half-written state behind.
 
 import { executeCall } from "@vent/runner/executor";
+import { requireEnv } from "@vent/shared";
 import type { ChildMessage, ParentMessage } from "./call-messages.js";
+
+const recordingLinks = {
+  secret: requireEnv("RUNNER_CALLBACK_SECRET"),
+  apiPublicUrl: requireEnv("API_PUBLIC_URL"),
+};
 
 const abort = new AbortController();
 let started = false;
@@ -48,8 +54,8 @@ async function run(call: Extract<ParentMessage, { type: "start" }>["call"]): Pro
   try {
     const result = await executeCall({
       ...call,
+      recordingLinks,
       signal: abort.signal,
-      onCallComplete: (conversation) => send({ type: "call_complete", result: conversation }),
     });
     await send({ type: "result", result });
     process.exit(0);

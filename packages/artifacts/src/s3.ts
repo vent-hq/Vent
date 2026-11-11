@@ -3,13 +3,11 @@ import {
   CompleteMultipartUploadCommand,
   CreateMultipartUploadCommand,
   S3Client,
-  PutObjectCommand,
   GetObjectCommand,
-  type PutObjectCommandInput,
   UploadPartCommand,
 } from "@aws-sdk/client-s3";
 import { getSignedUrl } from "@aws-sdk/s3-request-presigner";
-import type { Readable } from "node:stream";
+import { PendingBuffer } from "@vent/shared";
 
 export interface StorageConfig {
   endpoint: string;
@@ -19,7 +17,10 @@ export interface StorageConfig {
   region: string;
 }
 
-const MULTIPART_MIN_PART_SIZE = 5 * 1024 * 1024;
+// Recordings are 24 kHz mono 16-bit PCM, uploaded in 8 MB parts (S3's
+// minimum part size is 5 MB).
+const RECORDING_SAMPLE_RATE = 24_000;
+const PART_SIZE = 8 * 1024 * 1024;
 const WAV_HEADER_BYTES = 44;
 
 export class S3Storage {
@@ -43,19 +44,6 @@ export class S3Storage {
     });
   }
 
-  async presignUpload(
-    key: string,
-    contentType: string = "application/gzip",
-    expiresIn: number = 3600
-  ): Promise<string> {
-    const command = new PutObjectCommand({
-      Bucket: this.bucket,
-      Key: key,
-      ContentType: contentType,
-    });
-    return getSignedUrl(this.client, command, { expiresIn });
-  }
-
   async presignDownload(key: string, expiresIn: number = 3600): Promise<string> {
     const command = new GetObjectCommand({
       Bucket: this.bucket,
@@ -64,35 +52,7 @@ export class S3Storage {
     return getSignedUrl(this.client, command, { expiresIn });
   }
 
-  async upload(
-    key: string,
-    body: Buffer | Readable | ReadableStream,
-    contentType: string = "application/gzip"
-  ): Promise<void> {
-    const command = new PutObjectCommand({
-      Bucket: this.bucket,
-      Key: key,
-      Body: body as PutObjectCommandInput["Body"],
-      ContentType: contentType,
-    });
-    await this.client.send(command);
-  }
-
-  async download(key: string): Promise<ReadableStream | null> {
-    const command = new GetObjectCommand({
-      Bucket: this.bucket,
-      Key: key,
-    });
-    const response = await this.client.send(command);
-    return (response.Body?.transformToWebStream() as ReadableStream) ?? null;
-  }
-
-  async createWavMultipartUpload(
-    key: string,
-    sampleRate: number = 24_000,
-    partSize: number = 8 * 1024 * 1024,
-  ): Promise<WavMultipartUpload> {
-    const resolvedPartSize = Math.max(partSize, MULTIPART_MIN_PART_SIZE);
+  async createWavMultipartUpload(key: string): Promise<WavMultipartUpload> {
     const command = new CreateMultipartUploadCommand({
       Bucket: this.bucket,
       Key: key,
@@ -102,7 +62,7 @@ export class S3Storage {
     if (!response.UploadId) {
       throw new Error("Failed to create multipart upload");
     }
-    return new WavMultipartUpload(this.client, this.bucket, key, response.UploadId, sampleRate, resolvedPartSize);
+    return new WavMultipartUpload(this.client, this.bucket, key, response.UploadId);
   }
 }
 
@@ -123,10 +83,8 @@ export class WavMultipartUpload {
     private readonly bucket: string,
     private readonly key: string,
     private readonly uploadId: string,
-    private readonly sampleRate: number,
-    private readonly partSize: number,
   ) {
-    this.headTargetBytes = this.partSize - WAV_HEADER_BYTES;
+    this.headTargetBytes = PART_SIZE - WAV_HEADER_BYTES;
   }
 
   async appendPcm(chunk: Buffer): Promise<void> {
@@ -160,7 +118,7 @@ export class WavMultipartUpload {
     await this.uploadReadyParts();
 
     const headPart = Buffer.concat([
-      createWavHeader(this.totalPcmBytes, this.sampleRate),
+      createWavHeader(this.totalPcmBytes, RECORDING_SAMPLE_RATE),
       this.head.takeAll(),
     ]);
     await this.uploadPart(1, headPart);
@@ -196,8 +154,8 @@ export class WavMultipartUpload {
   }
 
   private async uploadReadyParts(): Promise<void> {
-    while (this.tail.byteLength >= this.partSize) {
-      const part = this.tail.take(this.partSize);
+    while (this.tail.byteLength >= PART_SIZE) {
+      const part = this.tail.take(PART_SIZE);
       await this.uploadPart(this.nextPartNumber++, part);
     }
   }
@@ -221,49 +179,6 @@ export class WavMultipartUpload {
     });
 
     await this.pendingUpload;
-  }
-}
-
-class PendingBuffer {
-  private chunks: Buffer[] = [];
-  private totalBytes = 0;
-
-  get byteLength(): number {
-    return this.totalBytes;
-  }
-
-  append(chunk: Buffer): void {
-    if (chunk.length === 0) return;
-    this.chunks.push(chunk);
-    this.totalBytes += chunk.length;
-  }
-
-  take(byteLength: number): Buffer {
-    if (byteLength <= 0) return Buffer.alloc(0);
-    const parts: Buffer[] = [];
-    let remaining = Math.min(byteLength, this.totalBytes);
-
-    while (remaining > 0 && this.chunks.length > 0) {
-      const head = this.chunks[0]!;
-      if (head.length <= remaining) {
-        parts.push(head);
-        this.chunks.shift();
-        this.totalBytes -= head.length;
-        remaining -= head.length;
-        continue;
-      }
-
-      parts.push(head.subarray(0, remaining));
-      this.chunks[0] = head.subarray(remaining);
-      this.totalBytes -= remaining;
-      remaining = 0;
-    }
-
-    return Buffer.concat(parts);
-  }
-
-  takeAll(): Buffer {
-    return this.take(this.totalBytes);
   }
 }
 

@@ -1,10 +1,8 @@
 import type { FastifyInstance, FastifyReply, FastifyRequest } from "fastify";
-import { schema } from "@vent/db";
 import {
-  RunnerCallbackV2Schema,
+  WorkerResultCallbackSchema,
   RunFailedCallbackSchema,
   RunEventCallbackSchema,
-  CallProgressCallbackSchema,
   RUNNER_CALLBACK_SIGNATURE_HEADER,
   RUNNER_CALLBACK_TIMESTAMP_HEADER,
   requireEnv,
@@ -55,68 +53,13 @@ export async function callbackRoutes(app: FastifyInstance) {
     }
     const body = parsed.data;
 
-    const [inserted] = await app.db
-      .insert(schema.runEvents)
-      .values({
-        run_id: body.run_id,
-        event_type: body.event_type,
-        message: body.message,
-        metadata_json: body.metadata_json ?? null,
-      })
-      .returning();
-
+    // Progress is only shown live; nothing stores it.
     broadcast(body.run_id, {
-      id: inserted!.id,
       run_id: body.run_id,
       event_type: body.event_type,
       message: body.message,
       metadata_json: body.metadata_json ?? null,
-      created_at: inserted!.created_at.toISOString(),
-    });
-
-    return reply.send({ ok: true });
-  });
-
-  // --- Per-call progress callback (from runner) ---
-  app.post("/internal/call-progress", { bodyLimit: INTERNAL_BODY_LIMIT }, async (request, reply) => {
-    if (!authorize(request, reply, secret)) return;
-
-    const parsed = CallProgressCallbackSchema.safeParse(request.body);
-    if (!parsed.success) {
-      return reply.status(400).send({ error: "Invalid body", details: parsed.error.format() });
-    }
-    const body = parsed.data;
-
-    const progressMessage = `${body.call_name}: ${body.status} (${body.duration_ms}ms)`;
-    const progressMetadata: Record<string, unknown> = {
-      call_name: body.call_name,
-      call_type: body.call_type,
-      status: body.status,
-      duration_ms: body.duration_ms,
-      completed: body.completed,
-      total: body.total,
-    };
-    if (body.result) {
-      progressMetadata.result = body.result;
-    }
-
-    const [progressEvent] = await app.db
-      .insert(schema.runEvents)
-      .values({
-        run_id: body.run_id,
-        event_type: "call_completed",
-        message: progressMessage,
-        metadata_json: progressMetadata,
-      })
-      .returning();
-
-    broadcast(body.run_id, {
-      id: progressEvent!.id,
-      run_id: body.run_id,
-      event_type: "call_completed",
-      message: progressMessage,
-      metadata_json: progressMetadata,
-      created_at: progressEvent!.created_at.toISOString(),
+      created_at: new Date().toISOString(),
     });
 
     return reply.send({ ok: true });
@@ -146,7 +89,7 @@ export async function callbackRoutes(app: FastifyInstance) {
   app.post("/internal/runner-callback", { bodyLimit: INTERNAL_BODY_LIMIT }, async (request, reply) => {
     if (!authorize(request, reply, secret)) return;
 
-    const parsed = RunnerCallbackV2Schema.safeParse(request.body);
+    const parsed = WorkerResultCallbackSchema.safeParse(request.body);
     if (!parsed.success) {
       return reply.status(400).send({ error: "Invalid body", details: parsed.error.format() });
     }
@@ -159,7 +102,7 @@ export async function callbackRoutes(app: FastifyInstance) {
       status: body.status,
       from: ["running"],
       errorText: body.error_text,
-      result: { conversation_result: body.conversation_result, aggregate: body.aggregate },
+      result: body.conversation_result,
     });
 
     return reply.send({ ok: true, ended });

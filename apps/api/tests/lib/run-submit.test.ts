@@ -4,10 +4,13 @@ import { after, before, mock, test } from "node:test";
 import type { FastifyInstance } from "fastify";
 import { PgDialect } from "drizzle-orm/pg-core";
 import type { SQL } from "drizzle-orm";
-import { schema } from "@vent/db";
 import { decryptPlatformConfig, type EncryptedPlatformConfig } from "@vent/platform-connections";
 
-mock.module("../../src/lib/run-subscribers.js", { namedExports: { broadcast() {} } });
+// run_complete announcements finalizeRun published to CLI streams.
+const published: Record<string, unknown>[] = [];
+mock.module("../../src/lib/run-subscribers.js", { namedExports: {
+  broadcast(_runId: string, event: Record<string, unknown>) { published.push(event); },
+} });
 let buildCallSpec: typeof import("../../src/lib/run-submit.js").buildCallSpec;
 let RunSubmitConfigSchema: typeof import("../../src/lib/run-submit.js").RunSubmitConfigSchema;
 let submitRun: typeof import("../../src/lib/run-submit.js").submitRun;
@@ -54,7 +57,8 @@ interface StoredRun extends Record<string, unknown> {
 function createSubmitApp(options: { enqueueFails?: boolean; claimBeforeEnqueueError?: boolean } = {}) {
   const rows: StoredRun[] = [];
   const jobs: Record<string, unknown>[] = [];
-  const events: Record<string, unknown>[] = [];
+  published.length = 0;
+  const events = published;
   let previousTransaction = Promise.resolve();
   let admissionLocked = false;
   const params = (condition: SQL) => new PgDialect().sqlToQuery(condition).params;
@@ -73,10 +77,9 @@ function createSubmitApp(options: { enqueueFails?: boolean; claimBeforeEnqueueEr
       }
       return { limit: async () => rows.filter(row => values.includes(row.user_id) && values.includes(row.idempotency_key)) };
     } }) }),
-    insert: (table: unknown) => ({ values: (values: Record<string, unknown>) => ({ returning: async () => {
+    insert: () => ({ values: (values: Record<string, unknown>) => ({ returning: async () => {
       const row: Record<string, unknown> = { id: randomUUID(), created_at: new Date(), ...structuredClone(values) };
-      if (table === schema.runs) rows.push(row as StoredRun);
-      else events.push(row);
+      rows.push(row as StoredRun);
       return [row];
     } }) }),
     update: () => ({ set: (values: Record<string, unknown>) => ({ where: (condition: SQL) => ({ returning: async () => {
@@ -112,7 +115,7 @@ function createSubmitApp(options: { enqueueFails?: boolean; claimBeforeEnqueueEr
 
 test("runs for the same agent keep independent encrypted configurations", async () => {
   const { app, rows, jobs } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), userId: "alice" };
+  const params = { userId: "alice" };
   const first = await submitRun(app, { ...params, config: config() });
   const secondSettings = { ...platform, voice: "josh", bland_api_key: "FAKE_NEW_KEY" };
   const second = await submitRun(app, { ...params, config: config(secondSettings) });
@@ -134,7 +137,7 @@ test("runs for the same agent keep independent encrypted configurations", async 
 
 test("retrying an idempotent submission preserves the original run and configuration", async () => {
   const { app, rows, jobs } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), userId: "alice", idempotencyKey: randomUUID() };
+  const params = { userId: "alice", idempotencyKey: randomUUID() };
   const first = await submitRun(app, { ...params, config: config() });
   const retry = await submitRun(app, { ...params, config: config({ ...platform, voice: "josh" }) });
   assert.equal(retry.run_id, first.run_id);
@@ -146,7 +149,7 @@ test("retrying an idempotent submission preserves the original run and configura
 
 test("different customers can use the same submission idempotency key", async () => {
   const { app, rows } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), config: config(), idempotencyKey: randomUUID() };
+  const params = { config: config(), idempotencyKey: randomUUID() };
   const first = await submitRun(app, { ...params, userId: "alice" });
   const second = await submitRun(app, { ...params, userId: "bob" });
   assert.notEqual(first.run_id, second.run_id);
@@ -187,7 +190,7 @@ test("provider, adapter, and resolved credentials are validated before submissio
 
 test("custom WebSocket runs do not require or store provider configuration", async () => {
   const { app, rows } = createSubmitApp();
-  await submitRun(app, { accessTokenId: randomUUID(), userId: "alice", config: RunSubmitConfigSchema.parse({
+  await submitRun(app, { userId: "alice", config: RunSubmitConfigSchema.parse({
     connection: { adapter: "websocket", agent_url: "wss://example.invalid/agent" }, call,
   }) });
   assert.equal(rows[0]!.platform_config_encrypted, null);
@@ -201,7 +204,7 @@ test("public run metadata excludes platform configuration", () => {
 
 test("the fleet limit counts queued and running calls across all users", async () => {
   const { app, rows, jobs } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), config: config() };
+  const params = { config: config() };
   await submitRun(app, { ...params, userId: "alice" });
   rows[0]!.status = "running";
   await submitRun(app, { ...params, userId: "bob" });
@@ -212,7 +215,7 @@ test("the fleet limit counts queued and running calls across all users", async (
 
 test("concurrent submissions cannot both take the last place", async () => {
   const { app, rows, jobs } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), config: config(), userId: "alice" };
+  const params = { config: config(), userId: "alice" };
   await submitRun(app, params);
   const outcomes = await Promise.allSettled([submitRun(app, params), submitRun(app, params)]);
   assert.equal(outcomes.filter(outcome => outcome.status === "fulfilled").length, 1);
@@ -223,7 +226,7 @@ test("concurrent submissions cannot both take the last place", async () => {
 
 test("concurrent retries reuse an existing run even when the fleet is full", async () => {
   const { app, rows, jobs } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), config: config(), userId: "alice", idempotencyKey: randomUUID() };
+  const params = { config: config(), userId: "alice", idempotencyKey: randomUUID() };
   const [first, retry] = await Promise.all([submitRun(app, params), submitRun(app, params)]);
   await submitRun(app, { ...params, userId: "bob" });
   const fullRetry = await submitRun(app, params);
@@ -237,7 +240,7 @@ test("concurrent retries reuse an existing run even when the fleet is full", asy
 
 test("finishing a run frees capacity without any Redis capacity operation", async () => {
   const { app, rows, events } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), config: config(), userId: "alice" };
+  const params = { config: config(), userId: "alice" };
   const first = await submitRun(app, params);
   await submitRun(app, params);
   await finalizeRun(app, { runId: first.run_id, status: "pass", from: ["queued", "running"] });
@@ -248,7 +251,7 @@ test("finishing a run frees capacity without any Redis capacity operation", asyn
 
 test("queue submission failure ends the queued run and frees its capacity", async () => {
   const { app, rows, events } = createSubmitApp({ enqueueFails: true });
-  const params = { accessTokenId: randomUUID(), config: config(), userId: "alice" };
+  const params = { config: config(), userId: "alice" };
   for (let i = 0; i < 3; i++) await assert.rejects(submitRun(app, params), /Queue unavailable/);
   assert.equal(rows.length, 3);
   assert.ok(rows.every(row => row.status === "fail"));
@@ -257,14 +260,14 @@ test("queue submission failure ends the queued run and frees its capacity", asyn
 
 test("an ambiguous queue error cannot free a run already claimed by a worker", async () => {
   const { app, rows, events } = createSubmitApp({ enqueueFails: true, claimBeforeEnqueueError: true });
-  await assert.rejects(submitRun(app, { accessTokenId: randomUUID(), config: config(), userId: "alice" }), /Queue unavailable/);
+  await assert.rejects(submitRun(app, { config: config(), userId: "alice" }), /Queue unavailable/);
   assert.equal(rows[0]!.status, "running");
   assert.equal(events.length, 0);
 });
 
 test("missing or invalid fleet limits reject submission before creating a run", async () => {
   const { app, rows, jobs } = createSubmitApp();
-  const params = { accessTokenId: randomUUID(), config: config(), userId: "alice" };
+  const params = { config: config(), userId: "alice" };
   try {
     delete process.env["FLEET_MAX_ACTIVE_RUNS"];
     await assert.rejects(submitRun(app, params), /FLEET_MAX_ACTIVE_RUNS/);

@@ -11,11 +11,10 @@
 
 import { EventEmitter } from "node:events";
 import { Readable } from "node:stream";
-import type { ObservedToolCall, ChannelStats, CallMetadata, ComponentLatency } from "@vent/shared";
-import { resample } from "@vent/voice";
+import { PendingBuffer, resample, type ObservedToolCall, type ChannelStats, type CallMetadata, type ComponentLatency } from "@vent/shared";
 
 /** What an adapter sends while the caller is silent. */
-export type ComfortNoiseMode = "noise" | "silence" | "none";
+export type ComfortNoiseMode = "noise" | "silence";
 
 /** Peak of the comfort noise, about -30 dBFS. */
 const COMFORT_NOISE_AMPLITUDE = 400;
@@ -34,12 +33,6 @@ export interface AudioChannelEvents {
   toolCallActive: (active: boolean) => void;
 }
 
-export interface SendAudioOptions {
-  /** When true, skip send guards (silence padding, mark await, clear).
-   *  Reserved for low-level sends where timing matters. */
-  raw?: boolean;
-}
-
 export interface LiveCallRecording {
   pcm: Readable;
   finalize(): Promise<void>;
@@ -47,14 +40,18 @@ export interface LiveCallRecording {
   cleanup(): Promise<void>;
 }
 
+/** One stretch of speech as the platform recorded it. A turn may arrive in several pieces. */
+export interface PlatformUtterance {
+  role: "caller" | "agent";
+  text: string;
+}
+
 export interface AudioChannel {
   connect(): Promise<void>;
   /** Send raw PCM audio to the agent (16-bit 24kHz mono) */
-  sendAudio(pcm: Buffer, opts?: SendAudioOptions): void | Promise<void>;
+  sendAudio(pcm: Buffer): void | Promise<void>;
   /** Start sending low-level comfort noise to keep the line active during processing. */
   startComfortNoise?(): void;
-  /** Stop comfort noise. */
-  stopComfortNoise?(): void;
   /** Flush any buffered audio, add silence tail, and resume comfort noise.
    *  Call after all sendAudio() calls for a turn are complete. */
   flushAudioBuffer?(): Promise<void>;
@@ -66,14 +63,14 @@ export interface AudioChannel {
   getCallData?(): Promise<ObservedToolCall[]>;
   /** Get platform call metadata (cost, ended reason, recording, analysis) after call ends. */
   getCallMetadata?(): Promise<CallMetadata | null>;
-  /** Get per-turn component latency breakdown (STT/LLM/TTS) from platform events. */
+  /** Get the platform's component latencies (STT/LLM/TTS) for the call; the result shows their means. */
   getComponentTimings?(): ComponentLatency[];
   /** Get a live mixed PCM stream so callers can upload while the call is still in progress. */
   getLiveCallRecording?(): LiveCallRecording | null;
   /** Drop any local recording capture state when a fallback artifact is not needed. */
   discardCallRecording?(): Promise<void>;
-  /** Get platform's own STT transcripts for cross-referencing with Vent's STT. */
-  getTranscripts?(): Array<{ turnIndex: number; text: string }>;
+  /** What the platform recorded, in call order: its STT of the caller, and the text the agent's LLM wrote. */
+  getTranscripts?(): PlatformUtterance[];
   /** Whether this adapter emits platformEndOfTurn events.
    *  When true, collectUntilEndOfTurn can defer to the platform signal over VAD. */
   hasPlatformEndOfTurn?: boolean;
@@ -137,8 +134,6 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
   private _audioDrainRunning = false;
   private _audioDrainNotify: (() => void) | null = null;
   private _audioDrainStopping = false;
-  protected _connectTimestampMs = 0;
-  protected _connectMonotonicMs = 0;
 
   /** Input sample rate for all adapters (16-bit mono PCM). */
   static readonly INPUT_SAMPLE_RATE = 24000;
@@ -157,9 +152,8 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
   /** Monotonic clock for self-correcting pacing (Pipecat _write_audio_sleep). */
   private _nextSendTime = 0;
 
-  /** What to send while the caller is silent: faint noise (default), digital
-   *  silence (platforms that hear any noise as the caller talking), or nothing
-   *  (transports that keep the line alive themselves). */
+  /** What to send while the caller is silent: faint noise (default) or digital
+   *  silence (platforms that hear any noise as the caller talking). */
   protected comfortNoise: ComfortNoiseMode = "noise";
   private _comfortNoiseOn = false;
   /** Incremented to end the running comfort-noise loop. */
@@ -181,10 +175,10 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
    * as fixed-size frames via writeAudioFrame(). Safe to call with any buffer
    * size, any number of times (Pipecat-style).
    */
-  sendAudio(pcm: Buffer, opts?: SendAudioOptions): void {
+  sendAudio(pcm: Buffer): void {
     this.stopComfortNoise();
     this._stats.bytesSent += pcm.length;
-    this.captureCallerAudio(pcm, performance.now() - this._connectMonotonicMs);
+    this._recordingCapture.append("caller", pcm);
 
     // Resample input → output rate
     const resampled = resample(pcm, BaseAudioChannel.INPUT_SAMPLE_RATE, this.outputSampleRate);
@@ -234,7 +228,7 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
     const silenceSamples = Math.floor(this.outputSampleRate * 0.5);
     const silence = new Int16Array(silenceSamples);
     const silencePcm = Buffer.from(silence.buffer, silence.byteOffset, silence.byteLength);
-    this.captureCallerAudio(silencePcm, performance.now() - this._connectMonotonicMs);
+    this._recordingCapture.append("caller", silencePcm);
     this._audioQueue.push({ samples: silence, sampleRate: this.outputSampleRate });
 
     // Signal drain loop to exit after processing remaining queue
@@ -258,7 +252,7 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
    * Runs until the caller speaks (sendAudio) or stopComfortNoise().
    */
   startComfortNoise(): void {
-    if (this.comfortNoise === "none" || this._comfortNoiseOn) return;
+    if (this._comfortNoiseOn) return;
     this._comfortNoiseOn = true;
     const run = ++this._comfortNoiseRun;
     const frameSamples = Math.round((this.outputSampleRate * this.frameDurationMs) / 1000);
@@ -272,7 +266,7 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
       try {
         while (run === this._comfortNoiseRun && this.connected) {
           const frame = this.comfortNoise === "silence" ? silence : noiseFrame(frameSamples);
-          await this.writeComfortNoiseFrame(frame, this.outputSampleRate);
+          await this.writeAudioFrame(frame, this.outputSampleRate);
           if (!clockPaced) continue;
           next += this.frameDurationMs;
           const wait = next - performance.now();
@@ -291,12 +285,6 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
     this._comfortNoiseRun++;
     // Drop noise the transport already buffered so speech isn't queued behind it.
     this.clearTransportQueue();
-  }
-
-  /** Send one comfort-noise frame. Override when writeAudioFrame() also does
-   *  per-turn bookkeeping that noise must not touch. */
-  protected writeComfortNoiseFrame(samples: Int16Array, sampleRate: number): Promise<void> {
-    return this.writeAudioFrame(samples, sampleRate);
   }
 
   /** Clear both the audio buffer/queue AND the transport's internal queue.
@@ -358,17 +346,12 @@ export abstract class BaseAudioChannel extends EventEmitter implements AudioChan
     })();
   }
 
-  protected enableRecordingCapture(): void {
-    // Recording capture is always available so the live upload path can
-    // initialize before or immediately after connect without adapter-specific setup.
-  }
-
-  protected captureCallerAudio(pcm: Buffer, _startMs: number): void {
-    this._recordingCapture.append("caller", pcm);
-  }
-
-  protected captureAgentAudio(pcm: Buffer, _startMs: number): void {
-    this._recordingCapture.append("agent", pcm);
+  /** Hand agent audio arriving at `sampleRate` to listeners and the recording, as 24kHz PCM. */
+  protected receiveAgentAudio(pcm: Buffer, sampleRate: number): void {
+    this._stats.bytesReceived += pcm.length;
+    const pcm24k = resample(pcm, sampleRate, BaseAudioChannel.INPUT_SAMPLE_RATE);
+    this._recordingCapture.append("agent", pcm24k);
+    this.emit("audio", pcm24k);
   }
 
   getLiveCallRecording(): LiveCallRecording | null {
@@ -385,8 +368,8 @@ const SILENCE_AMPLITUDE_THRESHOLD = 200;
 
 /**
  * Pipecat-style call recording: two in-memory byte buffers kept in sync
- * via "pad-before-append". Mixed audio is streamed live when requested,
- * otherwise a post-call WAV can still be rendered from the mixed output.
+ * via "pad-before-append". Mixed audio is buffered until the live recording
+ * stream is requested, then streamed through it.
  */
 class CallRecordingCapture {
   private callerChunks = new PendingBuffer();
@@ -397,7 +380,7 @@ class CallRecordingCapture {
   private callerSpeaking = false;
   private agentSpeaking = false;
   private finalized = false;
-  private liveRecording: LiveRecordingStream | null = null;
+  private liveRecording: LiveRecordingReadable | null = null;
 
   append(role: CallSide, pcm: Buffer): void {
     if (this.finalized || pcm.length === 0) return;
@@ -437,7 +420,7 @@ class CallRecordingCapture {
 
   getLiveRecording(): LiveCallRecording {
     if (!this.liveRecording) {
-      this.liveRecording = new LiveRecordingStream();
+      this.liveRecording = new LiveRecordingReadable();
       const bufferedMixed = this.mixedChunks.takeAll();
       if (bufferedMixed.length > 0) {
         this.liveRecording.enqueue(bufferedMixed);
@@ -445,7 +428,7 @@ class CallRecordingCapture {
     }
 
     return {
-      pcm: this.liveRecording.readable,
+      pcm: this.liveRecording,
       finalize: async () => {
         this.finalizeOutput();
       },
@@ -504,55 +487,6 @@ class CallRecordingCapture {
   }
 }
 
-class PendingBuffer {
-  private chunks: Buffer[] = [];
-  private totalBytes = 0;
-
-  get byteLength(): number {
-    return this.totalBytes;
-  }
-
-  append(chunk: Buffer): void {
-    if (chunk.length === 0) return;
-    this.chunks.push(chunk);
-    this.totalBytes += chunk.length;
-  }
-
-  take(byteLength: number): Buffer {
-    if (byteLength <= 0 || this.totalBytes === 0) return Buffer.alloc(0);
-
-    const parts: Buffer[] = [];
-    let remaining = Math.min(byteLength, this.totalBytes);
-
-    while (remaining > 0 && this.chunks.length > 0) {
-      const head = this.chunks[0]!;
-      if (head.length <= remaining) {
-        parts.push(head);
-        this.chunks.shift();
-        this.totalBytes -= head.length;
-        remaining -= head.length;
-        continue;
-      }
-
-      parts.push(head.subarray(0, remaining));
-      this.chunks[0] = head.subarray(remaining);
-      this.totalBytes -= remaining;
-      remaining = 0;
-    }
-
-    return Buffer.concat(parts);
-  }
-
-  takeAll(): Buffer {
-    return this.take(this.totalBytes);
-  }
-
-  clear(): void {
-    this.chunks = [];
-    this.totalBytes = 0;
-  }
-}
-
 class LiveRecordingReadable extends Readable {
   private queued: Buffer[] = [];
   private ended = false;
@@ -605,26 +539,6 @@ class LiveRecordingReadable extends Readable {
       this.streamClosed = true;
       this.push(null);
     }
-  }
-}
-
-class LiveRecordingStream {
-  readonly readable = new LiveRecordingReadable();
-
-  enqueue(chunk: Buffer): void {
-    this.readable.enqueue(chunk);
-  }
-
-  finish(): void {
-    this.readable.finish();
-  }
-
-  abort(): void {
-    this.readable.abort();
-  }
-
-  cleanup(): void {
-    this.readable.cleanup();
   }
 }
 
