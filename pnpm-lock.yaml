@@ -250,25 +250,6 @@ importers:
         specifier: ^5.7.0
         version: 5.9.3
 
-  demos/safetyspect-server:
-    dependencies:
-      express:
-        specifier: ^4.21.0
-        version: 4.22.3
-      postgres:
-        specifier: ^3.4.5
-        version: 3.4.8
-      retell-sdk:
-        specifier: ^5.10.3
-        version: 5.66.1
-    devDependencies:
-      tsx:
-        specifier: 'catalog:'
-        version: 4.21.0
-      typescript:
-        specifier: 'catalog:'
-        version: 5.9.3
-
   packages/adapters:
     dependencies:
       '@elevenlabs/elevenlabs-js':
@@ -435,6 +416,25 @@ importers:
         specifier: workspace:*
         version: link:../shared
     devDependencies:
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  platform-demos/demo-agents:
+    dependencies:
+      express:
+        specifier: ^4.21.0
+        version: 4.22.3
+      postgres:
+        specifier: ^3.4.5
+        version: 3.4.8
+      retell-sdk:
+        specifier: ^5.10.3
+        version: 5.66.1
+    devDependencies:
+      tsx:
+        specifier: 'catalog:'
+        version: 4.21.0
       typescript:
         specifier: 'catalog:'
         version: 5.9.3

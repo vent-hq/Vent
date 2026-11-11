@@ -6,17 +6,17 @@ packages and are not published. All business data is fictional.
 
 ## What runs where
 
-- `safetyspect-server/`: shared customer lookup, availability, booking and
+- `demo-agents/`: shared customer lookup, availability, booking and
   cancellation endpoints. Deployed as Fly app `vent-demo-backend`.
-- `postgres/`: dedicated Fly app `vent-demo-db`, with one Machine and a persistent
+- `demo-db/`: dedicated Fly app `vent-demo-db`, with one Machine and a persistent
   volume. Database: `vent_demo`. It is separate from Vent's production database.
   It has no public database port; the backend connects over Fly's private network.
 - `livekit/`: TypeScript agent, configured for Fly app `vent-demo-livekit`. It
   registers as `safetyspect-ts` and calls the same HTTP business tools as the other
   platforms. Its Dockerfile contains no database file.
-- `safetyspect-server/scripts/`: create/update the hosted Bland, Vapi, Retell and
+- `demo-agents/scripts/`: create/update the hosted Bland, Vapi, Retell and
   ElevenLabs agents through their platform APIs. They use the shared backend.
-- `suites/`: one baseline caller scenario per platform. It looks up James Chen,
+- `demo-suites/`: one baseline caller scenario per platform. It looks up James Chen,
   asks about availability, and declines to book, so repeated baseline calls do
   not consume appointment slots.
 
@@ -59,8 +59,8 @@ Keep the resulting IDs in `dev` before running calls or repeating setup.
 From the root, deploy existing demo apps with:
 
 ```bash
-fly deploy . --config demos/postgres/fly.toml --remote-only --ha=false
-fly deploy . --config demos/safetyspect-server/fly.toml --remote-only --ha=false
+fly deploy . --config platform-demos/demo-db/fly.toml --remote-only --ha=false
+fly deploy . --config platform-demos/demo-agents/fly.toml --remote-only --ha=false
 fly deploy . --config demos/livekit/fly.toml --remote-only --ha=false
 ```
 
@@ -83,7 +83,7 @@ doppler run --project vent --config dev -- pnpm dev:docker
 doppler run --project vent --config dev -- env \
   VENT_API_URL=http://127.0.0.1:3001 \
   VENT_ACCESS_TOKEN= VENT_REFRESH_TOKEN=vent_010101010101010101010101010101010101010101010101 \
-  node packages/pub-cli/dist/index.mjs run -f demos/suites/elevenlabs.json
+  node packages/pub-cli/dist/index.mjs run -f platform-demos/demo-suites/elevenlabs.json
 ```
 
 Select `bland.json`, `vapi.json`, `retell.json` or `livekit.json` for the other

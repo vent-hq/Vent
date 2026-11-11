@@ -2,10 +2,10 @@ FROM node:22-slim
 RUN corepack enable
 WORKDIR /app
 COPY pnpm-workspace.yaml package.json pnpm-lock.yaml .npmrc ./
-COPY demos/safetyspect-server/package.json demos/safetyspect-server/package.json
+COPY platform-demos/demo-agents/package.json platform-demos/demo-agents/package.json
 RUN pnpm install --frozen-lockfile --filter @vent/demo-backend...
-COPY demos/safetyspect-server demos/safetyspect-server
-WORKDIR /app/demos/safetyspect-server
+COPY platform-demos/demo-agents platform-demos/demo-agents
+WORKDIR /app/platform-demos/demo-agents
 ENV PORT=3001
 EXPOSE 3001
 CMD ["sh", "-c", "node src/seed.js && exec node src/index.js"]

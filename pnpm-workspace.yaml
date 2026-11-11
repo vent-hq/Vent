@@ -2,6 +2,7 @@ packages:
   - "apps/*"
   - "packages/*"
   - "demos/*"
+  - "platform-demos/*"
 
 catalog:
   # Toolchain
