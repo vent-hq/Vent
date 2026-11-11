@@ -1,6 +1,7 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { eq, and } from "drizzle-orm";
 import { schema } from "@vent/db";
+import { buildRunOutput } from "@vent/shared";
 import { subscribeToRun } from "../lib/run-subscribers.js";
 import { finalizeRun } from "../lib/finalize-run.js";
 import { RunSubmitSchema, submitRun, SubmitRunConfigError, FleetCapacityError } from "../lib/run-submit.js";
@@ -19,7 +20,7 @@ export async function runRoutes(app: FastifyInstance) {
 
   // A CLI waits on its run's stream until run_complete, so the stream never
   // ends by itself and would hold shutdown open. End them first: the CLI
-  // reconnects to another API machine and replays the events it missed.
+  // reconnects to another API machine and gets the result from the run row.
   const openStreams = new Set<() => void>();
   let closing = false;
   app.addHook("preClose", async () => {
@@ -46,7 +47,6 @@ export async function runRoutes(app: FastifyInstance) {
     let result;
     try {
       result = await submitRun(app, {
-        accessTokenId: request.accessTokenId!,
         userId: request.userId!,
         config: parsed.data.config,
         idempotencyKey: parsed.data.idempotency_key,
@@ -69,20 +69,25 @@ export async function runRoutes(app: FastifyInstance) {
     return reply.status(201).send(result);
   });
 
-  // --- Stream run events (SSE) ---
+  const TERMINAL_STATUSES = ["pass", "fail", "cancelled"];
+  const loadRun = async (id: string, userId: string) => {
+    const [run] = await app.db
+      .select()
+      .from(schema.runs)
+      .where(and(eq(schema.runs.id, id), eq(schema.runs.user_id, userId)))
+      .limit(1);
+    return run;
+  };
+
+  // --- Stream a run: live progress, then the result (SSE) ---
   app.get<{ Params: { id: string } }>("/runs/:id/stream", {
     ...accessTokenPreHandler,
     config: { rateLimit: { max: 300, timeWindow: "1 minute", keyGenerator: userOrIpKey } },
   }, async (request, reply) => {
     const { id } = request.params;
+    const userId = request.userId!;
 
-    const [run] = await app.db
-      .select({ id: schema.runs.id, status: schema.runs.status })
-      .from(schema.runs)
-      .where(and(eq(schema.runs.id, id), eq(schema.runs.user_id, request.userId!)))
-      .limit(1);
-
-    if (!run) return reply.status(404).send({ error: "Run not found" });
+    if (!(await loadRun(id, userId))) return reply.status(404).send({ error: "Run not found" });
 
     reply.raw.writeHead(200, {
       "Content-Type": "text/event-stream",
@@ -97,24 +102,14 @@ export async function runRoutes(app: FastifyInstance) {
       reply.raw.write(`data: ${JSON.stringify(event)}\n\n`);
     };
 
-    // Subscribe FIRST, then replay history. Without this ordering, an event
-    // published between the history SELECT and subscribe is lost — the
-    // runner-callback for short-lived runs frequently lands in that window,
-    // leaving the CLI hanging forever. We buffer live events arriving during
-    // history replay and drain them afterwards, deduplicating by event id.
-    // The shared subscriber (run-subscribers.ts) is one IORedis connection
-    // across all SSE clients on this instance — previously we opened one
-    // connection per client, which exhausted Upstash limits under load.
-    const seenIds = new Set<string | number>();
-    const bufferedDuringHistory: Record<string, unknown>[] = [];
-    let historyReplayed = false;
     let streamEnded = false;
     let unsubscribe: (() => void) | null = null;
-
+    let heartbeat: ReturnType<typeof setInterval> | null = null;
     const finish = () => {
       if (streamEnded) return;
       streamEnded = true;
       openStreams.delete(finish);
+      if (heartbeat) clearInterval(heartbeat);
       unsubscribe?.();
       reply.raw.end();
     };
@@ -122,137 +117,45 @@ export async function runRoutes(app: FastifyInstance) {
     if (closing) return finish();
     openStreams.add(finish);
 
-    const handleEvent = (event: Record<string, unknown>) => {
-      // Hard guard: once finish() has been called the underlying stream is
-      // ended. Any further write() throws "write after end". Drain loops
-      // and live handlers can both invoke handleEvent so check here too.
-      if (streamEnded) return;
-      const eid =
-        typeof event.id === "number" || typeof event.id === "string"
-          ? event.id
-          : null;
-      if (eid != null) {
-        if (seenIds.has(eid)) return;
-        seenIds.add(eid);
+    // The run row holds the only copy of the result: send it and end the stream.
+    let completing = false;
+    const complete = async () => {
+      if (completing || streamEnded) return;
+      completing = true;
+      const run = await loadRun(id, userId);
+      if (run && !streamEnded) {
+        write({ run_id: id, event_type: "run_complete", result: buildRunOutput(run) });
       }
-      write(event);
-      if (event.event_type === "run_complete") {
-        finish();
-      }
+      finish();
     };
 
+    // Subscribe before reading the run's status: a run that ends between the
+    // read and the subscribe would otherwise never reach this client. Short
+    // runs often end before the CLI connects; a CLI that reconnects (API
+    // deploy, network drop) gets the result the same way.
     unsubscribe = await subscribeToRun(id, (message) => {
       try {
         const event = JSON.parse(message) as Record<string, unknown>;
-        if (!historyReplayed) {
-          bufferedDuringHistory.push(event);
-        } else {
-          handleEvent(event);
-        }
+        if (event.event_type === "run_complete") void complete();
+        else if (!streamEnded) write(event);
       } catch { /* ignore malformed */ }
     });
-    // Shutdown can end the stream while it is still being set up.
-    if (streamEnded) return unsubscribe();
-
-    // Replay historical events from DB
-    const history = await app.db
-      .select()
-      .from(schema.runEvents)
-      .where(eq(schema.runEvents.run_id, id))
-      .orderBy(schema.runEvents.created_at);
     if (streamEnded) return;
 
-    let historyTerminal = false;
-    for (const evt of history) {
-      seenIds.add(evt.id);
-      write({
-        id: evt.id,
-        run_id: evt.run_id,
-        event_type: evt.event_type,
-        message: evt.message,
-        metadata_json: evt.metadata_json,
-        created_at: evt.created_at.toISOString(),
-      });
-      if (evt.event_type === "run_complete") {
-        historyTerminal = true;
-      }
-    }
+    const run = await loadRun(id, userId);
+    if (run && TERMINAL_STATUSES.includes(run.status)) return complete();
 
-    // History is replayed. Drain anything that arrived in the gap (deduped
-    // by id), then switch to live-mode. handleEvent is reentrancy-safe:
-    // a terminal buffered event triggers finish() and subsequent calls
-    // become no-ops via the streamEnded guard.
-    for (const buffered of bufferedDuringHistory) {
-      if (streamEnded) break;
-      handleEvent(buffered);
-    }
-    bufferedDuringHistory.length = 0;
-    historyReplayed = true;
-
-    // If finish() already ran (terminal event in history or buffered drain),
-    // skip heartbeat / close-listener setup entirely — they would otherwise
-    // arm a 30s interval against an ended stream.
-    if (streamEnded) return;
-
-    // If history already contains a terminal event (or the run is terminal
-    // in DB and never emitted a terminal event — shouldn't happen but defends
-    // against pre-event-system runs), close immediately.
-    if (historyTerminal || ["pass", "fail", "cancelled"].includes(run.status)) {
-      const [latest] = await app.db
-        .select({ status: schema.runs.status })
-        .from(schema.runs)
-        .where(eq(schema.runs.id, id))
-        .limit(1);
-      if (latest && ["pass", "fail", "cancelled"].includes(latest.status)) {
-        finish();
-        return;
-      }
-    }
-
-    const heartbeat = setInterval(() => {
-      // Defensive: if the stream has been closed since this interval armed,
-      // a write throws "write after end". Stop the interval first.
-      if (streamEnded) {
-        clearInterval(heartbeat);
-        return;
-      }
-      reply.raw.write(": heartbeat\n\n");
+    heartbeat = setInterval(() => {
+      if (!streamEnded) reply.raw.write(": heartbeat\n\n");
     }, 30_000);
-
-    request.raw.on("close", () => {
-      clearInterval(heartbeat);
-      finish();
-    });
+    request.raw.on("close", finish);
   });
 
-  // ----- helper used below -----
-
-  // --- Get run status (JSON) ---
+  // --- Get a run's result: the same JSON the stream ends with ---
   app.get<{ Params: { id: string } }>("/runs/:id", accessTokenPreHandler, async (request, reply) => {
-    const [run] = await app.db
-      .select()
-      .from(schema.runs)
-      .where(and(eq(schema.runs.id, request.params.id), eq(schema.runs.user_id, request.userId!)))
-      .limit(1);
-
+    const run = await loadRun(request.params.id, request.userId!);
     if (!run) return reply.status(404).send({ error: "Run not found" });
-
-    const results = await app.db
-      .select()
-      .from(schema.scenarioResults)
-      .where(eq(schema.scenarioResults.run_id, run.id));
-
-    return reply.send({
-      id: run.id,
-      status: run.status,
-      created_at: run.created_at,
-      started_at: run.started_at,
-      finished_at: run.finished_at,
-      duration_ms: run.duration_ms,
-      error_text: run.error_text,
-      aggregate: run.aggregate_json,
-      results: results.map((r) => r.metrics_json),
-    });
+    return reply.send(buildRunOutput(run));
   });
 
   // --- Stop/cancel a run ---

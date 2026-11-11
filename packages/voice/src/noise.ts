@@ -3,12 +3,20 @@
  * All audio is 16-bit signed PCM, 24kHz mono.
  */
 
-const SAMPLE_RATE = 24000;
-const MAX_SAMPLE = 32767;
-const MIN_SAMPLE = -32768;
+import { SAMPLE_RATE, clamp16, pcmRms } from "@vent/shared";
 
-function clamp(value: number): number {
-  return Math.max(MIN_SAMPLE, Math.min(MAX_SAMPLE, Math.round(value)));
+/** Scale a float signal to the target RMS and encode it as Int16LE PCM. */
+function toPcmAtRms(raw: Float64Array, rmsLevel: number): Buffer {
+  let sumSq = 0;
+  for (let i = 0; i < raw.length; i++) sumSq += raw[i]! * raw[i]!;
+  const currentRms = Math.sqrt(sumSq / raw.length);
+  const scale = currentRms > 0 ? rmsLevel / currentRms : 0;
+
+  const buf = Buffer.alloc(raw.length * 2);
+  for (let i = 0; i < raw.length; i++) {
+    buf.writeInt16LE(clamp16(raw[i]! * scale), i * 2);
+  }
+  return buf;
 }
 
 /**
@@ -20,7 +28,7 @@ export function generateWhiteNoise(durationMs: number, rmsLevel = 3000): Buffer 
   const buf = Buffer.alloc(numSamples * 2);
 
   for (let i = 0; i < numSamples; i++) {
-    const sample = clamp((Math.random() * 2 - 1) * rmsLevel * Math.SQRT2);
+    const sample = clamp16((Math.random() * 2 - 1) * rmsLevel * Math.SQRT2);
     buf.writeInt16LE(sample, i * 2);
   }
 
@@ -34,7 +42,6 @@ export function generateWhiteNoise(durationMs: number, rmsLevel = 3000): Buffer 
  */
 export function generateBabbleNoise(durationMs: number, rmsLevel = 3000): Buffer {
   const numSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  const buf = Buffer.alloc(numSamples * 2);
 
   // Generate white noise first
   const raw = new Float64Array(numSamples);
@@ -54,17 +61,7 @@ export function generateBabbleNoise(durationMs: number, rmsLevel = 3000): Buffer
     filtered[i] = runningSum / count;
   }
 
-  // Normalize to target RMS
-  let sumSq = 0;
-  for (let i = 0; i < numSamples; i++) sumSq += filtered[i]! * filtered[i]!;
-  const currentRms = Math.sqrt(sumSq / numSamples);
-  const scale = currentRms > 0 ? rmsLevel / currentRms : 0;
-
-  for (let i = 0; i < numSamples; i++) {
-    buf.writeInt16LE(clamp(filtered[i]! * scale), i * 2);
-  }
-
-  return buf;
+  return toPcmAtRms(filtered, rmsLevel);
 }
 
 /**
@@ -73,7 +70,6 @@ export function generateBabbleNoise(durationMs: number, rmsLevel = 3000): Buffer
  */
 export function generatePinkNoise(durationMs: number, rmsLevel = 3000): Buffer {
   const numSamples = Math.floor((SAMPLE_RATE * durationMs) / 1000);
-  const buf = Buffer.alloc(numSamples * 2);
   const octaves = 8;
 
   // Voss-McCartney: maintain running values per octave
@@ -98,17 +94,7 @@ export function generatePinkNoise(durationMs: number, rmsLevel = 3000): Buffer {
     raw[i] = sum / (octaves + 1);
   }
 
-  // Normalize to target RMS
-  let sumSq = 0;
-  for (let i = 0; i < numSamples; i++) sumSq += raw[i]! * raw[i]!;
-  const currentRms = Math.sqrt(sumSq / numSamples);
-  const scale = currentRms > 0 ? rmsLevel / currentRms : 0;
-
-  for (let i = 0; i < numSamples; i++) {
-    buf.writeInt16LE(clamp(raw[i]! * scale), i * 2);
-  }
-
-  return buf;
+  return toPcmAtRms(raw, rmsLevel);
 }
 
 /**
@@ -124,22 +110,10 @@ export function mixAudio(clean: Buffer, noise: Buffer, snrDb: number): Buffer {
   const numSamples = clean.length / 2;
   const mixed = Buffer.alloc(clean.length);
 
-  // Compute RMS of clean signal
-  let cleanSumSq = 0;
-  for (let i = 0; i < numSamples; i++) {
-    const s = clean.readInt16LE(i * 2);
-    cleanSumSq += s * s;
-  }
-  const cleanRms = Math.sqrt(cleanSumSq / numSamples);
-
-  // Compute RMS of noise (looping if shorter than clean)
+  const cleanRms = pcmRms(clean);
+  // Noise loops if shorter than clean
   const noiseSamples = noise.length / 2;
-  let noiseSumSq = 0;
-  for (let i = 0; i < noiseSamples; i++) {
-    const s = noise.readInt16LE(i * 2);
-    noiseSumSq += s * s;
-  }
-  const noiseRms = Math.sqrt(noiseSumSq / noiseSamples);
+  const noiseRms = pcmRms(noise);
 
   if (noiseRms === 0) {
     clean.copy(mixed);
@@ -153,7 +127,7 @@ export function mixAudio(clean: Buffer, noise: Buffer, snrDb: number): Buffer {
     const cleanSample = clean.readInt16LE(i * 2);
     const noiseIdx = i % noiseSamples;
     const noiseSample = noise.readInt16LE(noiseIdx * 2);
-    mixed.writeInt16LE(clamp(cleanSample + noiseSample * scaleFactor), i * 2);
+    mixed.writeInt16LE(clamp16(cleanSample + noiseSample * scaleFactor), i * 2);
   }
 
   return mixed;

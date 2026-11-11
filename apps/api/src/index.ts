@@ -1,9 +1,9 @@
 import { buildApp } from "./app.js";
-import { requireEnv } from "@vent/shared";
+import { envPositiveInt, requireEnv } from "@vent/shared";
 
 async function main() {
   const app = await buildApp();
-  const port = parseInt(process.env["API_PORT"] ?? "3000", 10);
+  const port = envPositiveInt("API_PORT", 3000);
   const host = requireEnv("API_HOST");
 
   // While shutting down, close each connection as soon as its response is

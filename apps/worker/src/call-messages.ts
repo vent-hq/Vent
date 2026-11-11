@@ -1,7 +1,6 @@
 // IPC protocol between the worker (parent) and a call process (child).
 // Each call runs in its own child process; see call-supervisor.ts.
 
-import type { ConversationCallResult } from "@vent/shared";
 import type { ExecuteCallOpts, ExecuteCallResult } from "@vent/runner/executor";
 
 /** Everything the child needs to place one call. Must be JSON-serializable. */
@@ -14,7 +13,6 @@ export type ParentMessage =
   | { type: "ping" };
 
 export type ChildMessage =
-  | { type: "call_complete"; result: ConversationCallResult }
   | { type: "result"; result: ExecuteCallResult }
   | { type: "error"; message: string }
   | { type: "pong" };

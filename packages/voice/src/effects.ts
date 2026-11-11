@@ -1,11 +1,10 @@
 /**
  * Audio effects pipeline — pure DSP on PCM 16-bit 24kHz mono buffers.
  * Simulates real-world audio conditions: speed, speakerphone, mic distance,
- * clarity, packet loss, jitter, and accent (via TTS voice selection).
+ * clarity, noise, packet loss and jitter.
  */
 
-import type { CallerAccent, CallerAudioEffects } from "@vent/shared";
-import { resample } from "./format.js";
+import { SAMPLE_RATE, clamp16, resample, type CallerAudioEffects } from "@vent/shared";
 import {
   generateBabbleNoise,
   generateWhiteNoise,
@@ -13,97 +12,13 @@ import {
   mixAudio,
 } from "./noise.js";
 
-const SAMPLE_RATE = 24000;
 const BYTES_PER_SAMPLE = 2;
-const MAX_SAMPLE = 32767;
-const MIN_SAMPLE = -32768;
-
-function clamp(value: number): number {
-  return Math.max(MIN_SAMPLE, Math.min(MAX_SAMPLE, Math.round(value)));
-}
-
-// ============================================================
-// Accent presets — Deepgram Aura-2 voice IDs
-// ============================================================
-
-export const ACCENT_VOICES: Record<CallerAccent, string> = {
-  // English accents
-  american: "aura-2-thalia-en",
-  british: "aura-2-draco-en",
-  australian: "aura-2-hyperion-en",
-  filipino: "aura-2-amalthea-en",
-
-  // Other languages
-  spanish_mexican: "aura-2-javier-es",
-  spanish_peninsular: "aura-2-nestor-es",
-  spanish_colombian: "aura-2-celeste-es",
-  spanish_argentine: "aura-2-antonia-es",
-  german: "aura-2-julius-de",
-  french: "aura-2-hector-fr",
-  italian: "aura-2-elio-it",
-  dutch: "aura-2-sander-nl",
-  japanese: "aura-2-ebisu-ja",
-};
-
-/** Resolve an accent (validated against CALLER_ACCENTS) to a Deepgram voice ID. */
-export function resolveAccentVoiceId(accent: CallerAccent): string {
-  return ACCENT_VOICES[accent];
-}
-
-// ============================================================
-// Language defaults — ISO 639-1 → Deepgram Aura-2 voice ID
-// ============================================================
-
-export const LANGUAGE_DEFAULT_VOICES: Record<string, string> = {
-  en: "aura-2-thalia-en",
-  es: "aura-2-javier-es",
-  fr: "aura-2-hector-fr",
-  de: "aura-2-julius-de",
-  it: "aura-2-elio-it",
-  nl: "aura-2-sander-nl",
-  ja: "aura-2-ebisu-ja",
-};
-
-export const LANGUAGE_NAMES: Record<string, string> = {
-  en: "English",
-  es: "Spanish",
-  fr: "French",
-  de: "German",
-  it: "Italian",
-  nl: "Dutch",
-  ja: "Japanese",
-};
-
-/**
- * Resolve an ISO 639-1 language code to a default Deepgram voice ID.
- * Returns undefined if the language has no TTS voice available.
- */
-export function resolveLanguageVoiceId(language: string): string | undefined {
-  return LANGUAGE_DEFAULT_VOICES[language];
-}
-
-// ============================================================
-// Gender presets — English-only male/female toggle
-// ============================================================
-
-export const GENDER_VOICE_DEFAULTS: Record<"male" | "female", string> = {
-  female: "aura-2-thalia-en",
-  male: "aura-2-apollo-en",
-};
-
-export function resolveGenderVoiceId(gender: "male" | "female"): string {
-  return GENDER_VOICE_DEFAULTS[gender];
-}
-
-// ============================================================
-// DSP effects
-// ============================================================
 
 /**
  * Time-stretch via resampling. Speed > 1 = faster (fewer samples).
  * Shifts pitch proportionally — realistic for fast/slow talkers.
  */
-export function applySpeed(pcm: Buffer, speed: number): Buffer {
+function applySpeed(pcm: Buffer, speed: number): Buffer {
   if (speed === 1.0) return pcm;
   return resample(pcm, SAMPLE_RATE * speed, SAMPLE_RATE);
 }
@@ -112,7 +27,7 @@ export function applySpeed(pcm: Buffer, speed: number): Buffer {
  * Bandpass 300-3400 Hz — simulates telephone/speakerphone audio.
  * Cascaded single-pole IIR: high-pass at 300 Hz + low-pass at 3400 Hz.
  */
-export function applySpeakerphone(pcm: Buffer): Buffer {
+function applySpeakerphone(pcm: Buffer): Buffer {
   const numSamples = pcm.length / BYTES_PER_SAMPLE;
   const output = Buffer.alloc(pcm.length);
 
@@ -138,7 +53,7 @@ export function applySpeakerphone(pcm: Buffer): Buffer {
     // Low-pass: y[n] = y[n-1] + alpha * (x[n] - y[n-1])
     lpPrevY = lpPrevY + lpAlpha * (hpPrevY - lpPrevY);
 
-    output.writeInt16LE(clamp(lpPrevY), i * BYTES_PER_SAMPLE);
+    output.writeInt16LE(clamp16(lpPrevY), i * BYTES_PER_SAMPLE);
   }
 
   return output;
@@ -153,7 +68,7 @@ const MIC_DISTANCE_PROFILES = {
   far: { gainDb: -10, lpCutoff: 3000 },
 } as const;
 
-export function applyMicDistance(pcm: Buffer, distance: "close" | "normal" | "far"): Buffer {
+function applyMicDistance(pcm: Buffer, distance: "close" | "normal" | "far"): Buffer {
   if (distance === "close") return pcm;
 
   const profile = MIC_DISTANCE_PROFILES[distance];
@@ -169,7 +84,7 @@ export function applyMicDistance(pcm: Buffer, distance: "close" | "normal" | "fa
   for (let i = 0; i < numSamples; i++) {
     const x = pcm.readInt16LE(i * BYTES_PER_SAMPLE) * gain;
     lpPrevY = lpPrevY + lpAlpha * (x - lpPrevY);
-    output.writeInt16LE(clamp(lpPrevY), i * BYTES_PER_SAMPLE);
+    output.writeInt16LE(clamp16(lpPrevY), i * BYTES_PER_SAMPLE);
   }
 
   return output;
@@ -179,7 +94,7 @@ export function applyMicDistance(pcm: Buffer, distance: "close" | "normal" | "fa
  * Audio clarity degradation — low-pass filter + light noise.
  * clarity=1.0 = no effect, clarity=0.0 = heavily degraded.
  */
-export function applyClarity(pcm: Buffer, clarity: number): Buffer {
+function applyClarity(pcm: Buffer, clarity: number): Buffer {
   if (clarity >= 1.0) return pcm;
 
   const degradation = 1.0 - clarity;
@@ -200,7 +115,7 @@ export function applyClarity(pcm: Buffer, clarity: number): Buffer {
     let x = pcm.readInt16LE(i * BYTES_PER_SAMPLE);
     x += (Math.random() * 2 - 1) * noiseAmp;
     lpPrevY = lpPrevY + lpAlpha * (x - lpPrevY);
-    output.writeInt16LE(clamp(lpPrevY), i * BYTES_PER_SAMPLE);
+    output.writeInt16LE(clamp16(lpPrevY), i * BYTES_PER_SAMPLE);
   }
 
   return output;
@@ -210,7 +125,7 @@ export function applyClarity(pcm: Buffer, clarity: number): Buffer {
  * Simulated packet loss — zero out random 20ms chunks.
  * lossRate = fraction of chunks to drop (0.05 = 5%).
  */
-export function applyPacketLoss(pcm: Buffer, lossRate: number): Buffer {
+function applyPacketLoss(pcm: Buffer, lossRate: number): Buffer {
   if (lossRate <= 0) return pcm;
 
   const chunkSamples = Math.round((20 / 1000) * SAMPLE_RATE); // 20ms = 480 samples
@@ -230,7 +145,7 @@ export function applyPacketLoss(pcm: Buffer, lossRate: number): Buffer {
  * Simulated network jitter — insert random silence gaps between 20ms chunks.
  * jitterMs = max silence to insert before each chunk (uniform random 0 to jitterMs).
  */
-export function applyJitter(pcm: Buffer, jitterMs: number): Buffer {
+function applyJitter(pcm: Buffer, jitterMs: number): Buffer {
   if (jitterMs <= 0) return pcm;
 
   const chunkSamples = Math.round((20 / 1000) * SAMPLE_RATE);

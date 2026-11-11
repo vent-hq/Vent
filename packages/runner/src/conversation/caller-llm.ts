@@ -11,7 +11,6 @@
 
 import Anthropic from "@anthropic-ai/sdk";
 import type { CallerPersona } from "@vent/shared";
-import { LANGUAGE_NAMES } from "@vent/voice";
 
 // @ts-expect-error — esbuild inlines .txt files as strings via loader
 import SYSTEM_PROMPT from "./caller-system-prompt.txt";
@@ -97,6 +96,16 @@ function compilePersona(persona: CallerPersona): string {
     instructions.map((i) => `- ${i}`).join("\n")
   );
 }
+
+const LANGUAGE_NAMES: Record<string, string> = {
+  en: "English",
+  es: "Spanish",
+  fr: "French",
+  de: "German",
+  it: "Italian",
+  nl: "Dutch",
+  ja: "Japanese",
+};
 
 function compileLanguage(language: string): string {
   const name = LANGUAGE_NAMES[language] ?? language;

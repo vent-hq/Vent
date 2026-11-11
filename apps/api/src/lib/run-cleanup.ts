@@ -1,16 +1,9 @@
 import type { FastifyInstance } from "fastify";
 import { lt, and, sql } from "drizzle-orm";
 import { schema } from "@vent/db";
+import { envPositiveInt } from "@vent/shared";
 import { finalizeRun } from "./finalize-run.js";
 import { enqueueRun } from "./enqueue-run.js";
-
-function parseMsEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-  const parsed = Number(raw);
-  if (!Number.isFinite(parsed) || parsed <= 0) return fallback;
-  return Math.floor(parsed);
-}
 
 interface SweepLimits {
   stuckRunningMs: number;
@@ -94,10 +87,10 @@ async function sweepRuns(app: FastifyInstance, limits: SweepLimits): Promise<voi
 
 export function registerRunCleanup(app: FastifyInstance): void {
   const cleanupEnabled = (process.env["RUN_CLEANUP_ENABLED"] ?? "true") !== "false";
-  const CLEANUP_INTERVAL_MS = parseMsEnv("RUN_CLEANUP_INTERVAL_MS", 60_000);
+  const CLEANUP_INTERVAL_MS = envPositiveInt("RUN_CLEANUP_INTERVAL_MS", 60_000);
   const limits: SweepLimits = {
-    stuckRunningMs: parseMsEnv("RUN_STUCK_RUNNING_MS", 60 * 60_000),
-    stuckQueuedMs: parseMsEnv("RUN_STUCK_QUEUED_REMOTE_MS", 10 * 60_000),
+    stuckRunningMs: envPositiveInt("RUN_STUCK_RUNNING_MS", 60 * 60_000),
+    stuckQueuedMs: envPositiveInt("RUN_STUCK_QUEUED_REMOTE_MS", 10 * 60_000),
     unqueuedGraceMs: 30_000,
   };
   let cleanupInterval: ReturnType<typeof setInterval> | undefined;

@@ -19,22 +19,37 @@ import {
   type ListenLiveClient,
   type LiveTranscriptionEvent,
 } from "@deepgram/sdk";
-import type { TranscriptionResult } from "./types.js";
+import { SAMPLE_RATE } from "@vent/shared";
 
-export interface StreamingTranscriberConfig {
-  apiKeyEnv?: string;
-  sampleRate?: number;
-  model?: string;
-  /** ISO 639-1 language code for STT (e.g., "es", "fr"). Defaults to English if not set. */
-  language?: string;
+const MODEL = "nova-3";
+
+export interface TranscriptionResult {
+  text: string;
+  confidence: number;
+}
+
+/** Deepgram emits errors as plain objects ({ error, statusCode, ... }), not Error instances. */
+function describeDeepgramError(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (err && typeof err === "object") {
+    const { message, error, statusCode } = err as { message?: unknown; error?: unknown; statusCode?: unknown };
+    const text = typeof message === "string" ? message : error instanceof Error ? error.message : JSON.stringify(err);
+    return statusCode != null ? `${text} (status ${String(statusCode)})` : text;
+  }
+  return String(err);
+}
+
+/** Drop a connection without waiting for it. Disconnecting a socket that is
+ *  still opening fires an "error" event, which would crash the process if the
+ *  connection had no error listener left. */
+function discardConnection(conn: ListenLiveClient): void {
+  conn.removeAllListeners();
+  conn.on(LiveTranscriptionEvents.Error, () => {});
+  conn.disconnect();
 }
 
 export class StreamingTranscriber {
   private connection: ListenLiveClient | null = null;
-  private readonly apiKeyEnv: string;
-  private readonly sampleRate: number;
-  private readonly model: string;
-  private readonly language: string | undefined;
 
   /** Accumulated final transcript segments for the current turn. */
   private finalSegments: { text: string; confidence: number }[] = [];
@@ -57,17 +72,12 @@ export class StreamingTranscriber {
   /** Whether a reconnection is in progress. */
   private reconnecting = false;
 
-  constructor(config?: StreamingTranscriberConfig) {
-    this.apiKeyEnv = config?.apiKeyEnv ?? "DEEPGRAM_API_KEY";
-    this.sampleRate = config?.sampleRate ?? 24000;
-    this.model = config?.model ?? "nova-3";
-    this.language = config?.language;
-  }
+  constructor(private readonly language?: string) {}
 
   async connect(): Promise<void> {
-    const apiKey = process.env[this.apiKeyEnv];
+    const apiKey = process.env.DEEPGRAM_API_KEY;
     if (!apiKey) {
-      throw new Error(`Missing Deepgram API key (env: ${this.apiKeyEnv})`);
+      throw new Error("Missing Deepgram API key (env: DEEPGRAM_API_KEY)");
     }
 
     const deepgram = createClient(apiKey);
@@ -76,9 +86,9 @@ export class StreamingTranscriber {
       let settled = false;
       this.connection = deepgram.listen.live({
         encoding: "linear16",
-        sample_rate: this.sampleRate,
+        sample_rate: SAMPLE_RATE,
         channels: 1,
-        model: this.model,
+        model: MODEL,
         punctuate: true,
         // interim_results + utterance_end_ms is Deepgram's prescribed
         // end-of-utterance pattern for noisy audio. endpointing alone is
@@ -109,8 +119,7 @@ export class StreamingTranscriber {
       const rejectOnce = (err: unknown) => {
         if (settled) return;
         settled = true;
-        const msg = err instanceof Error ? err.message : String(err);
-        reject(new Error(`Deepgram streaming STT connection failed: ${msg}`));
+        reject(new Error(`Deepgram streaming STT connection failed: ${describeDeepgramError(err)}`));
       };
 
       this.connection.on(LiveTranscriptionEvents.Open, () => {
@@ -167,8 +176,7 @@ export class StreamingTranscriber {
       );
 
       this.connection.on(LiveTranscriptionEvents.Error, (err: unknown) => {
-        const msg = err instanceof Error ? err.message : String(err);
-        console.warn(`[STT] Deepgram error: ${msg}`);
+        console.warn(`[STT] Deepgram error: ${describeDeepgramError(err)}`);
         rejectOnce(err);
       });
 
@@ -253,7 +261,7 @@ export class StreamingTranscriber {
     }
 
     const segmentsBefore = this.finalSegments.length;
-    const audioSec = (this.bytesFed / 2 / this.sampleRate).toFixed(1);
+    const audioSec = (this.bytesFed / 2 / SAMPLE_RATE).toFixed(1);
     console.log(`[STT] finalize segments=${segmentsBefore} bytesFed=${this.bytesFed} (~${audioSec}s)`);
 
     const closeStreamAt = Date.now();
@@ -271,9 +279,8 @@ export class StreamingTranscriber {
         const c = this.connection;
         this.connection = null;
         if (c) {
-          c.removeAllListeners();
           try {
-            c.disconnect();
+            discardConnection(c);
           } catch {}
         }
         // Last-resort tail recovery: if a pending interim was never
@@ -350,8 +357,7 @@ export class StreamingTranscriber {
       if (this.connection.isConnected()) {
         this.connection.requestClose();
       }
-      this.connection.removeAllListeners();
-      this.connection.disconnect();
+      discardConnection(this.connection);
       this.connection = null;
     }
   }
@@ -361,11 +367,6 @@ export class StreamingTranscriber {
       clearInterval(this.keepAliveInterval);
       this.keepAliveInterval = null;
     }
-  }
-
-  /** Whether the connection is open and usable. */
-  get connected(): boolean {
-    return this.connection?.isConnected() ?? false;
   }
 
   /**

@@ -6,8 +6,10 @@ import { signCallback } from "@vent/shared";
 import { recordingRoutes } from "../../src/routes/recordings.js";
 
 mock.module("../../src/lib/rate-limit-redis.js", { namedExports: { createRateLimitRedis: () => undefined } });
+// Progress events a run-event callback published to CLI streams.
+const published: unknown[] = [];
 mock.module("../../src/lib/run-subscribers.js", { namedExports: {
-  broadcast() {},
+  broadcast(_runId: string, event: unknown) { published.push(event); },
   async subscribeToRun() { return () => {}; },
 } });
 let callbackRoutes: typeof import("../../src/routes/callback.js").callbackRoutes;
@@ -28,15 +30,10 @@ after(() => {
 
 async function createApp(trustProxy = false) {
   const app = Fastify({ trustProxy });
-  const rows: Record<string, unknown>[] = [];
-  app.decorate("db", { select: () => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) }),
-    insert: () => ({ values: (value: Record<string, unknown>) => ({
-    returning: async () => {
-      const row = { id: randomUUID(), created_at: new Date(), ...value };
-      rows.push(row);
-      return [row];
-    },
-  }) }) } as unknown as FastifyInstance["db"]);
+  published.length = 0;
+  app.decorate("db", {
+    select: () => ({ from: () => ({ where: () => ({ limit: async () => [] }) }) }),
+  } as unknown as FastifyInstance["db"]);
   app.addHook("preValidation", async request => {
     request.rawBody = JSON.stringify(request.body);
   });
@@ -61,7 +58,7 @@ async function createApp(trustProxy = false) {
   await app.register(runRoutes);
   await app.register(recordingRoutes);
   await app.ready();
-  return { app, rows };
+  return { app };
 }
 
 const submitFrom = (app: FastifyInstance, ip: string, token?: string) => app.inject({
@@ -103,7 +100,7 @@ test("one logged-in user shares a single submit budget across IPs", async () => 
 });
 
 test("worker callbacks stay authenticated without consuming the submission allowance", async () => {
-  const { app, rows } = await createApp();
+  const { app } = await createApp();
   const payload = JSON.stringify({ run_id: randomUUID(), event_type: "progress", message: "Call update" });
   try {
     for (let i = 0; i < 60; i++) {
@@ -113,7 +110,7 @@ test("worker callbacks stay authenticated without consuming the submission allow
       });
       assert.equal(response.statusCode, 200);
     }
-    assert.equal(rows.length, 60);
+    assert.equal(published.length, 60);
     for (let i = 0; i < 50; i++) {
       assert.equal((await app.inject({ method: "POST", url: "/runs/submit" })).statusCode, 401);
     }
@@ -121,20 +118,20 @@ test("worker callbacks stay authenticated without consuming the submission allow
     assert.equal((await app.inject({ method: "POST", url: "/internal/run-event", payload,
       headers: { "content-type": "application/json" },
     })).statusCode, 401);
-    assert.equal(rows.length, 60);
+    assert.equal(published.length, 60);
   } finally { await app.close(); }
 });
 
 test("a worker callback signature is only valid for the endpoint it was made for", async () => {
-  const { app, rows } = await createApp();
+  const { app } = await createApp();
   const payload = JSON.stringify({ run_id: randomUUID(), event_type: "progress", message: "Call update" });
   const signedForRunEvent = { "content-type": "application/json", ...signCallback("POST", "/internal/run-event", payload, secret) };
   try {
-    const moved = await app.inject({ method: "POST", url: "/internal/call-progress", payload, headers: signedForRunEvent });
+    const moved = await app.inject({ method: "POST", url: "/internal/run-failed", payload, headers: signedForRunEvent });
     assert.equal(moved.statusCode, 401);
     const withQuery = await app.inject({ method: "POST", url: "/internal/run-event?x=1", payload, headers: signedForRunEvent });
     assert.equal(withQuery.statusCode, 200);
-    assert.equal(rows.length, 1);
+    assert.equal(published.length, 1);
   } finally { await app.close(); }
 });
 

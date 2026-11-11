@@ -1,14 +1,14 @@
 import type { FastifyInstance, FastifyRequest } from "fastify";
 import { createStorageClient, verifyArtifactToken } from "@vent/artifacts";
+import { requireEnv } from "@vent/shared";
 
 export async function recordingRoutes(app: FastifyInstance) {
+  const secret = requireEnv("RUNNER_CALLBACK_SECRET");
+
   async function resolveRecordingDownloadUrl(
     token: string,
     request: FastifyRequest,
   ): Promise<string | null> {
-    const secret = process.env["RUNNER_CALLBACK_SECRET"] ?? "";
-    if (!secret) return null;
-
     const verified = verifyArtifactToken(token, secret);
     if (!verified) return null;
 

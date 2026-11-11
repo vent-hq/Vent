@@ -5,38 +5,33 @@
  */
 
 import { randomUUID } from "node:crypto";
-import type {
-  ConversationCallSpec,
-  ConversationCallResult,
-  RunAggregateV2,
-} from "@vent/shared";
-import { requireEnv } from "@vent/shared";
+import { isPlatformProvider, type ConversationCallSpec, type ConversationCallResult } from "@vent/shared";
 import { buildArtifactUrl, createArtifactToken, createStorageClient } from "@vent/artifacts";
 import { createAudioChannel, type AudioChannel, type AudioChannelConfig } from "@vent/adapters";
-import { runConversationCall } from "./conversation/index.js";
-
-export interface CallStartInfo {
-  call_name: string;
-}
+import { runConversationCall } from "./conversation/executor.js";
+import { buildPlatformTranscript } from "./conversation/platform-transcript.js";
 
 export interface ExecuteCallOpts {
   callSpec: ConversationCallSpec;
   channelConfig: AudioChannelConfig;
-  runId?: string;
-  /** Owning user — embedded in the recording artifact token so the API can
-   *  enforce that only the owner (not anyone with a leaked URL) can fetch it. */
-  userId?: string;
-  onCallStart?: (info: CallStartInfo) => void;
-  onCallComplete?: (result: ConversationCallResult) => void | Promise<void>;
+  runId: string;
+  /** Owning user, recorded in the recording artifact token for audit logging. */
+  userId: string;
+  /** Signs recording links: the recording is served by the API at apiPublicUrl. */
+  recordingLinks: RecordingLinkSigning;
   /** External cancel signal — when fired, the call aborts at the next turn
    *  boundary, partial transcript is preserved, and the channel is hung up. */
   signal?: AbortSignal;
 }
 
+export interface RecordingLinkSigning {
+  secret: string;
+  apiPublicUrl: string;
+}
+
 export interface ExecuteCallResult {
   status: "pass" | "fail";
   conversationResult: ConversationCallResult;
-  aggregate: RunAggregateV2;
 }
 
 interface ActiveRecordingUpload {
@@ -44,27 +39,10 @@ interface ActiveRecordingUpload {
   abort(): Promise<void>;
 }
 
-let storageClient:
-  | ReturnType<typeof createStorageClient>
-  | null
-  | undefined;
+let storageClient: ReturnType<typeof createStorageClient> | undefined;
 
 function getStorageClient() {
-  if (storageClient !== undefined) return storageClient;
-  try {
-    storageClient = createStorageClient();
-  } catch {
-    storageClient = null;
-  }
-  return storageClient;
-}
-
-function getRequiredStorageClient() {
-  const storage = getStorageClient();
-  if (!storage) {
-    throw new Error("Vent-owned recording requires object storage configuration");
-  }
-  return storage;
+  return (storageClient ??= createStorageClient());
 }
 
 function slugifyRecordingLabel(label: string): string {
@@ -81,14 +59,8 @@ async function attachRecordingUrl(
   channel: AudioChannel,
   adapter: AudioChannelConfig["adapter"],
   activeUpload: ActiveRecordingUpload | null,
-  runId?: string,
+  runId: string,
 ): Promise<void> {
-  if (!runId) {
-    await activeUpload?.abort().catch(() => {});
-    await channel.discardCallRecording?.().catch(() => {});
-    return;
-  }
-
   console.log(`[recording] activeUpload=${!!activeUpload} runId=${runId}`);
   if (activeUpload) {
     try {
@@ -118,44 +90,29 @@ async function attachRecordingUrl(
   await channel.discardCallRecording?.().catch(() => {});
 }
 
-function buildRecordingUrl(
-  key: string,
-  storage: NonNullable<ReturnType<typeof createStorageClient>>,
-  userId: string | undefined,
-): Promise<string> | string {
+function buildRecordingUrl(key: string, signing: RecordingLinkSigning, userId: string): string {
   // Signed-URL-only auth (S3/Twilio pattern). The HMAC token is the credential;
   // 1h TTL bounds blast radius. No dashboard sign-in required.
-  const secret = process.env["RUNNER_CALLBACK_SECRET"] ?? "";
-  if (secret) {
-    const apiBaseUrl = requireEnv("API_PUBLIC_URL");
-    // userId is captured in the token payload for audit logging only — it's
-    // not enforced on access. May be undefined in dev / standalone runner.
-    return buildArtifactUrl(apiBaseUrl, createArtifactToken(key, secret, { userId: userId ?? "anon" }));
-  }
-  return storage.presignDownload(key, 3600);
+  return buildArtifactUrl(signing.apiPublicUrl, createArtifactToken(key, signing.secret, { userId }));
 }
 
 async function startRecordingUpload(
   channel: AudioChannel,
   resultName: string | undefined,
   callerPrompt: string,
-  runId?: string,
-  userId?: string,
-): Promise<ActiveRecordingUpload | null> {
-  if (!runId) {
-    console.log("[recording] startRecordingUpload: no runId");
-    return null;
-  }
-
+  runId: string,
+  userId: string,
+  signing: RecordingLinkSigning,
+): Promise<ActiveRecordingUpload> {
   const liveRecording = channel.getLiveCallRecording?.();
   if (!liveRecording) {
     throw new Error("Vent-owned recording stream is unavailable");
   }
 
-  const storage = getRequiredStorageClient();
+  const storage = getStorageClient();
   const baseName = slugifyRecordingLabel(resultName ?? callerPrompt.slice(0, 48));
   const key = `recordings/${runId}/${baseName}-${randomUUID()}.wav`;
-  const recordingUrl = await buildRecordingUrl(key, storage, userId);
+  const recordingUrl = buildRecordingUrl(key, signing, userId);
   const multipart = await storage.createWavMultipartUpload(key);
   let aborted = false;
 
@@ -203,26 +160,15 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
     channelConfig,
     runId,
     userId,
-    onCallStart,
-    onCallComplete,
+    recordingLinks,
     signal,
   } = opts;
-
-  const notifyCallComplete = async (result: ConversationCallResult) => {
-    if (!onCallComplete) return;
-    try {
-      await onCallComplete(result);
-    } catch (err) {
-      console.warn(`onCallComplete failed: ${(err as Error).message}`);
-    }
-  };
 
   // Pre-flight health check — only for relay/local agent runs.
   // Platform adapters (vapi, retell, elevenlabs, bland) don't need this —
   // it would waste a real API call + credits just to verify connectivity.
   // The first real call will fail with a clear error if config is wrong.
-  const isPlatformAdapter = ["vapi", "retell", "elevenlabs", "bland", "livekit"].includes(channelConfig.adapter);
-  if (!isPlatformAdapter) {
+  if (!isPlatformProvider(channelConfig.adapter)) {
     const probeChannel = await createAudioChannel(channelConfig);
     try {
       await probeChannel.connect();
@@ -256,32 +202,18 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
         status: "error",
         transcript: [],
         duration_ms: 0,
-        metrics: { mean_ttfb_ms: 0 },
+        metrics: {},
         error: `Agent unreachable: ${errorMsg}`,
       };
-      await notifyCallComplete(failResult);
-      return {
-        status: "fail",
-        conversationResult: failResult,
-        aggregate: {
-          conversation_calls: { total: 1, passed: 0, failed: 1 },
-          total_duration_ms: 0,
-        },
-      };
+      return { status: "fail", conversationResult: failResult };
     }
   }
 
   // Execute the single call
   const callName = spec.name ?? `conversation:${spec.caller_prompt.slice(0, 50)}`;
-  onCallStart?.({ call_name: callName });
   console.log(`  Conversation: ${spec.caller_prompt.slice(0, 60)}...`);
 
-  const perCallChannelConfig: AudioChannelConfig = {
-    ...channelConfig,
-    runId,
-    callName,
-  };
-  const channel = await createAudioChannel(perCallChannelConfig);
+  const channel = await createAudioChannel(channelConfig);
   const start = Date.now();
 
   let result: ConversationCallResult;
@@ -294,12 +226,12 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
     // gets dropped — Deepgram only sees audio starting mid-sentence.
     const callResult = await runConversationCall(spec, channel, {
       onConnected: async () => {
-        recordingUpload = await startRecordingUpload(channel, spec.name, spec.caller_prompt, runId, userId);
+        recordingUpload = await startRecordingUpload(channel, spec.name, spec.caller_prompt, runId, userId, recordingLinks);
       },
       signal,
     });
     result = callResult;
-    await attachRecordingUrl(result, channel, perCallChannelConfig.adapter, recordingUpload, runId);
+    await attachRecordingUrl(result, channel, channelConfig.adapter, recordingUpload, runId);
     console.log(`    Status: ${result.status} (${result.duration_ms}ms)`);
     console.log(JSON.stringify({
       event: "call_complete", call_name: callName,
@@ -313,33 +245,23 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
     const observedToolCalls = await channel.getCallData?.().catch(() => []) ?? [];
     const callMetadata = await channel.getCallMetadata?.().catch(() => null) ?? null;
 
-    // Salvage whatever transcript the channel captured before the throw —
-    // returning [] discards real diagnostic data when the failure was late
-    // in the call (e.g. mid-conversation timeout). channel.getTranscripts()
-    // returns CALLER-only text across all five adapters (verified) — these
-    // are the user/caller-side utterances the platform's own STT captured.
-    // Don't fabricate alternating agent turns; we don't have the agent text
-    // here, only what the user said.
-    const platformTranscript =
-      (channel.getTranscripts ? channel.getTranscripts() : []) ?? [];
-    const salvagedTranscript = platformTranscript.map((t) => ({
-      role: "caller" as const,
-      text: t.text,
-      timestamp_ms: 0,
-    }));
+    // Vent's own transcript is lost with the throw; keep what the platform
+    // recorded, since the failure may have come late in the call.
+    const platformTranscript = buildPlatformTranscript(channel.getTranscripts?.() ?? []);
 
     result = {
       name: spec.name,
       caller_prompt: spec.caller_prompt,
       status: "error",
-      transcript: salvagedTranscript,
+      transcript: [],
+      ...(platformTranscript.length > 0 ? { platform_transcript: platformTranscript } : {}),
       duration_ms: Date.now() - start,
-      metrics: { mean_ttfb_ms: 0 },
+      metrics: {},
       error: errorMsg,
       observed_tool_calls: observedToolCalls.length > 0 ? observedToolCalls : undefined,
       call_metadata: callMetadata ?? undefined,
     };
-    await attachRecordingUrl(result, channel, perCallChannelConfig.adapter, recordingUpload, runId);
+    await attachRecordingUrl(result, channel, channelConfig.adapter, recordingUpload, runId);
     console.log(JSON.stringify({
       event: "call_complete", call_name: callName,
       status: "error", duration_ms: result.duration_ms, error: errorMsg,
@@ -348,25 +270,7 @@ export async function executeCall(opts: ExecuteCallOpts): Promise<ExecuteCallRes
     await channel.disconnect().catch(() => {});
   }
 
-  await notifyCallComplete(result);
-
-  const passed = result.status === "completed" ? 1 : 0;
-  const failed = result.status === "error" ? 1 : 0;
-  const costUsd = result.call_metadata?.cost_usd;
-
-  const aggregate: RunAggregateV2 = {
-    conversation_calls: { total: 1, passed, failed },
-    total_duration_ms: result.duration_ms,
-    ...(costUsd != null && costUsd > 0 ? { total_cost_usd: costUsd } : {}),
-  };
-
-  const status = failed === 0 ? "pass" : "fail";
-
+  const status = result.status === "error" ? "fail" : "pass";
   console.log(`Run complete: ${status}`);
-
-  return {
-    status,
-    conversationResult: result,
-    aggregate,
-  };
+  return { status, conversationResult: result };
 }

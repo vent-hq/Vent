@@ -10,13 +10,12 @@
     "test": "tsx --test tests/*.test.ts"
   },
   "dependencies": {
-    "@elevenlabs/elevenlabs-js": "^2.39.0",
+    "@elevenlabs/elevenlabs-js": "^2.77.0",
     "@livekit/protocol": "^1.45.1",
     "@livekit/rtc-node": "^0.13.0",
     "@roamhq/wrtc": "0.10.0",
     "@vapi-ai/server-sdk": "^0.11.0",
     "@vent/shared": "workspace:*",
-    "@vent/voice": "workspace:*",
     "livekit-server-sdk": "^2.0.0",
     "retell-sdk": "^5.9.0",
     "ws": "catalog:"

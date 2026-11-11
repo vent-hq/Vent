@@ -1,9 +1,6 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac } from "node:crypto";
+import { requireEnv, safeEqual } from "@vent/shared";
 import { S3Storage } from "./s3.js";
-import type { StorageConfig } from "./s3.js";
-
-export type { StorageConfig } from "./s3.js";
-export { S3Storage } from "./s3.js";
 
 // v=2 adds `uid` (owning user) and `exp` (unix seconds) so recording URLs are
 // scoped to a user and expire. v=1 tokens are no longer issued and rejected
@@ -20,7 +17,7 @@ interface ArtifactTokenPayloadV2 {
 // The token itself is the credential (S3 / Twilio pattern); we deliberately
 // don't require session auth on the recording route because the cookie can't
 // cross the dashboard↔api origin boundary on .fly.dev.
-const DEFAULT_TOKEN_TTL_SECONDS = 60 * 60;
+const TOKEN_TTL_SECONDS = 60 * 60;
 
 function signToken(encodedPayload: string, secret: string): string {
   return createHmac("sha256", secret).update(encodedPayload).digest("base64url");
@@ -28,8 +25,6 @@ function signToken(encodedPayload: string, secret: string): string {
 
 export interface CreateArtifactTokenOpts {
   userId: string;
-  ttlSeconds?: number;
-  nowMs?: number;
 }
 
 export function createArtifactToken(
@@ -37,13 +32,11 @@ export function createArtifactToken(
   secret: string,
   opts: CreateArtifactTokenOpts,
 ): string {
-  const now = opts.nowMs ?? Date.now();
-  const ttl = opts.ttlSeconds ?? DEFAULT_TOKEN_TTL_SECONDS;
   const payload: ArtifactTokenPayloadV2 = {
     v: 2,
     k: key,
     uid: opts.userId,
-    exp: Math.floor(now / 1000) + ttl,
+    exp: Math.floor(Date.now() / 1000) + TOKEN_TTL_SECONDS,
   };
   const encodedPayload = Buffer.from(JSON.stringify(payload)).toString("base64url");
   return `${encodedPayload}.${signToken(encodedPayload, secret)}`;
@@ -55,20 +48,10 @@ export interface VerifiedArtifactToken {
   expiresAt: number;
 }
 
-export function verifyArtifactToken(
-  token: string,
-  secret: string,
-  nowMs: number = Date.now(),
-): VerifiedArtifactToken | null {
+export function verifyArtifactToken(token: string, secret: string): VerifiedArtifactToken | null {
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
-
-  const expectedSignature = signToken(encodedPayload, secret);
-  const provided = Buffer.from(signature);
-  const expected = Buffer.from(expectedSignature);
-  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
-    return null;
-  }
+  if (!safeEqual(signature, signToken(encodedPayload, secret))) return null;
 
   try {
     const payload = JSON.parse(
@@ -84,7 +67,7 @@ export function verifyArtifactToken(
     ) {
       return null;
     }
-    if (payload.exp * 1000 < nowMs) {
+    if (payload.exp * 1000 < Date.now()) {
       return null;
     }
     return { key: payload.k, userId: payload.uid, expiresAt: payload.exp * 1000 };
@@ -98,19 +81,12 @@ export function buildArtifactUrl(baseUrl: string, token: string): string {
   return `${normalizedBase}/recordings/${encodeURIComponent(token)}`;
 }
 
-export function createStorageClient(config?: Partial<StorageConfig>): S3Storage {
-  const fullConfig: StorageConfig = {
-    endpoint: config?.endpoint ?? process.env["S3_ENDPOINT"] ?? "",
-    bucket: config?.bucket ?? process.env["S3_BUCKET"] ?? "vent-bundles",
-    accessKeyId: config?.accessKeyId ?? process.env["S3_ACCESS_KEY_ID"] ?? "",
-    secretAccessKey:
-      config?.secretAccessKey ?? process.env["S3_SECRET_ACCESS_KEY"] ?? "",
-    region: config?.region ?? process.env["S3_REGION"] ?? "auto",
-  };
-
-  if (!fullConfig.endpoint) {
-    throw new Error("S3_ENDPOINT is required");
-  }
-
-  return new S3Storage(fullConfig);
+export function createStorageClient(): S3Storage {
+  return new S3Storage({
+    endpoint: requireEnv("S3_ENDPOINT"),
+    bucket: requireEnv("S3_BUCKET"),
+    accessKeyId: process.env["S3_ACCESS_KEY_ID"] ?? "",
+    secretAccessKey: process.env["S3_SECRET_ACCESS_KEY"] ?? "",
+    region: process.env["S3_REGION"] ?? "auto",
+  });
 }

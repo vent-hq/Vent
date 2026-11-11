@@ -1,9 +1,5 @@
 import { createCipheriv, createDecipheriv, randomBytes } from "node:crypto";
-import {
-  PlatformConfigSchema,
-  type PlatformConfig,
-  type PlatformProvider,
-} from "@vent/shared";
+import { PlatformConfigSchema, type PlatformConfig } from "@vent/shared";
 
 const PLATFORM_CONNECTIONS_MASTER_KEY_ENV = "PLATFORM_CONNECTIONS_MASTER_KEY";
 const ENCRYPTION_ALGORITHM = "aes-256-gcm";
@@ -36,47 +32,13 @@ function loadMasterKey(): Buffer {
   return normalizeMasterKey(raw);
 }
 
-function requiredFieldError(field: string, provider: PlatformProvider): Error {
-  return new Error(`${provider} configuration requires ${field}`);
-}
-
-export function validateResolvedPlatformConfig(platform: PlatformConfig): void {
-  switch (platform.provider) {
-    case "vapi":
-      if (!platform.vapi_api_key) throw requiredFieldError("vapi_api_key", platform.provider);
-      if (!platform.vapi_assistant_id) throw requiredFieldError("vapi_assistant_id", platform.provider);
-      return;
-    case "retell":
-      if (!platform.retell_api_key) throw requiredFieldError("retell_api_key", platform.provider);
-      if (!platform.retell_agent_id) throw requiredFieldError("retell_agent_id", platform.provider);
-      return;
-    case "elevenlabs":
-      if (!platform.elevenlabs_api_key) throw requiredFieldError("elevenlabs_api_key", platform.provider);
-      if (!platform.elevenlabs_agent_id) throw requiredFieldError("elevenlabs_agent_id", platform.provider);
-      return;
-    case "livekit":
-      if (!platform.livekit_api_key) throw requiredFieldError("livekit_api_key", platform.provider);
-      if (!platform.livekit_api_secret) throw requiredFieldError("livekit_api_secret", platform.provider);
-      if (!platform.livekit_url) throw requiredFieldError("livekit_url", platform.provider);
-      return;
-    case "bland":
-      if (!platform.bland_api_key) throw requiredFieldError("bland_api_key", platform.provider);
-      // Each test call creates a Bland web agent, which has no persona field:
-      // the instructions must come from a pathway or a task prompt.
-      if (!platform.bland_pathway_id && !platform.task) {
-        throw new Error("Bland configuration requires bland_pathway_id or task (a persona_id alone gives the agent no instructions)");
-      }
-      return;
-  }
-}
-
+// Callers pass a config already parsed and checked for missing fields (the
+// API's run submit schema); this only encrypts it.
 export function encryptPlatformConfig(platform: PlatformConfig): EncryptedPlatformConfig {
-  const parsedConfig = PlatformConfigSchema.parse(platform);
-  validateResolvedPlatformConfig(parsedConfig);
   const key = loadMasterKey();
   const iv = randomBytes(IV_BYTES);
   const cipher = createCipheriv("aes-256-gcm", key, iv);
-  const plaintext = Buffer.from(JSON.stringify(parsedConfig), "utf8");
+  const plaintext = Buffer.from(JSON.stringify(platform), "utf8");
   const ciphertext = Buffer.concat([cipher.update(plaintext), cipher.final()]);
   const tag = cipher.getAuthTag();
   return {
@@ -103,7 +65,5 @@ export function decryptPlatformConfig(envelope: EncryptedPlatformConfig): Platfo
     decipher.update(Buffer.from(envelope.ciphertext, "base64")),
     decipher.final(),
   ]);
-  const platform = PlatformConfigSchema.parse(JSON.parse(plaintext.toString("utf8")));
-  validateResolvedPlatformConfig(platform);
-  return platform;
+  return PlatformConfigSchema.parse(JSON.parse(plaintext.toString("utf8")));
 }

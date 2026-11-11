@@ -2,21 +2,35 @@ import { and, eq, sql } from "drizzle-orm";
 import IORedis from "ioredis";
 import { createDb, schema, type Database } from "@vent/db";
 import {
-  formatConversationResult,
+  envPositiveInt,
   signCallback,
+  RUNNER_CALLBACK_HEADER,
   requireEnv,
+  type RunJob,
+  type WorkerCallbackBodies,
+  isPlatformProvider,
 } from "@vent/shared";
+import type { AudioChannelConfig } from "@vent/adapters";
+import { loadRunPlatformConfig } from "./platform-config.js";
+import { CALL_PROCESS_ENTRY, runCallInProcess } from "../call-supervisor.js";
+
+const apiUrl = requireEnv("API_URL");
+const callbackSecret = requireEnv("RUNNER_CALLBACK_SECRET");
 
 // Signed POST to the API's /internal/* routes. The signature covers the
 // method, path, timestamp and exact body (packages/shared/src/callback-auth.ts),
 // so it is re-made for every attempt and only valid for this path.
-function postToApi(path: string, payload: unknown, timeoutMs: number): Promise<Response> {
+function postToApi<P extends keyof WorkerCallbackBodies>(
+  path: P,
+  payload: WorkerCallbackBodies[P],
+  timeoutMs: number,
+): Promise<Response> {
   const body = JSON.stringify(payload);
-  return fetch(`${process.env["API_URL"]!}${path}`, {
+  return fetch(`${apiUrl}${path}`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      ...signCallback("POST", path, body, process.env["RUNNER_CALLBACK_SECRET"] ?? ""),
+      ...signCallback("POST", path, body, callbackSecret),
     },
     body,
     signal: AbortSignal.timeout(timeoutMs),
@@ -25,9 +39,9 @@ function postToApi(path: string, payload: unknown, timeoutMs: number): Promise<R
 
 // POST with bounded retry, for reports that end a run: a transient blip on a
 // single fetch would otherwise leave the run "running" until the cleanup job.
-async function postToApiWithRetry(
-  path: string,
-  payload: unknown,
+async function postToApiWithRetry<P extends keyof WorkerCallbackBodies>(
+  path: P,
+  payload: WorkerCallbackBodies[P],
   perAttemptTimeoutMs: number,
   attempts: number,
 ): Promise<Response> {
@@ -51,14 +65,6 @@ async function postToApiWithRetry(
   }
   throw lastErr ?? new Error("callback failed");
 }
-
-import type {
-  CallSpec,
-  AdapterType,
-} from "@vent/shared";
-import type { AudioChannelConfig } from "@vent/adapters";
-import { loadRunPlatformConfig } from "./platform-config.js";
-import { CALL_PROCESS_ENTRY, runCallInProcess } from "../call-supervisor.js";
 
 // ---------------------------------------------------------------------------
 // Event emission — writes to DB and notifies API for SSE broadcast
@@ -85,18 +91,6 @@ export class LostCallLock extends Error {
   }
 }
 
-export interface RunJob {
-  run_id: string;
-  user_id: string;
-  adapter?: string;
-  call_spec?: Record<string, unknown>;
-  voice_config?: Record<string, unknown>;
-  start_command?: string;
-  health_endpoint?: string;
-  agent_url?: string;
-  agent_session_id?: string;
-}
-
 const redisUrl = requireEnv("REDIS_URL");
 const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 
@@ -104,8 +98,7 @@ const redis = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 // Direct execution for already-deployed agents (platform adapters or agent_url)
 // ---------------------------------------------------------------------------
 
-// Runs the call in its own process, reports "call finished" (for the CLI's
-// live view), then the final result, which ends the run.
+// Runs the call in its own process, then reports the result, which ends the run.
 async function runCallAndReport(
   job: RunJob,
   channelConfig: AudioChannelConfig,
@@ -113,39 +106,18 @@ async function runCallAndReport(
 ): Promise<void> {
   // No try/catch here — errors (including a crashed or killed call process)
   // propagate to executeRun's outer catch, which reports them to the API.
-  const { status, conversationResult, aggregate } = await runCallInProcess(CALL_PROCESS_ENTRY, {
+  const { status, conversationResult } = await runCallInProcess(CALL_PROCESS_ENTRY, {
     runId: job.run_id,
     userId: job.user_id,
-    callSpec: (job.call_spec as unknown as CallSpec).call,
+    callSpec: job.call_spec.call,
     channelConfig,
-  }, {
-    signal,
-    onCallComplete: async (result) => {
-      const callName = result.name ?? "conversation";
-      try {
-        const res = await postToApi("/internal/call-progress", {
-          run_id: job.run_id,
-          completed: 1,
-          total: 1,
-          call_type: "conversation",
-          call_name: callName,
-          status: result.status,
-          duration_ms: result.duration_ms,
-          result: formatConversationResult(result),
-        }, 15_000);
-        if (!res.ok) console.warn(`call-progress POST failed (${res.status}) for ${callName}`);
-      } catch (err) {
-        console.warn(`call-progress POST error for ${callName}:`, (err as Error).message);
-      }
-    },
-  });
+  }, { signal });
   if (signal.reason instanceof LostCallLock) throw signal.reason;
 
   const response = await postToApiWithRetry("/internal/runner-callback", {
     run_id: job.run_id,
     status: signal.aborted ? "cancelled" : status,
     conversation_result: conversationResult,
-    aggregate,
     ...(signal.aborted ? { error_text: "Cancelled by user" } : {}),
   }, 30_000, 4);
 
@@ -165,11 +137,10 @@ async function executeRemoteRun(
   job: RunJob,
   signal: AbortSignal,
 ): Promise<void> {
-  const adapterType = (job.adapter ?? "websocket") as AdapterType;
-  const platform = await loadRunPlatformConfig(db, job.run_id, job.user_id, adapterType);
+  const platform = await loadRunPlatformConfig(db, job.run_id, job.user_id, job.adapter);
   await runCallAndReport(job, {
-    adapter: adapterType,
-    agentUrl: job.agent_url ?? "http://localhost:3001",
+    adapter: job.adapter,
+    agentUrl: job.agent_url,
     platform,
   }, signal);
 }
@@ -184,13 +155,12 @@ async function executeSessionRun(
   signal: AbortSignal,
 ): Promise<void> {
   // Build relay connect URL using session_id — the WsAudioChannel will append conn_id automatically
-  const apiUrl = process.env["API_URL"]!;
   const relayWsUrl = apiUrl.replace(/^http/, "ws") + `/relay/connect?session_id=${job.agent_session_id}`;
 
   // Pin all relay connections to the API machine that holds the relay session.
   // Without this, Fly.io load-balances across machines and connections hit
   // instances that have no in-memory session → 4404 → "WebSocket not connected".
-  const relayHeaders: Record<string, string> = {};
+  const relayHeaders: Record<string, string> = { [RUNNER_CALLBACK_HEADER]: callbackSecret };
   if (relayMachineId && relayMachineId !== "local") {
     relayHeaders["fly-force-instance-id"] = relayMachineId;
     console.log(`[relay] Pinning connections to Fly machine ${relayMachineId}`);
@@ -208,27 +178,14 @@ async function executeSessionRun(
 // ---------------------------------------------------------------------------
 // Pool size scales with WORKER_TOTAL_CONCURRENCY (each in-flight job issues
 // several queries during its lifetime — status updates, encrypted-creds
-// resolve, etc.). Override with WORKER_DB_POOL_MAX for fatter workers.
-
-function parsePoolMax(): number {
-  const explicit = process.env["WORKER_DB_POOL_MAX"];
-  if (explicit) {
-    const n = Number.parseInt(explicit, 10);
-    if (!Number.isInteger(n) || n <= 0) {
-      throw new Error("WORKER_DB_POOL_MAX must be a positive integer");
-    }
-    return n;
-  }
-  // Default formula: ~2x concurrency, capped at 50 per worker process.
-  // Multiple worker machines × default formula could otherwise exhaust the
-  // shared Postgres `max_connections` budget. Operators can override with
-  // WORKER_DB_POOL_MAX after sizing their DB tier.
-  const conc = Number.parseInt(process.env["WORKER_TOTAL_CONCURRENCY"] ?? "10", 10);
-  return Math.min(50, Math.max(10, conc * 2));
-}
+// resolve, etc.): ~2x concurrency, capped at 50 per worker process, since
+// multiple worker machines × this formula could otherwise exhaust the shared
+// Postgres `max_connections` budget. Operators can override with
+// WORKER_DB_POOL_MAX after sizing their DB tier.
+const defaultPoolMax = Math.min(50, Math.max(10, envPositiveInt("WORKER_TOTAL_CONCURRENCY") * 2));
 
 const db = createDb(requireEnv("DATABASE_URL"), {
-  max: parsePoolMax(),
+  max: envPositiveInt("WORKER_DB_POOL_MAX", defaultPoolMax),
   idleTimeoutSeconds: 30,
   maxLifetimeSeconds: 3600,
 });
@@ -306,17 +263,9 @@ export async function executeRun(job: RunJob, lockLost: AbortSignal): Promise<vo
     await emitEvent(job.run_id, "run_started", "Run started");
 
     // Already-deployed agents: run calls directly in worker process
-    const isPlatformAdapter =
-      job.adapter === "vapi" ||
-      job.adapter === "retell" ||
-      job.adapter === "elevenlabs" ||
-      job.adapter === "bland" ||
-      job.adapter === "livekit";
-    const isRemote =
-      isPlatformAdapter ||
-      !!job.agent_url;
+    const isRemote = isPlatformProvider(job.adapter) || !!job.agent_url;
     if (isRemote) {
-      await emitEvent(job.run_id, "connecting", `Connecting to remote agent (${job.adapter ?? "websocket"})...`);
+      await emitEvent(job.run_id, "connecting", `Connecting to remote agent (${job.adapter})...`);
       await executeRemoteRun(db, job, signal);
       return;
     }

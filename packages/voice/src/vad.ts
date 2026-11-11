@@ -8,39 +8,30 @@
 
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { resample } from "./format.js";
+import { SAMPLE_RATE, pcmRms, resample } from "@vent/shared";
 
 export type VADState = "speech" | "silence" | "end_of_turn";
 
 export interface VoiceActivityDetectorConfig {
   /** Silence duration (ms) after speech before returning "end_of_turn". Default: 1500 */
   silenceThresholdMs?: number;
-  /** VAD hop size in samples. Must match TEN VAD expectations. Default: 256 */
-  hopSize?: number;
-  /** VAD detection threshold [0.0, 1.0]. Default: 0.5 */
-  vadThreshold?: number;
-  /**
-   * Minimum RMS energy (int16 scale) for a frame to be considered for speech.
-   * Frames below this are treated as silence without consulting the neural
-   * network. Filters WebRTC comfort noise (~30-200 RMS) that otherwise
-   * triggers false positives and prevents end-of-turn detection.
-   * Default: 100 — chosen to sit just above typical comfort-noise floor so
-   * quieter platform TTS (Retell/LiveKit, meanAbs often 200-300) reaches the
-   * neural model. Isolated comfort-noise false positives that slip past the
-   * gate are filtered by `minSpeechOnsetFrames` hysteresis below.
-   */
-  energyFloorRms?: number;
-  /**
-   * Minimum consecutive voice-classified frames required to flip from the
-   * "no speech yet" state to "speech". Once in speech state, a single voice
-   * frame resets the silence counter — this hysteresis only applies to the
-   * initial onset. Filters isolated neural-VAD false positives on comfort
-   * noise (observed ~17% single-frame rate) without losing sensitivity to
-   * real speech onsets (which last many consecutive frames).
-   * Default: 2 (≈32ms at 16kHz / hopSize 256).
-   */
-  minSpeechOnsetFrames?: number;
 }
+
+/** TEN VAD hop size in samples at 16kHz (16ms frames). */
+const HOP_SIZE = 256;
+/** TEN VAD detection threshold [0.0, 1.0]. */
+const VAD_THRESHOLD = 0.5;
+/**
+ * Minimum consecutive voice-classified frames required to flip from the
+ * "no speech yet" state to "speech". Once in speech state, a single voice
+ * frame resets the silence counter — this hysteresis only applies to the
+ * initial onset. Filters isolated neural-VAD false positives on comfort
+ * noise (observed ~17% single-frame rate) without losing sensitivity to
+ * real speech onsets (which last many consecutive frames). 2 ≈ 32ms.
+ */
+const MIN_SPEECH_ONSET_FRAMES = 2;
+/** Duration of one VAD frame on the audio timeline. */
+const FRAME_DURATION_MS = (HOP_SIZE / 16000) * 1000;
 
 interface TenVADModule {
   _ten_vad_create(handlePtr: number, hopSize: number, threshold: number): number;
@@ -52,24 +43,21 @@ interface TenVADModule {
     outFlagPtr: number
   ): number;
   _ten_vad_destroy(handlePtr: number): number;
-  _ten_vad_get_version(): number;
   _malloc(size: number): number;
   _free(ptr: number): void;
   HEAP16: Int16Array;
   HEAP32: Int32Array;
   HEAPF32: Float32Array;
-  UTF8ToString(ptr: number): string;
 }
 
 export class VoiceActivityDetector {
   private module: TenVADModule | null = null;
   private handle = 0;
-  private readonly hopSize: number;
-  private readonly vadThreshold: number;
-  private readonly energyFloorRms: number;
-  private readonly minSpeechOnsetFrames: number;
   /** Silence duration (ms) after speech before returning "end_of_turn". Mutable for adaptive thresholds. */
   silenceThresholdMs: number;
+  /** Minimum RMS energy (int16 scale) for a frame to reach the model; quieter
+   *  frames count as silence. Set per turn by the caller (see turnTiming). */
+  energyFloorRms = 100;
 
   private hasSpeech = false;
   /** Count of consecutive "voice" frames while hasSpeech is still false.
@@ -78,13 +66,12 @@ export class VoiceActivityDetector {
   private pendingSpeechFrames = 0;
 
   // Audio-timeline silence tracking (frame count, not wall-clock).
-  // Each frame = hopSize samples at 16kHz = hopSize/16 ms.
+  // Each frame = HOP_SIZE samples at 16kHz = FRAME_DURATION_MS.
   // Using frame count avoids the wall-clock vs audio-clock mismatch that
   // occurs when the event loop processes audio frames in bursts under CPU
   // contention — Date.now() barely advances between burst-processed frames,
   // so real 800ms silences appear as <10ms of wall-clock time.
   private silenceFrames = 0;
-  private readonly frameDurationMs: number;
 
   // Pre-allocated WASM memory pointers
   private audioPtr = 0;
@@ -92,18 +79,11 @@ export class VoiceActivityDetector {
   private flagPtr = 0;
 
   // Accumulation buffer for partial frames
-  private sampleBuffer: Int16Array;
+  private readonly sampleBuffer = new Int16Array(HOP_SIZE);
   private sampleBufferOffset = 0;
 
   constructor(config: VoiceActivityDetectorConfig = {}) {
-    this.hopSize = config.hopSize ?? 256;
-    this.vadThreshold = config.vadThreshold ?? 0.5;
     this.silenceThresholdMs = config.silenceThresholdMs ?? 1500;
-    this.energyFloorRms = config.energyFloorRms ?? 100;
-    this.minSpeechOnsetFrames = config.minSpeechOnsetFrames ?? 2;
-    this.sampleBuffer = new Int16Array(this.hopSize);
-    // 256 samples at 16kHz = 16ms per frame
-    this.frameDurationMs = (this.hopSize / 16000) * 1000;
   }
 
   async init(): Promise<void> {
@@ -127,7 +107,7 @@ export class VoiceActivityDetector {
 
     // Create VAD handle (pointer-to-pointer pattern)
     const handlePtr = this.module._malloc(4);
-    const result = this.module._ten_vad_create(handlePtr, this.hopSize, this.vadThreshold);
+    const result = this.module._ten_vad_create(handlePtr, HOP_SIZE, VAD_THRESHOLD);
     if (result !== 0) {
       this.module._free(handlePtr);
       throw new Error("Failed to create TEN VAD instance");
@@ -136,21 +116,21 @@ export class VoiceActivityDetector {
     this.module._free(handlePtr);
 
     // Pre-allocate WASM memory for processing
-    this.audioPtr = this.module._malloc(this.hopSize * 2); // int16 = 2 bytes each
+    this.audioPtr = this.module._malloc(HOP_SIZE * 2); // int16 = 2 bytes each
     this.probPtr = this.module._malloc(4);  // float32
     this.flagPtr = this.module._malloc(4);  // int32
   }
 
   /**
    * Process 24kHz mono PCM int16 audio.
-   * Resamples to 16kHz internally, accumulates into hopSize frames,
+   * Resamples to 16kHz internally, accumulates into HOP_SIZE frames,
    * and returns the VAD state after processing all input.
    */
   process(pcm24k: Buffer): VADState {
     if (!this.module) throw new Error("VAD not initialized — call init() first");
 
     // Resample 24kHz → 16kHz for TEN VAD
-    const pcm16k = resample(pcm24k, 24000, 16000);
+    const pcm16k = resample(pcm24k, SAMPLE_RATE, 16000);
 
     const samples = new Int16Array(
       pcm16k.buffer,
@@ -162,7 +142,7 @@ export class VoiceActivityDetector {
     let offset = 0;
 
     while (offset < samples.length) {
-      const remaining = this.hopSize - this.sampleBufferOffset;
+      const remaining = HOP_SIZE - this.sampleBufferOffset;
       const toCopy = Math.min(remaining, samples.length - offset);
       this.sampleBuffer.set(
         samples.subarray(offset, offset + toCopy),
@@ -171,7 +151,7 @@ export class VoiceActivityDetector {
       this.sampleBufferOffset += toCopy;
       offset += toCopy;
 
-      if (this.sampleBufferOffset === this.hopSize) {
+      if (this.sampleBufferOffset === HOP_SIZE) {
         state = this.processFrame(this.sampleBuffer);
         this.sampleBufferOffset = 0;
       }
@@ -183,7 +163,7 @@ export class VoiceActivityDetector {
   private currentState(): VADState {
     if (!this.hasSpeech) return "silence";
     if (this.silenceFrames > 0) {
-      if (this.silenceFrames * this.frameDurationMs >= this.silenceThresholdMs) {
+      if (this.silenceFrames * FRAME_DURATION_MS >= this.silenceThresholdMs) {
         return "end_of_turn";
       }
     }
@@ -199,18 +179,14 @@ export class VoiceActivityDetector {
     // sporadically classifies comfort noise as speech (~17% of frames),
     // preventing the silence counter from ever reaching the end-of-turn
     // threshold.
-    let sumSq = 0;
-    for (let i = 0; i < samples.length; i++) {
-      sumSq += samples[i]! * samples[i]!;
-    }
-    const rms = Math.sqrt(sumSq / samples.length);
+    const rms = pcmRms(Buffer.from(samples.buffer, samples.byteOffset, samples.byteLength));
 
     if (rms < this.energyFloorRms) {
       // Below noise floor — treat as silence without consulting the model
       this.pendingSpeechFrames = 0;
       if (!this.hasSpeech) return "silence";
       this.silenceFrames++;
-      if (this.silenceFrames * this.frameDurationMs >= this.silenceThresholdMs) {
+      if (this.silenceFrames * FRAME_DURATION_MS >= this.silenceThresholdMs) {
         return "end_of_turn";
       }
       return "silence";
@@ -226,7 +202,7 @@ export class VoiceActivityDetector {
     const result = mod._ten_vad_process(
       this.handle,
       this.audioPtr,
-      this.hopSize,
+      HOP_SIZE,
       this.probPtr,
       this.flagPtr
     );
@@ -243,11 +219,11 @@ export class VoiceActivityDetector {
         // Already in speech state — a single voice frame is enough to stay there.
         return "speech";
       }
-      // First-onset hysteresis: require minSpeechOnsetFrames consecutive voice
+      // First-onset hysteresis: require MIN_SPEECH_ONSET_FRAMES consecutive voice
       // frames before flipping to the "speech" state. Filters isolated neural
       // false positives that the energy gate let through.
       this.pendingSpeechFrames++;
-      if (this.pendingSpeechFrames >= this.minSpeechOnsetFrames) {
+      if (this.pendingSpeechFrames >= MIN_SPEECH_ONSET_FRAMES) {
         this.hasSpeech = true;
         return "speech";
       }
@@ -263,17 +239,11 @@ export class VoiceActivityDetector {
     // Had speech before, now silence — count frames on audio timeline
     this.silenceFrames++;
 
-    if (this.silenceFrames * this.frameDurationMs >= this.silenceThresholdMs) {
+    if (this.silenceFrames * FRAME_DURATION_MS >= this.silenceThresholdMs) {
       return "end_of_turn";
     }
 
     return "silence";
-  }
-
-  getVersion(): string {
-    if (!this.module) throw new Error("VAD not initialized");
-    const ptr = this.module._ten_vad_get_version();
-    return this.module.UTF8ToString(ptr);
   }
 
   reset(): void {
@@ -293,7 +263,7 @@ export class VoiceActivityDetector {
       this.module.HEAP32[handlePtr >> 2] = this.handle;
       this.module._ten_vad_destroy(handlePtr);
 
-      const result = this.module._ten_vad_create(handlePtr, this.hopSize, this.vadThreshold);
+      const result = this.module._ten_vad_create(handlePtr, HOP_SIZE, VAD_THRESHOLD);
       if (result !== 0) {
         this.module._free(handlePtr);
         throw new Error("Failed to recreate TEN VAD instance on reset");

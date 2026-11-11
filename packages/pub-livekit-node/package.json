@@ -1,0 +1,44 @@
+{
+  "name": "@vent-hq/livekit",
+  "version": "0.4.0",
+  "type": "module",
+  "description": "Vent helper for forwarding LiveKit Agents SDK observability",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc --noEmit",
+    "clean": "rm -rf dist",
+    "prepack": "pnpm clean && pnpm build"
+  },
+  "keywords": [
+    "vent",
+    "livekit",
+    "voice",
+    "agents",
+    "observability"
+  ],
+  "license": "MIT",
+  "sideEffects": false,
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/vent-hq/Vent.git",
+    "directory": "packages/pub-livekit-node"
+  },
+  "homepage": "https://venthq.dev",
+  "devDependencies": {
+    "typescript": "catalog:"
+  }
+}

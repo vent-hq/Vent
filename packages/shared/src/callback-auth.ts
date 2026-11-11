@@ -1,13 +1,21 @@
 import { createHmac, timingSafeEqual } from "node:crypto";
 import {
-  RUNNER_CALLBACK_MAX_SKEW_MS,
   RUNNER_CALLBACK_SIGNATURE_HEADER,
   RUNNER_CALLBACK_TIMESTAMP_HEADER,
 } from "./constants.js";
 
+const RUNNER_CALLBACK_MAX_SKEW_MS = 5 * 60_000;
+
 export interface CallbackHeaders {
   [RUNNER_CALLBACK_SIGNATURE_HEADER]: string;
   [RUNNER_CALLBACK_TIMESTAMP_HEADER]: string;
+}
+
+/** Constant-time string comparison, for secrets and signatures. */
+export function safeEqual(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && timingSafeEqual(left, right);
 }
 
 // Signs the method, path, timestamp and exact body bytes, one per line, so a
@@ -49,9 +57,7 @@ export function verifyCallback(
   }
 
   const expected = computeSignature(method, path, timestampHeader, rawBody, secret);
-  const provided = Buffer.from(signatureHeader);
-  const expectedBuf = Buffer.from(expected);
-  if (provided.length !== expectedBuf.length || !timingSafeEqual(provided, expectedBuf)) {
+  if (!safeEqual(signatureHeader, expected)) {
     return { ok: false, reason: "bad_signature" };
   }
 

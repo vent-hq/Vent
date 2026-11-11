@@ -8,40 +8,16 @@ import {
   RUN_JOB_LOCK_RENEW_MS,
   RUN_JOB_STALLED_INTERVAL_MS,
   RUN_QUEUE_NAME,
+  envPositiveInt,
   requireEnv,
+  type RunJob,
 } from "@vent/shared";
-import { checkDatabase, executeRun, LostCallLock, type RunJob } from "./jobs/run-executor.js";
+import { checkDatabase, executeRun, LostCallLock } from "./jobs/run-executor.js";
 import { cancelAllCalls } from "./call-supervisor.js";
 import { createWorkerMetrics } from "./metrics.js";
 
 const LOG_DIR = "/tmp/vent-run-logs";
 try { mkdirSync(LOG_DIR, { recursive: true }); } catch {}
-
-function parseRequiredPositiveIntEnv(name: string): number {
-  const raw = process.env[name];
-  if (!raw) {
-    throw new Error(`${name} must be set`);
-  }
-
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-
-  return value;
-}
-
-function parsePositiveIntEnv(name: string, fallback: number): number {
-  const raw = process.env[name];
-  if (!raw) return fallback;
-
-  const value = Number.parseInt(raw, 10);
-  if (!Number.isInteger(value) || value <= 0) {
-    throw new Error(`${name} must be a positive integer`);
-  }
-
-  return value;
-}
 
 const redisUrl = requireEnv("REDIS_URL");
 const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
@@ -49,8 +25,8 @@ const connection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
 // the general-purpose `connection` causes BullMQ to log a deprecation and,
 // under sustained load, can deadlock blocking commands behind non-blocking ones.
 const workerConnection = new IORedis(redisUrl, { maxRetriesPerRequest: null });
-const totalConcurrency = parseRequiredPositiveIntEnv("WORKER_TOTAL_CONCURRENCY");
-const workerMetricsPort = parsePositiveIntEnv("WORKER_METRICS_PORT", 9091);
+const totalConcurrency = envPositiveInt("WORKER_TOTAL_CONCURRENCY");
+const workerMetricsPort = envPositiveInt("WORKER_METRICS_PORT", 9091);
 const runLogStore = new AsyncLocalStorage<string[]>();
 const originalConsoleLog = console.log.bind(console);
 const originalConsoleError = console.error.bind(console);
@@ -85,7 +61,7 @@ async function processRun(job: Job<RunJob>): Promise<void> {
   const lost = new AbortController();
   lockLost.set(job.id!, lost);
   console.log(
-    `Processing run ${data.run_id} (adapter: ${data.adapter ?? "unknown"}${data.agent_session_id ? ", session" : ""})`,
+    `Processing run ${data.run_id} (adapter: ${data.adapter}${data.agent_session_id ? ", session" : ""})`,
   );
 
   // Capture all console output for the run so we can dump it at the end.

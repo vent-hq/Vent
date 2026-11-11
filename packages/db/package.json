@@ -8,8 +8,7 @@
     "typecheck": "tsc --noEmit",
     "clean": "rm -rf dist",
     "generate": "drizzle-kit generate",
-    "migrate": "tsx src/migrate.ts",
-    "seed:local": "tsx src/seed-local.ts"
+    "migrate": "tsx src/migrate.ts"
   },
   "dependencies": {
     "drizzle-orm": "catalog:",

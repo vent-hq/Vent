@@ -190,6 +190,20 @@
       "when": 1794213915246,
       "tag": "0026_drop_unused_schema",
       "breakpoints": true
+    },
+    {
+      "idx": 27,
+      "version": "7",
+      "when": 1794300422632,
+      "tag": "0027_fold_results_into_runs",
+      "breakpoints": true
+    },
+    {
+      "idx": 28,
+      "version": "7",
+      "when": 1794303805231,
+      "tag": "0028_drop_run_events",
+      "breakpoints": true
     }
   ]
 }

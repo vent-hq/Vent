@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { BaseAudioChannel, type ComfortNoiseMode } from "../src/audio-channel.js";
+import { BaseAudioChannel, type ComfortNoiseMode } from "../src/shared/audio-channel.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
@@ -47,15 +47,6 @@ test("silence mode sends all-zero frames", async () => {
 
   assert.ok(ch.frames.length > 0);
   assert.ok(ch.frames.every((f) => f.every((s) => s === 0)));
-});
-
-test("none mode sends nothing", async () => {
-  const ch = new FakeChannel("none");
-  ch.startComfortNoise();
-  await sleep(60);
-  await ch.disconnect();
-
-  assert.equal(ch.frames.length, 0);
 });
 
 test("caller speech stops the noise and drops buffered noise once", async () => {

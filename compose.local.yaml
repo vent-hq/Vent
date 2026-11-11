@@ -24,8 +24,8 @@ x-local-environment: &local-environment
   RUNNER_CALLBACK_SECRET: vent-local-callback-secret
   PLATFORM_CONNECTIONS_MASTER_KEY: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   WORKER_METRICS_PORT: "${VENT_LOCAL_METRICS_PORT:-19091}"
-  WORKER_TOTAL_CONCURRENCY: "2"
-  FLEET_MAX_ACTIVE_RUNS: "2"
+  WORKER_TOTAL_CONCURRENCY: "45"
+  FLEET_MAX_ACTIVE_RUNS: "45"
 
 x-container-environment: &container-environment
   <<: *local-environment

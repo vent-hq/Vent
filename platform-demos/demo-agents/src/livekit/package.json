@@ -1,0 +1,24 @@
+{
+  "name": "@vent/demo-livekit",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "packageManager": "pnpm@9.15.0",
+  "scripts": {
+    "dev": "node --import tsx agent.ts dev",
+    "start": "node --import tsx agent.ts start",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@livekit/agents": "1.9.5",
+    "@livekit/agents-plugin-silero": "1.9.5",
+    "@livekit/rtc-node": "1.2.1",
+    "@vent-hq/livekit": "0.4.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
