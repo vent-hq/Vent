@@ -1,6 +1,5 @@
 node_modules
-dist
+.turbo
 .env
 .env.*
-npm-debug.log
 .DS_Store

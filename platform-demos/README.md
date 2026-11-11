@@ -11,9 +11,11 @@ packages and are not published. All business data is fictional.
 - `demo-db/`: dedicated Fly app `vent-demo-db`, with one Machine and a persistent
   volume. Database: `vent_demo`. It is separate from Vent's production database.
   It has no public database port; the backend connects over Fly's private network.
-- `livekit/`: TypeScript agent, configured for Fly app `vent-demo-livekit`. It
-  registers as `safetyspect-ts` and calls the same HTTP business tools as the other
-  platforms. Its Dockerfile contains no database file.
+- `demo-agents/src/livekit/`: TypeScript agent, hosted on LiveKit Cloud in
+  the same project as the demo `LIVEKIT_URL`. It registers as `safetyspect-ts` and
+  calls the same HTTP business tools as the other platforms. It is a standalone
+  package with its own lockfile, outside the pnpm workspace, because LiveKit Cloud
+  builds from this directory alone. It is not part of the backend's runtime.
 - `demo-agents/scripts/`: create/update the hosted Bland, Vapi, Retell and
   ElevenLabs agents through their platform APIs. They use the shared backend.
 - `demo-suites/`: one baseline caller scenario per platform. It looks up James Chen,
@@ -54,20 +56,22 @@ doppler run --project vent --config dev -- pnpm --filter @vent/demo-backend setu
 
 Keep the resulting IDs in `dev` before running calls or repeating setup.
 
-## Fly deployments
+## Deployments
 
-From the root, deploy existing demo apps with:
+From the root, deploy the database and backend to Fly, and the LiveKit agent to
+LiveKit Cloud:
 
 ```bash
 fly deploy . --config platform-demos/demo-db/fly.toml --remote-only --ha=false
 fly deploy . --config platform-demos/demo-agents/fly.toml --remote-only --ha=false
-fly deploy . --config demos/livekit/fly.toml --remote-only --ha=false
+(cd platform-demos/demo-agents/src/livekit && lk agent deploy)
 ```
 
-The database and backend apps and their secrets are already provisioned. LiveKit
-needs its Fly app created in the same organization and its three LiveKit
-credentials imported as Fly secrets before its first deployment. No update to
-Vent's production API or worker is required.
+The database and backend apps and their secrets are already provisioned. The
+LiveKit agent's ID and project are in its `livekit.toml`; link that project to
+the CLI once with `lk project add` using the demo LiveKit credentials. LiveKit
+Cloud injects those credentials into the agent itself. No update to Vent's
+production API or worker is required.
 
 The backend initializes its PostgreSQL schema and missing sample customers on
 startup. Initialization preserves existing customers and bookings. PostgreSQL
@@ -82,7 +86,7 @@ doppler run --project vent --config dev -- pnpm dev:docker
 
 doppler run --project vent --config dev -- env \
   VENT_API_URL=http://127.0.0.1:3001 \
-  VENT_ACCESS_TOKEN= VENT_REFRESH_TOKEN=vent_010101010101010101010101010101010101010101010101 \
+  VENT_REFRESH_TOKEN=vent_010101010101010101010101010101010101010101010101 \
   node packages/pub-cli/dist/index.mjs run -f platform-demos/demo-suites/elevenlabs.json
 ```
 
@@ -97,6 +101,7 @@ on the local Vent backend. Calls use real provider credits.
 curl --fail https://vent-demo-backend.fly.dev/health
 pnpm --filter @vent/demo-backend test
 pnpm typecheck
+pnpm --dir platform-demos/demo-agents/src/livekit typecheck
 ```
 
 Backend integration tests run against the deployed demo backend, exercise all
