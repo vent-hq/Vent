@@ -95,7 +95,7 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 ## Release Triggers
 
 - npm: add a `.changeset`, merge to `main`, then merge the auto-generated `chore: version packages` PR from `.github/workflows/release.yml`.
-- Python: bump `packages/pub-livekit-python/pyproject.toml` and `packages/pub-livekit-python/CHANGELOG.md`, then merge to `main`; `.github/workflows/release-python.yml` publishes if `PYPI_API_TOKEN` is set.
+- Python: bump `packages/pub-livekit-python/pyproject.toml` and `packages/pub-livekit-python/CHANGELOG.md`, then merge to `main`; `.github/workflows/release-python.yml` publishes through PyPI trusted publishing (no token).
 
 ## Environment Variables
 - `DATABASE_URL` — PostgreSQL connection string

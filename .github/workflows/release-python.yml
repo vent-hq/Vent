@@ -9,6 +9,11 @@ on:
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
 
+# PyPI trusted publishing: PyPI accepts this workflow's GitHub identity, no token.
+permissions:
+  contents: read
+  id-token: write
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -78,9 +83,8 @@ jobs:
           python -m build packages/pub-livekit-python
 
       - name: Publish Python package
-        if: steps.version.outputs.changed == 'true' && secrets.PYPI_API_TOKEN != ''
+        if: steps.version.outputs.changed == 'true'
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
-          password: ${{ secrets.PYPI_API_TOKEN }}
           packages-dir: packages/pub-livekit-python/dist/
           skip-existing: true
