@@ -4,6 +4,38 @@ All notable changes to `vent-livekit` are documented in this file.
 
 For the repo-wide summary, see [CHANGELOG.md](../../CHANGELOG.md).
 
+## 0.5.0
+
+### Added
+
+- Tool calls carry `duration_ms`: how long the tool ran, from LiveKit's call and output timestamps.
+- The session's close reason is sent as `ended_reason` on `vent:call-metadata`, so Vent shows why the call ended when the agent's side ended it.
+
+### Fixed
+
+- Tool calls published on `vent:tool-calls` now carry `type: "tool_call"`. Previously they were sent with `type: "vent:tool-calls"`, so Vent dropped every tool call from LiveKit agents using the Python helper.
+- The close-with-error warning on `vent:warning` now sends the error under `detail`, which Vent reads (it was sent as `error` and dropped).
+- Event payloads with circular references or nesting deeper than 8 levels no longer fail to serialize: those values are sent as `null`. Previously the depth limit passed the raw object through, so a deep or circular payload could not be published.
+
+### Changed
+
+- The helper is split into modules (`bridge.py`, `_json.py`) and `VentLiveKitBridge` is a regular class. The package moved out of `src/`; the import is still `from vent_livekit import instrument_livekit_agent`. The `VENT_TOPICS` dict is no longer exported.
+- `instrument_livekit_agent(ctx=..., session=...)` now requires both, and raises if the room isn't connected yet.
+- `platform` in call metadata is always `livekit`.
+- `session_usage_updated` is no longer forwarded on `vent:session-usage`: Vent no longer reports token usage.
+- The session report is no longer sent on `vent:session-report` when the session closes: Vent no longer keeps it.
+- Audio and image chat content is dropped before an event is converted to JSON, rather than after.
+- A publish attempted with no running event loop is logged instead of dropped silently, and in-flight publishes are kept alive until they finish.
+- A session that closes with an exception sends its type and message in the warning's `detail` (previously an empty object).
+
+### Removed
+
+- The `room`, `participant`, `reliable`, `session_metadata`, `debug_urls` and `auto_publish_session_report` options. Pass `ctx`; delivery is always reliable; call `publish_call_metadata()` / `publish_debug_url()` after setup.
+- `publish_session_usage()` and `publish_session_report()`. Neither is sent anymore.
+- `call_id` on tool calls and the `event` field on metrics and conversation items. Vent never read them.
+- Stop forwarding `user_input_transcribed` on `vent:user-input-transcribed`. Vent reads the transcript from native LiveKit transcription, so the topic was ignored.
+- Remove the agent-handoff `vent:transfer` publish. It keyed off `has_agent_handoff`/`new_agent_id`, which never appear in the serialized event, so it never fired.
+
 ## 0.4.0
 
 ### Added
