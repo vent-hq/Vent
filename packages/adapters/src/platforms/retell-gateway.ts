@@ -9,7 +9,7 @@
  */
 const wrtc: typeof import("@roamhq/wrtc") = require("@roamhq/wrtc");
 import { resample } from "@vent/voice";
-import { CONNECT_TIMEOUT_MS } from "./audio-channel.js";
+import { CONNECT_TIMEOUT_MS } from "../shared/audio-channel.js";
 
 const API = "https://api.retellai.com";
 const SAMPLE_RATE = 48000;

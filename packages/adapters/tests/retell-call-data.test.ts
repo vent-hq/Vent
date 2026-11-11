@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { RetellAudioChannel } from "../src/retell-audio-channel.js";
+import { RetellAudioChannel } from "../src/platforms/retell.js";
 
 test("Retell call data that cannot be fetched is reported, not returned as empty data", async () => {
   const channel = new RetellAudioChannel({ apiKey: "test-key", agentId: "test-agent" });

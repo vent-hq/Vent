@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { BaseAudioChannel, type ComfortNoiseMode } from "../src/audio-channel.js";
+import { BaseAudioChannel, type ComfortNoiseMode } from "../src/shared/audio-channel.js";
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 

@@ -12,7 +12,7 @@
 import WebSocket from "ws";
 import type { ObservedToolCall, ComponentLatency, CallMetadata, CallTransfer, ProviderWarning } from "@vent/shared";
 import { resample } from "@vent/voice";
-import { BaseAudioChannel, type SendAudioOptions } from "./audio-channel.js";
+import { BaseAudioChannel, type SendAudioOptions } from "../shared/audio-channel.js";
 
 // ---- Constants ----
 

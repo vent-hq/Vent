@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 const wrtc: typeof import("@roamhq/wrtc") = require("@roamhq/wrtc");
-import { RetellGateway } from "../src/retell-gateway.js";
+import { RetellGateway } from "../src/platforms/retell-gateway.js";
 
 test("Retell v3 signaling carries bidirectional PCM and deletes the media session", async () => {
   const originalFetch = globalThis.fetch;

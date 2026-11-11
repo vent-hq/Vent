@@ -16,8 +16,8 @@ import WebSocket from "ws";
 import { VapiClient, type Vapi } from "@vapi-ai/server-sdk";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, UsageEntry } from "@vent/shared";
 import { resample } from "@vent/voice";
-import { BaseAudioChannel, CONNECT_TIMEOUT_MS } from "./audio-channel.js";
-import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS } from "../shared/audio-channel.js";
+import { pollUntilReady, callDataUnavailableWarning } from "../shared/post-call.js";
 
 export interface VapiAudioChannelConfig {
   apiKey: string;

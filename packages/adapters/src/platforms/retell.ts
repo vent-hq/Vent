@@ -18,9 +18,9 @@
 import Retell from "retell-sdk";
 import type { CallResponse } from "retell-sdk/resources/call.js";
 import { RetellGateway, FRAME_SAMPLES } from "./retell-gateway.js";
-import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
+import { pollUntilReady, callDataUnavailableWarning } from "../shared/post-call.js";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, CostBreakdown, UsageEntry } from "@vent/shared";
-import { BaseAudioChannel, type SendAudioOptions, type ComfortNoiseMode } from "./audio-channel.js";
+import { BaseAudioChannel, type SendAudioOptions, type ComfortNoiseMode } from "../shared/audio-channel.js";
 
 export interface RetellAudioChannelConfig {
   apiKey: string;

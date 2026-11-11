@@ -8,9 +8,9 @@ import type {
   ElevenLabsPlatformConfig,
 } from "@vent/shared";
 import { RUNNER_CALLBACK_HEADER } from "@vent/shared";
-import type { AudioChannel } from "./audio-channel.js";
+import type { AudioChannel } from "./shared/audio-channel.js";
 
-export type { AudioChannel } from "./audio-channel.js";
+export type { AudioChannel } from "./shared/audio-channel.js";
 
 export interface AudioChannelConfig {
   adapter: AdapterType;
@@ -43,7 +43,7 @@ export async function createAudioChannel(config: AudioChannelConfig): Promise<Au
         if (secret) headers[RUNNER_CALLBACK_HEADER] = secret;
         if (config.relayHeaders) Object.assign(headers, config.relayHeaders);
       }
-      const { WsAudioChannel } = await import("./ws-audio-channel.js");
+      const { WsAudioChannel } = await import("./platforms/websocket.js");
       return new WsAudioChannel({
         wsUrl,
         headers,
@@ -63,7 +63,7 @@ export async function createAudioChannel(config: AudioChannelConfig): Promise<Au
       if (!apiSecret) throw new Error("LiveKit adapter requires LIVEKIT_API_SECRET env or platform.livekit_api_secret");
 
       const roomName = `vent-${crypto.randomUUID().replace(/-/g, "").slice(0, 8)}`;
-      const { WebRtcAudioChannel } = await import("./webrtc-audio-channel.js");
+      const { WebRtcAudioChannel } = await import("./platforms/livekit.js");
       return new WebRtcAudioChannel({
         livekitUrl,
         apiKey,
@@ -79,7 +79,7 @@ export async function createAudioChannel(config: AudioChannelConfig): Promise<Au
       const assistantId = p?.vapi_assistant_id || process.env["VAPI_ASSISTANT_ID"] || process.env["VAPI_AGENT_ID"] || "";
       if (!apiKey) throw new Error("Vapi adapter requires vapi_api_key or VAPI_API_KEY env");
       if (!assistantId) throw new Error("Vapi adapter requires VAPI_ASSISTANT_ID or VAPI_AGENT_ID in .env");
-      const { VapiAudioChannel } = await import("./vapi-audio-channel.js");
+      const { VapiAudioChannel } = await import("./platforms/vapi.js");
       return new VapiAudioChannel({ apiKey, assistantId });
     }
 
@@ -89,7 +89,7 @@ export async function createAudioChannel(config: AudioChannelConfig): Promise<Au
       const agentId = p?.retell_agent_id || process.env["RETELL_AGENT_ID"] || "";
       if (!apiKey) throw new Error("Retell adapter requires retell_api_key or RETELL_API_KEY env");
       if (!agentId) throw new Error("Retell adapter requires retell_agent_id or RETELL_AGENT_ID env");
-      const { RetellAudioChannel } = await import("./retell-audio-channel.js");
+      const { RetellAudioChannel } = await import("./platforms/retell.js");
       return new RetellAudioChannel({ apiKey, agentId });
     }
 
@@ -99,7 +99,7 @@ export async function createAudioChannel(config: AudioChannelConfig): Promise<Au
       const agentId = p?.elevenlabs_agent_id || process.env["ELEVENLABS_AGENT_ID"] || "";
       if (!apiKey) throw new Error("ElevenLabs adapter requires elevenlabs_api_key or ELEVENLABS_API_KEY env");
       if (!agentId) throw new Error("ElevenLabs adapter requires elevenlabs_agent_id or ELEVENLABS_AGENT_ID env");
-      const { ElevenLabsAudioChannel } = await import("./elevenlabs-audio-channel.js");
+      const { ElevenLabsAudioChannel } = await import("./platforms/elevenlabs.js");
       return new ElevenLabsAudioChannel({ apiKey, agentId });
     }
 
@@ -112,7 +112,7 @@ export async function createAudioChannel(config: AudioChannelConfig): Promise<Au
         throw new Error("Bland adapter requires bland_pathway_id or platform.task");
       }
 
-      const { BlandWsAudioChannel } = await import("./bland-ws-audio-channel.js");
+      const { BlandWsAudioChannel } = await import("./platforms/bland.js");
       return new BlandWsAudioChannel({
         apiKey,
         agentId: pathwayId || undefined,

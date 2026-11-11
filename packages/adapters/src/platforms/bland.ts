@@ -21,7 +21,7 @@
 import WebSocket from "ws";
 import { resample } from "@vent/voice";
 import type { ObservedToolCall, CallMetadata, ComponentLatency } from "@vent/shared";
-import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type ComfortNoiseMode, type SendAudioOptions } from "./audio-channel.js";
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type ComfortNoiseMode, type SendAudioOptions } from "../shared/audio-channel.js";
 import {
   BLAND_API_BASE,
   type BlandCallOptions,
@@ -36,8 +36,8 @@ import {
   isBlandCallDone,
   buildBlandCallMetadata,
   buildBlandTranscripts,
-} from "./bland-shared.js";
-import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
+} from "../bland-shared.js";
+import { pollUntilReady, callDataUnavailableWarning } from "../shared/post-call.js";
 
 export interface BlandWsAudioChannelConfig {
   apiKey: string;

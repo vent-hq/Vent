@@ -39,7 +39,7 @@ import { RoomAgentDispatch, RoomConfiguration } from "@livekit/protocol";
 import { AccessToken, RoomServiceClient } from "livekit-server-sdk";
 import { resample } from "@vent/voice";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, ProviderWarning, UsageEntry } from "@vent/shared";
-import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "./audio-channel.js";
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "../shared/audio-channel.js";
 
 interface WsToolCallEvent {
   type: "tool_call";

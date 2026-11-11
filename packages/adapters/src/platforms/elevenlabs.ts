@@ -42,8 +42,8 @@ import {
 import { ElevenLabsClient } from "@elevenlabs/elevenlabs-js";
 import type { ObservedToolCall, CallMetadata, CallTransfer, ComponentLatency, CostBreakdown, ProviderWarning, UsageEntry } from "@vent/shared";
 import { resample } from "@vent/voice";
-import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "./audio-channel.js";
-import { pollUntilReady, callDataUnavailableWarning } from "./post-call.js";
+import { BaseAudioChannel, CONNECT_TIMEOUT_MS, type SendAudioOptions } from "../shared/audio-channel.js";
+import { pollUntilReady, callDataUnavailableWarning } from "../shared/post-call.js";
 
 export interface ElevenLabsAudioChannelConfig {
   apiKey: string;

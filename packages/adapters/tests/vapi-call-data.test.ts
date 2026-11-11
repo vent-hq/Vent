@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { VapiAudioChannel } from "../src/vapi-audio-channel.js";
+import { VapiAudioChannel } from "../src/platforms/vapi.js";
 
 function channelWithCallData(callData: Record<string, unknown> | null): VapiAudioChannel {
   const channel = new VapiAudioChannel({ apiKey: "test-key", assistantId: "test-assistant" });

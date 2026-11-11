@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { pollUntilReady } from "../src/post-call.js";
+import { pollUntilReady } from "../src/shared/post-call.js";
 
 test("pollUntilReady keeps polling past errors and not-ready results until data is ready", async () => {
   const responses: Array<() => { status: string }> = [
