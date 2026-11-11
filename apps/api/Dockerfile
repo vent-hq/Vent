@@ -10,13 +10,11 @@ COPY packages/voice/package.json packages/voice/package.json
 COPY packages/adapters/package.json packages/adapters/package.json
 COPY packages/platform-connections/package.json packages/platform-connections/package.json
 COPY packages/artifacts/package.json packages/artifacts/package.json
-COPY packages/relay-client/package.json packages/relay-client/package.json
 COPY apps/api/package.json apps/api/package.json
 RUN pnpm install --frozen-lockfile
 COPY packages packages
 COPY apps/api apps/api
 COPY tsconfig.json tsconfig.json
-RUN pnpm --filter @vent/relay-client build
 RUN pnpm --filter @vent/api build
 
 FROM base AS runtime

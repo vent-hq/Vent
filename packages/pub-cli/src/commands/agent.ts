@@ -4,7 +4,7 @@ import { apiFetch } from "../lib/api.js";
 import { loadAccessToken } from "../lib/config.js";
 import { printError, printInfo, printSuccess } from "../lib/output.js";
 import { startAgentSession, type RelayHandle } from "../lib/relay.js";
-import type { RelayDisconnectedInfo } from "@vent/relay-client";
+import type { RelayDisconnectedInfo } from "../lib/relay-client.js";
 
 interface AgentStartArgs {
   config?: string;

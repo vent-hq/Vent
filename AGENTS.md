@@ -66,7 +66,6 @@ packages/
 ├── artifacts/              # S3-compatible artifact storage (recordings, audio)
 ├── db/                     # Drizzle ORM schema + PostgreSQL migrations
 ├── platform-connections/   # Platform credential encryption (AES-256-GCM)
-├── relay-client/           # WebSocket relay for local agent tunneling
 ├── pub-cli/                # Published CLI (vent-hq on npm)
 ├── pub-livekit-node/       # Published Node helper (@vent-hq/livekit on npm)
 ├── pub-livekit-python/     # Published Python helper (vent-livekit on PyPI)

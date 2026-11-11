@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from "node:child_process";
-import { RelayClient, type RelayClientConfig } from "@vent/relay-client";
+import { RelayClient, type RelayClientConfig } from "./relay-client.js";
 
 export interface RelayHandle {
   client: RelayClient;

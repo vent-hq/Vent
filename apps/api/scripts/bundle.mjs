@@ -41,10 +41,4 @@ cpSync(
   { recursive: true }
 );
 
-// Copy relay-client bundle (served to connecting relay clients)
-cpSync(
-  path.resolve(packages, "relay-client/dist/relay-client.mjs"),
-  path.resolve(__dirname, "../dist/relay-client.mjs")
-);
-
 console.log("Bundled → dist/");

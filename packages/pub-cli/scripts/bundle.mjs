@@ -18,7 +18,6 @@ await build({
   chunkNames: "[name]-[hash]",
   loader: { ".md": "text", ".txt": "text" },
   alias: {
-    "@vent/relay-client": path.resolve(__dirname, "../../relay-client/src/client.ts"),
     "@vent/shared": path.resolve(__dirname, "../../shared/src/index.ts"),
   },
   external: [

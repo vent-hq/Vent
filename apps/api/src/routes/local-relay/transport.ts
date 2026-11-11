@@ -1,5 +1,3 @@
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
 import type { FastifyInstance } from "fastify";
 import { eq, and } from "drizzle-orm";
 import IORedis from "ioredis";
@@ -12,17 +10,6 @@ function timingSafeCompare(a: string, b: string): boolean {
   return timingSafeEqual(Buffer.from(a), Buffer.from(b));
 }
 import type WebSocket from "ws";
-
-// ---------------------------------------------------------------------------
-// Load bundled relay client at startup (served at GET /relay/client.mjs)
-// ---------------------------------------------------------------------------
-
-let relayClientBundle: string;
-try {
-  relayClientBundle = readFileSync(join(__dirname, "..", "relay-client.mjs"), "utf-8");
-} catch {
-  relayClientBundle = "// relay-client bundle not found — build packages/relay-client first";
-}
 
 // ---------------------------------------------------------------------------
 // Types
@@ -374,14 +361,6 @@ async function relayRoutes(app: FastifyInstance) {
     socket.on("error", (err) => {
       app.log.error({ sessionKey, connId, err: err.message }, "relay/connect: socket error");
     });
-  });
-
-  // GET /relay/client.mjs — Serve the bundled relay client script
-  app.get("/relay/client.mjs", async (_request, reply) => {
-    return reply
-      .header("Content-Type", "application/javascript; charset=utf-8")
-      .header("Cache-Control", "no-cache")
-      .send(relayClientBundle);
   });
 
   // Cleanup on server shutdown

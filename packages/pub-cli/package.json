@@ -34,7 +34,6 @@
   },
   "homepage": "https://venthq.dev",
   "devDependencies": {
-    "@vent/relay-client": "workspace:*",
     "@vent/shared": "workspace:*",
     "esbuild": "catalog:",
     "jose": "^6.2.15"
