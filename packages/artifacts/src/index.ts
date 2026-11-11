@@ -1,4 +1,5 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac } from "node:crypto";
+import { safeEqual } from "@vent/shared";
 import { S3Storage } from "./s3.js";
 import type { StorageConfig } from "./s3.js";
 
@@ -63,12 +64,7 @@ export function verifyArtifactToken(
   const [encodedPayload, signature] = token.split(".");
   if (!encodedPayload || !signature) return null;
 
-  const expectedSignature = signToken(encodedPayload, secret);
-  const provided = Buffer.from(signature);
-  const expected = Buffer.from(expectedSignature);
-  if (provided.length !== expected.length || !timingSafeEqual(provided, expected)) {
-    return null;
-  }
+  if (!safeEqual(signature, signToken(encodedPayload, secret))) return null;
 
   try {
     const payload = JSON.parse(

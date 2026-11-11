@@ -2,13 +2,7 @@ import type { FastifyInstance } from "fastify";
 import { eq, and } from "drizzle-orm";
 import IORedis from "ioredis";
 import { schema } from "@vent/db";
-import { timingSafeEqual } from "node:crypto";
-import { RUNNER_CALLBACK_HEADER, requireEnv } from "@vent/shared";
-
-function timingSafeCompare(a: string, b: string): boolean {
-  if (a.length !== b.length) return false;
-  return timingSafeEqual(Buffer.from(a), Buffer.from(b));
-}
+import { RUNNER_CALLBACK_HEADER, requireEnv, safeEqual } from "@vent/shared";
 import type WebSocket from "ws";
 
 // ---------------------------------------------------------------------------
@@ -129,6 +123,8 @@ function isValidUUID(value: string): boolean {
 // ---------------------------------------------------------------------------
 
 async function relayRoutes(app: FastifyInstance) {
+  const callbackSecret = requireEnv("RUNNER_CALLBACK_SECRET");
+
   // GET /relay/control — Control + data channel (multiplexed) from the relay
   // client of an agent session (`vent agent start`); its runs share the tunnel.
   app.get("/relay/control", { websocket: true }, async (socket, req) => {
@@ -299,9 +295,7 @@ async function relayRoutes(app: FastifyInstance) {
     const connId = query.conn_id;
 
     const secret = (req.headers as Record<string, string>)[RUNNER_CALLBACK_HEADER];
-    const expectedSecret = process.env["RUNNER_CALLBACK_SECRET"];
-
-    if (!expectedSecret || !secret || !timingSafeCompare(secret, expectedSecret)) {
+    if (!secret || !safeEqual(secret, callbackSecret)) {
       socket.close(4401, "Unauthorized");
       return;
     }

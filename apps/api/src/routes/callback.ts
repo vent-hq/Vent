@@ -7,6 +7,7 @@ import {
   CallProgressCallbackSchema,
   RUNNER_CALLBACK_SIGNATURE_HEADER,
   RUNNER_CALLBACK_TIMESTAMP_HEADER,
+  requireEnv,
   verifyCallback,
 } from "@vent/shared";
 import { broadcast } from "../lib/run-subscribers.js";
@@ -18,13 +19,7 @@ declare module "fastify" {
   }
 }
 
-function authorize(request: FastifyRequest, reply: FastifyReply): boolean {
-  const expectedSecret = process.env["RUNNER_CALLBACK_SECRET"];
-  if (!expectedSecret) {
-    reply.status(500).send({ error: "Callback secret not configured" });
-    return false;
-  }
-
+function authorize(request: FastifyRequest, reply: FastifyReply, secret: string): boolean {
   const sig = request.headers[RUNNER_CALLBACK_SIGNATURE_HEADER];
   const ts = request.headers[RUNNER_CALLBACK_TIMESTAMP_HEADER];
   const sigStr = Array.isArray(sig) ? sig[0] : sig;
@@ -34,7 +29,7 @@ function authorize(request: FastifyRequest, reply: FastifyReply): boolean {
   // The route's own path, not request.url: query strings and encodings can't
   // change what was signed. Internal routes have no parameters.
   const path = request.routeOptions.url ?? "";
-  const result = verifyCallback(request.method, path, rawBody, expectedSecret, sigStr, tsStr);
+  const result = verifyCallback(request.method, path, rawBody, secret, sigStr, tsStr);
   if (!result.ok) {
     request.log.warn({ reason: result.reason, route: request.url }, "callback auth rejected");
     reply.status(401).send({ error: "Unauthorized" });
@@ -44,13 +39,15 @@ function authorize(request: FastifyRequest, reply: FastifyReply): boolean {
 }
 
 export async function callbackRoutes(app: FastifyInstance) {
+  const secret = requireEnv("RUNNER_CALLBACK_SECRET");
+
   // Internal callback routes can carry full conversation transcripts which
   // routinely exceed the global 1MB default.
   const INTERNAL_BODY_LIMIT = 10 * 1024 * 1024;
 
   // --- Run lifecycle event callback (from runner or worker) ---
   app.post("/internal/run-event", { bodyLimit: INTERNAL_BODY_LIMIT }, async (request, reply) => {
-    if (!authorize(request, reply)) return;
+    if (!authorize(request, reply, secret)) return;
 
     const parsed = RunEventCallbackSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -82,7 +79,7 @@ export async function callbackRoutes(app: FastifyInstance) {
 
   // --- Per-call progress callback (from runner) ---
   app.post("/internal/call-progress", { bodyLimit: INTERNAL_BODY_LIMIT }, async (request, reply) => {
-    if (!authorize(request, reply)) return;
+    if (!authorize(request, reply, secret)) return;
 
     const parsed = CallProgressCallbackSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -127,7 +124,7 @@ export async function callbackRoutes(app: FastifyInstance) {
 
   // --- Worker failure callback (run failed before a result existed) ---
   app.post("/internal/run-failed", async (request, reply) => {
-    if (!authorize(request, reply)) return;
+    if (!authorize(request, reply, secret)) return;
 
     const parsed = RunFailedCallbackSchema.safeParse(request.body);
     if (!parsed.success) {
@@ -147,7 +144,7 @@ export async function callbackRoutes(app: FastifyInstance) {
 
   // --- Runner results callback ---
   app.post("/internal/runner-callback", { bodyLimit: INTERNAL_BODY_LIMIT }, async (request, reply) => {
-    if (!authorize(request, reply)) return;
+    if (!authorize(request, reply, secret)) return;
 
     const parsed = RunnerCallbackV2Schema.safeParse(request.body);
     if (!parsed.success) {
