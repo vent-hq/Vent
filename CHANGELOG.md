@@ -4,9 +4,9 @@ All notable product-level changes to Vent are documented in this file.
 
 Detailed package histories live in:
 
-- [vent-hq](packages/cli/CHANGELOG.md)
-- [@vent-hq/livekit](packages/livekit/CHANGELOG.md)
-- [vent-livekit](packages/livekit-python/CHANGELOG.md)
+- [vent-hq](packages/pub-cli/CHANGELOG.md)
+- [@vent-hq/livekit](packages/pub-livekit-node/CHANGELOG.md)
+- [vent-livekit](packages/pub-livekit-python/CHANGELOG.md)
 
 ## 2026-04-13
 

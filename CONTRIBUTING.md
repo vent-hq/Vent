@@ -21,12 +21,12 @@ apps/
 packages/
   adapters/               Voice platform adapters (Vapi, Retell, LiveKit, ElevenLabs, Bland, custom)
   artifacts/              S3/R2 artifact storage (recordings, audio)
-  cli/                    Published CLI (vent-hq on npm)
   db/                     Drizzle ORM schema + PostgreSQL migrations
-  livekit/                Published Node helper (@vent-hq/livekit on npm)
-  livekit-python/         Published Python helper (vent-livekit on PyPI)
   platform-connections/   Platform credential encryption (AES-256-GCM)
   relay-client/           WebSocket relay for local agent tunneling
+  pub-cli/                Published CLI (vent-hq on npm)
+  pub-livekit-node/       Published Node helper (@vent-hq/livekit on npm)
+  pub-livekit-python/     Published Python helper (vent-livekit on PyPI)
   runner/                 Call execution engine (orchestration, audio analysis)
   shared/                 Shared types, Zod schemas, constants, utilities
   voice/                  Voice processing (VAD, STT via Deepgram)
@@ -81,7 +81,7 @@ pnpm version-packages       # Apply pending changesets and update changelogs
 pnpm release:publish        # Publish all npm packages managed by Changesets
 ```
 
-Add a changeset whenever you change a published package (`vent-hq`, `@vent-hq/livekit`). The Python package (`vent-livekit`) is versioned independently — bump `packages/livekit-python/pyproject.toml` and `packages/livekit-python/CHANGELOG.md` in the same PR.
+Add a changeset whenever you change a published package (`vent-hq`, `@vent-hq/livekit`). The Python package (`vent-livekit`) is versioned independently — bump `packages/pub-livekit-python/pyproject.toml` and `packages/pub-livekit-python/CHANGELOG.md` in the same PR.
 
 ## Pull request expectations
 

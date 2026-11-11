@@ -16,4 +16,4 @@ await run("pnpm db:migrate");
 await run("pnpm --filter @vent/db seed:local");
 await run("docker compose -f compose.local.yaml --profile app up -d --build --wait");
 await run("pnpm --filter vent-hq build");
-console.log(`Local Vent stack ready. To call your deployed agent:\ndoppler run --project vent --config dev -- env VENT_API_URL=${local.API_URL} VENT_ACCESS_TOKEN= VENT_REFRESH_TOKEN=${local.VENT_REFRESH_TOKEN} node packages/cli/dist/index.mjs run -f <suite.json>\nSee local-scripts/README.md for platform configuration.`);
+console.log(`Local Vent stack ready. To call your deployed agent:\ndoppler run --project vent --config dev -- env VENT_API_URL=${local.API_URL} VENT_ACCESS_TOKEN= VENT_REFRESH_TOKEN=${local.VENT_REFRESH_TOKEN} node packages/pub-cli/dist/index.mjs run -f <suite.json>\nSee local-scripts/README.md for platform configuration.`);

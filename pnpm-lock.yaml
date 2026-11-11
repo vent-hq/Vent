@@ -325,21 +325,6 @@ importers:
         specifier: 'catalog:'
         version: 5.9.3
 
-  packages/cli:
-    devDependencies:
-      '@vent/relay-client':
-        specifier: workspace:*
-        version: link:../relay-client
-      '@vent/shared':
-        specifier: workspace:*
-        version: link:../shared
-      esbuild:
-        specifier: 'catalog:'
-        version: 0.24.2
-      jose:
-        specifier: ^6.2.15
-        version: 6.2.15
-
   packages/db:
     dependencies:
       drizzle-orm:
@@ -362,19 +347,6 @@ importers:
         specifier: 'catalog:'
         version: 5.9.3
 
-  packages/livekit:
-    dependencies:
-      '@livekit/agents':
-        specifier: ^1.0.0
-        version: 1.2.3(@livekit/rtc-node@0.13.24)(typescript@5.9.3)(zod@4.3.6)
-      '@livekit/rtc-node':
-        specifier: ^0.13.0
-        version: 0.13.24
-    devDependencies:
-      typescript:
-        specifier: 'catalog:'
-        version: 5.9.3
-
   packages/platform-connections:
     dependencies:
       '@vent/shared':
@@ -384,6 +356,34 @@ importers:
       tsx:
         specifier: 'catalog:'
         version: 4.21.0
+      typescript:
+        specifier: 'catalog:'
+        version: 5.9.3
+
+  packages/pub-cli:
+    devDependencies:
+      '@vent/relay-client':
+        specifier: workspace:*
+        version: link:../relay-client
+      '@vent/shared':
+        specifier: workspace:*
+        version: link:../shared
+      esbuild:
+        specifier: 'catalog:'
+        version: 0.24.2
+      jose:
+        specifier: ^6.2.15
+        version: 6.2.15
+
+  packages/pub-livekit-node:
+    dependencies:
+      '@livekit/agents':
+        specifier: ^1.0.0
+        version: 1.2.6(@livekit/rtc-node@0.13.25)(typescript@5.9.3)(zod@4.3.6)
+      '@livekit/rtc-node':
+        specifier: ^0.13.0
+        version: 0.13.25
+    devDependencies:
       typescript:
         specifier: 'catalog:'
         version: 5.9.3
@@ -1540,12 +1540,6 @@ packages:
     peerDependencies:
       '@livekit/agents': 1.2.6
       '@livekit/rtc-node': ^0.13.25
-
-  '@livekit/agents@1.2.3':
-    resolution: {integrity: sha512-8TfN0qqSbccA1O9afygv0G7qf//cd0bJhlIuehQV3c5SSxVeZQbL9M8xxGRPHxm8y2vNnm2+euCmoE/VYmBbiA==}
-    peerDependencies:
-      '@livekit/rtc-node': ^0.13.24
-      zod: ^3.25.76 || ^4.1.8
 
   '@livekit/agents@1.2.6':
     resolution: {integrity: sha512-xQ8rBBTvv2ULDe3f4XXakRso5ZxdCtElvSEMAQeqKXEiWZQjJ1WQHFldk5IoQ3isYxXhckSIerM7MKVVZ/q9eA==}
@@ -5642,50 +5636,6 @@ snapshots:
       - bufferutil
       - utf-8-validate
 
-  '@livekit/agents@1.2.3(@livekit/rtc-node@0.13.24)(typescript@5.9.3)(zod@4.3.6)':
-    dependencies:
-      '@bufbuild/protobuf': 1.10.1
-      '@ffmpeg-installer/ffmpeg': 1.1.0
-      '@livekit/mutex': 1.1.1
-      '@livekit/protocol': 1.45.1
-      '@livekit/rtc-node': 0.13.24
-      '@livekit/throws-transformer': 0.0.0-20260320165515(typescript@5.9.3)
-      '@livekit/typed-emitter': 3.0.0
-      '@opentelemetry/api': 1.9.1
-      '@opentelemetry/api-logs': 0.54.2
-      '@opentelemetry/core': 2.6.1(@opentelemetry/api@1.9.1)
-      '@opentelemetry/exporter-logs-otlp-proto': 0.54.2(@opentelemetry/api@1.9.1)
-      '@opentelemetry/exporter-trace-otlp-proto': 0.54.2(@opentelemetry/api@1.9.1)
-      '@opentelemetry/instrumentation-pino': 0.43.0(@opentelemetry/api@1.9.1)
-      '@opentelemetry/otlp-exporter-base': 0.208.0(@opentelemetry/api@1.9.1)
-      '@opentelemetry/resources': 1.30.1(@opentelemetry/api@1.9.1)
-      '@opentelemetry/sdk-logs': 0.54.2(@opentelemetry/api@1.9.1)
-      '@opentelemetry/sdk-trace-base': 1.30.1(@opentelemetry/api@1.9.1)
-      '@opentelemetry/sdk-trace-node': 1.30.1(@opentelemetry/api@1.9.1)
-      '@opentelemetry/semantic-conventions': 1.40.0
-      '@types/pidusage': 2.0.5
-      commander: 12.1.0
-      fluent-ffmpeg: 2.1.3
-      form-data: 4.0.5
-      heap-js: 2.7.1
-      json-schema: 0.4.0
-      livekit-server-sdk: 2.15.0
-      ofetch: 1.5.1
-      openai: 6.33.0(ws@8.19.0)(zod@4.3.6)
-      pidusage: 4.0.1
-      pino: 8.21.0
-      pino-pretty: 11.3.0
-      sharp: 0.34.5
-      uuid: 11.1.0
-      ws: 8.19.0
-      zod: 4.3.6
-      zod-to-json-schema: 3.25.2(zod@4.3.6)
-    transitivePeerDependencies:
-      - bufferutil
-      - supports-color
-      - typescript
-      - utf-8-validate
-
   '@livekit/agents@1.2.6(@livekit/rtc-node@0.13.25)(typescript@5.9.3)(zod@4.3.6)':
     dependencies:
       '@bufbuild/protobuf': 1.10.1
@@ -7864,11 +7814,6 @@ snapshots:
       global-agent: 3.0.0
       onnxruntime-common: 1.21.0
       tar: 7.5.22
-
-  openai@6.33.0(ws@8.19.0)(zod@4.3.6):
-    optionalDependencies:
-      ws: 8.19.0
-      zod: 4.3.6
 
   openai@6.33.0(ws@8.22.1)(zod@4.3.6):
     optionalDependencies:

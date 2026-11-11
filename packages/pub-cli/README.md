@@ -109,7 +109,7 @@ Platform credentials are encrypted at rest (AES-256-GCM) and never appear in cha
 - [Website](https://venthq.dev)
 - [Documentation](https://docs.vent.dev)
 - [Source on GitHub](https://github.com/vent-hq/vent)
-- [Changelog](https://github.com/vent-hq/vent/blob/main/packages/cli/CHANGELOG.md)
+- [Changelog](https://github.com/vent-hq/vent/blob/main/packages/pub-cli/CHANGELOG.md)
 - [@vent_hq on X](https://x.com/vent_hq)
 
 ## License

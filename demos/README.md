@@ -83,7 +83,7 @@ doppler run --project vent --config dev -- pnpm dev:docker
 doppler run --project vent --config dev -- env \
   VENT_API_URL=http://127.0.0.1:3001 \
   VENT_ACCESS_TOKEN= VENT_REFRESH_TOKEN=vent_010101010101010101010101010101010101010101010101 \
-  node packages/cli/dist/index.mjs run -f demos/suites/elevenlabs.json
+  node packages/pub-cli/dist/index.mjs run -f demos/suites/elevenlabs.json
 ```
 
 Select `bland.json`, `vapi.json`, `retell.json` or `livekit.json` for the other

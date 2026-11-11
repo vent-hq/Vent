@@ -35,7 +35,7 @@ pnpm deploy:all                 # Deploy API, then worker
 pnpm changeset add                       # Create a changeset for npm package releases
 pnpm version-packages                    # Apply pending changesets and update changelogs
 pnpm release:publish                     # Publish all npm packages managed by Changesets
-python -m build packages/livekit-python  # Build the Python package locally
+python -m build packages/pub-livekit-python  # Build the Python package locally
 ```
 
 ### CLI (published as `vent-hq`)
@@ -64,12 +64,12 @@ apps/
 packages/
 ├── adapters/               # Voice platform adapters
 ├── artifacts/              # S3-compatible artifact storage (recordings, audio)
-├── cli/                    # Published CLI (vent-hq on npm)
 ├── db/                     # Drizzle ORM schema + PostgreSQL migrations
-├── livekit/                # Published Node helper (@vent-hq/livekit on npm)
-├── livekit-python/         # Published Python helper (vent-livekit on PyPI)
 ├── platform-connections/   # Platform credential encryption (AES-256-GCM)
 ├── relay-client/           # WebSocket relay for local agent tunneling
+├── pub-cli/                # Published CLI (vent-hq on npm)
+├── pub-livekit-node/       # Published Node helper (@vent-hq/livekit on npm)
+├── pub-livekit-python/     # Published Python helper (vent-livekit on PyPI)
 ├── runner/                 # Call execution engine (orchestration, audio analysis)
 ├── shared/                 # Shared types, Zod schemas, constants, utilities
 └── voice/                  # Voice processing (VAD, STT via Deepgram)
@@ -88,15 +88,15 @@ Each `vent run` executes a single call. Run N calls in parallel via separate she
 ## Published Packages
 
 - Only three packages publish to npm/PyPI; everything else in `apps/*` and `packages/*` is internal/private.
-- `packages/cli` -> `vent-hq` (npm, Changesets)
-- `packages/livekit` -> `@vent-hq/livekit` (npm, Changesets)
-- `packages/livekit-python` -> `vent-livekit` (PyPI, independent versioning)
-- `packages/cli` and `packages/livekit` rebuild ignored `dist/` in `prepack` before npm publish.
+- `packages/pub-cli` -> `vent-hq` (npm, Changesets)
+- `packages/pub-livekit-node` -> `@vent-hq/livekit` (npm, Changesets)
+- `packages/pub-livekit-python` -> `vent-livekit` (PyPI, independent versioning)
+- `packages/pub-cli` and `packages/pub-livekit-node` rebuild ignored `dist/` in `prepack` before npm publish.
 
 ## Release Triggers
 
 - npm: add a `.changeset`, merge to `main`, then merge the auto-generated `chore: version packages` PR from `.github/workflows/release.yml`.
-- Python: bump `packages/livekit-python/pyproject.toml` and `packages/livekit-python/CHANGELOG.md`, then merge to `main`; `.github/workflows/release-python.yml` publishes if `PYPI_API_TOKEN` is set.
+- Python: bump `packages/pub-livekit-python/pyproject.toml` and `packages/pub-livekit-python/CHANGELOG.md`, then merge to `main`; `.github/workflows/release-python.yml` publishes if `PYPI_API_TOKEN` is set.
 
 ## Environment Variables
 - `DATABASE_URL` — PostgreSQL connection string

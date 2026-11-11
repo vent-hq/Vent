@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - "packages/livekit-python/**"
+      - "packages/pub-livekit-python/**"
       - ".github/workflows/release-python.yml"
 
 concurrency: ${{ github.workflow }}-${{ github.ref }}
@@ -32,16 +32,16 @@ jobs:
           import subprocess
           from pathlib import Path
 
-          pyproject_path = Path("packages/livekit-python/pyproject.toml")
+          pyproject_path = Path("packages/pub-livekit-python/pyproject.toml")
           current_text = pyproject_path.read_text(encoding="utf8")
           current_match = re.search(r'^version = "([^"]+)"$', current_text, re.MULTILINE)
           if not current_match:
-            raise SystemExit("Could not parse current version from packages/livekit-python/pyproject.toml")
+            raise SystemExit("Could not parse current version from packages/pub-livekit-python/pyproject.toml")
 
           previous_text = ""
           try:
             previous_text = subprocess.check_output(
-              ["git", "show", "HEAD^:packages/livekit-python/pyproject.toml"],
+              ["git", "show", "HEAD^:packages/pub-livekit-python/pyproject.toml"],
               text=True,
               stderr=subprocess.DEVNULL,
             )
@@ -66,8 +66,8 @@ jobs:
       - name: Ensure Python changelog was updated
         if: steps.version.outputs.changed == 'true'
         run: |
-          if git rev-parse --verify HEAD^ >/dev/null 2>&1 && git diff --quiet HEAD^ HEAD -- packages/livekit-python/CHANGELOG.md; then
-            echo "packages/livekit-python/CHANGELOG.md must be updated when packages/livekit-python/pyproject.toml changes." >&2
+          if git rev-parse --verify HEAD^ >/dev/null 2>&1 && git diff --quiet HEAD^ HEAD -- packages/pub-livekit-python/CHANGELOG.md; then
+            echo "packages/pub-livekit-python/CHANGELOG.md must be updated when packages/pub-livekit-python/pyproject.toml changes." >&2
             exit 1
           fi
 
@@ -75,12 +75,12 @@ jobs:
         if: steps.version.outputs.changed == 'true'
         run: |
           python -m pip install --upgrade pip build
-          python -m build packages/livekit-python
+          python -m build packages/pub-livekit-python
 
       - name: Publish Python package
         if: steps.version.outputs.changed == 'true' && secrets.PYPI_API_TOKEN != ''
         uses: pypa/gh-action-pypi-publish@release/v1
         with:
           password: ${{ secrets.PYPI_API_TOKEN }}
-          packages-dir: packages/livekit-python/dist/
+          packages-dir: packages/pub-livekit-python/dist/
           skip-existing: true

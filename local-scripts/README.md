@@ -90,7 +90,7 @@ Run from the repository root, replacing `path/to/suite.json` with your file:
 doppler run --project vent --config dev -- env \
   VENT_API_URL=http://127.0.0.1:3001 \
   VENT_ACCESS_TOKEN= VENT_REFRESH_TOKEN=vent_010101010101010101010101010101010101010101010101 \
-  node packages/cli/dist/index.mjs run -f path/to/suite.json
+  node packages/pub-cli/dist/index.mjs run -f path/to/suite.json
 ```
 
 Use the Doppler config containing your target platform's credentials for this
