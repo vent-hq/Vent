@@ -10,7 +10,7 @@ npm install @vent-hq/livekit
 
 ## Usage
 
-`instrumentLiveKitAgent()` subscribes to LiveKit `AgentSession` events and publishes them on `vent:*` DataChannel topics that the Vent LiveKit adapter already understands.
+`instrumentLiveKitAgent()` subscribes to LiveKit `AgentSession` events and publishes them on `vent:*` DataChannel topics that the Vent LiveKit adapter reads. Call it after `ctx.connect()` and `session.start()`.
 
 ```ts
 import { instrumentLiveKitAgent } from "@vent-hq/livekit";
@@ -20,39 +20,23 @@ const vent = instrumentLiveKitAgent({ ctx, session });
 vent.dispose();
 ```
 
-You can pass `room` or `participant` directly instead of `ctx`.
-
 ## Events forwarded
 
 | LiveKit event            | Vent topic                      |
 | ------------------------ | ------------------------------- |
 | `metrics_collected`      | `vent:metrics`                  |
-| `function_tools_executed`| `vent:tool-calls` (one message per call), `vent:transfer` (agent handoffs) |
+| `function_tools_executed`| `vent:tool-calls` (one message per call) |
 | `conversation_item_added`| `vent:conversation-item`        |
-| `user_input_transcribed` | `vent:user-input-transcribed`   |
-| `session_usage_updated`  | `vent:session-usage`            |
-| `close`                  | `vent:session-report` (auto), `vent:warning` (on error) |
+| `close`                  | `vent:call-metadata` (`ended_reason`), `vent:warning` (on error) |
 
 ## Bridge methods
 
-The returned bridge publishes data that the outside room observer cannot already see:
+The returned bridge publishes what only the agent knows:
 
 ```ts
-await vent.publishCallMetadata({ provider_call_id: "pstn-call-123" });
-await vent.publishDebugUrl("insight", "https://...");
+await vent.publishCallMetadata({ cost: { total_usd: 0.12, breakdown: { llm: 0.07, tts: 0.05 } } });
+await vent.publishDebugUrl("trace", "https://...");
 await vent.publishWarning("rate limited", { retry_after_ms: 500 });
-await vent.publishSessionUsage({ llm_tokens: 1200 });
-```
-
-You can also pass `sessionMetadata` and `debugUrls` to `instrumentLiveKitAgent` to publish them on startup:
-
-```ts
-const vent = instrumentLiveKitAgent({
-  ctx,
-  session,
-  sessionMetadata: { provider_call_id: "pstn-call-123" },
-  debugUrls: { insight: "https://..." },
-});
 ```
 
 ## Notes

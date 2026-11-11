@@ -357,13 +357,6 @@ importers:
         version: 6.2.15
 
   packages/pub-livekit-node:
-    dependencies:
-      '@livekit/agents':
-        specifier: ^1.0.0
-        version: 1.2.6(@livekit/rtc-node@0.13.25)(typescript@5.9.3)(zod@4.3.6)
-      '@livekit/rtc-node':
-        specifier: ^0.13.0
-        version: 0.13.25
     devDependencies:
       typescript:
         specifier: 'catalog:'

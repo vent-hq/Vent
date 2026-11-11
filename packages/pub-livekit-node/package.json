@@ -38,10 +38,6 @@
     "directory": "packages/pub-livekit-node"
   },
   "homepage": "https://venthq.dev",
-  "peerDependencies": {
-    "@livekit/agents": "^1.0.0",
-    "@livekit/rtc-node": "^0.13.0"
-  },
   "devDependencies": {
     "typescript": "catalog:"
   }
