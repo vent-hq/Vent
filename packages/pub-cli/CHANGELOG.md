@@ -1,5 +1,23 @@
 # vent-hq
 
+## 0.15.0
+
+### Minor Changes
+
+- a16762c: Requires Node.js 22 or newer: `vent-hq agent start` uses the built-in `WebSocket`, which Node 20 only provides behind a flag.
+
+  `--help` / `-h` now works for every command: `vent-hq <command> --help` prints that command's usage instead of running it (previously `init --help` ran init, `logout --help` logged out, and `login --help` / `agent start --help` failed with "unknown option"). Every command reports missing credentials with the same message. A Bland config with only `persona_id` is now rejected before submitting (it needs `bland_pathway_id` or `task`), matching what the API already required. Saved run history in `.vent/runs/` no longer stores `calls_passed` / `calls_failed`. Skill file fixes: results have no `emotion` field, and `max_turns` is optional (defaults to 6).
+
+- 2d246d9: `vent run` has one result format: the `--verbose` (`-v`) flag is removed. Tool results are no longer shortened, and `component_latency` keeps only the call's mean STT/LLM/TTS times. `call_metadata.variables` is removed (it repeated tool call arguments and results, plus platform bookkeeping). Removed with the verbose view: the `debug` blocks, `caller_prompt`, p90/p95/p99 and the other extra latency figures, `usage`, `recording_variants`, and the run's timestamps. The full raw result stays stored with the run.
+- 2d246d9: Call results are leaner and show more of what matters. `latency` is mean, p50, max and first response time. `signal_quality` shows `mean_snr_db` and `max_clipping_ratio`. `tool_calls.names` and the run-level `aggregate` are removed: they repeated other fields. Zero-cost categories are left out of the cost breakdown. Cost is one `call_metadata.cost` object: the provider's `total_usd`, plus `breakdown` in the provider's own categories when it splits the cost; `cost_usd` and `cost_breakdown` are gone. Bland cost is now Bland's reported price instead of an estimate. `provider_debug_urls` is in the default output and links to the call in the Vapi, ElevenLabs or LiveKit Cloud dashboard. In `@vent-hq/livekit`, call metadata takes `cost: { total_usd, breakdown? }` instead of `cost_usd` and `cost_breakdown`.
+
+### Patch Changes
+
+- 2d246d9: Call results now include `platform_transcript`: the agent platform's own record of the call next to Vent's `transcript`. Its agent turns are the text the agent's LLM wrote, and its caller turns are what the agent's speech-to-text heard, so a number the voice read wrong or a word the agent misheard shows up by comparing the two. The `--verbose` per-turn `platform_transcript` field is removed. WebSocket agents can send `vent:transcript` with `role: "agent"`; `turn_index` is no longer used.
+- a16762c: Requires Node 20.12 or newer. `.env` and `.env.local` are now read with Node's built-in parser.
+- a16762c: The agent skill files say to wrap Vent commands with your secrets manager (e.g. `doppler run -- npx vent-hq run …`). Missing-credential errors now name every place the CLI looks.
+- 2d246d9: Tool calls are now on the agent turn that ran them: each agent turn in `transcript` has `tool_calls` (name, arguments, result, `successful`, `latency_ms`), so what the agent said sits next to what its tools returned. A tool the agent ran but never replied after is on the call's last turn. The call-level `tool_calls` summary (counts, mean latency, `observed[]`, `turn_index`) is gone; a call-level `tool_calls` list appears only for a failed call whose transcript was lost. Tool calls were also matched to the wrong turn before (the agent's previous turn), which is fixed.
+
 ## 0.14.0
 
 ### Minor Changes

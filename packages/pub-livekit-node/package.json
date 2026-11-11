@@ -1,6 +1,6 @@
 {
   "name": "@vent-hq/livekit",
-  "version": "0.4.0",
+  "version": "0.5.0",
   "type": "module",
   "description": "Vent helper for forwarding LiveKit Agents SDK observability",
   "main": "./dist/index.js",
