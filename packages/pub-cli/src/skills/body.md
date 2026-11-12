@@ -81,8 +81,7 @@ Platform-direct suite:
 ```json
 {
   "connection": {
-    "adapter": "vapi",
-    "platform": { "provider": "vapi" }
+    "adapter": "vapi"
   },
   "calls": {
     "happy-path": {
@@ -131,6 +130,8 @@ Auto-resolved env vars and JSON fields:
 Use existing provider config when possible: Vapi assistant, Retell agent, ElevenLabs agent, Bland pathway, or LiveKit agent. Bland uniquely supports inline config — `platform` needs `bland_pathway_id` or an inline `task`, optionally with `persona_id` and voice, model, and turn-handling overrides (see Bland's API docs for the full field list).
 
 ### Concurrency
+
+If the repo has voice agents on more than one platform (e.g. one on Retell and one on Vapi), test one platform at a time: wait for one platform's batch of calls to return before starting the next platform's. Parallel calls are fine, but only to one platform at once.
 
 When you fan out multiple Vent calls in parallel against the same provider (for example, running several named calls from one suite at once{{PARALLEL_EXAMPLE}}), respect the provider's per-account concurrency limit. Exceeding it makes calls queue or fail at the provider — Vent does not enforce these caps for you.
 
