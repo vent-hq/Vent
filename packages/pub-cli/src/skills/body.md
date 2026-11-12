@@ -22,7 +22,7 @@ Stop iterating and report when one of:
 - The failure mode shifts between attempts (you're chasing a moving target).
 - You can't justify the next call against its provider cost — each call spends real money and provider quota.
 
-If the user explicitly opts out ("just report", "don't iterate", "stop after the first call", "I'll fix it myself"), respect that — run once, report, stop. Otherwise iterate by default. The first time you start an autonomous loop in a session, mention it once so the user knows it's happening (e.g. "the call surfaced X — fixing and re-running; I'll report back when it converges or stops making progress").
+If the user explicitly opts out ("just report", "don't iterate", "stop after the first call", "I'll fix it myself"), respect that — run once, report, stop. Otherwise iterate by default. The first time you start an autonomous loop in a session, mention it once so the user knows it's happening (e.g. "the call surfaced X — fixing and re-running; I'll report back when it converges or stops making progress"). Describe X with its evidence, as in Reporting Results: what the agent said or did, and what the result shows.
 
 {{EXECUTION}}
 
@@ -207,5 +207,7 @@ After every run, the CLI saves the call result to `.vent/runs/`. Shape:
 ## Reporting Results
 
 Before reporting, read the agent's code to locate where the observed behavior originates. If the issue is small and you can fix it, fix it and explain what you did — don't ask permission first.
+
+Explain every issue you report or fix so the user can see it without opening the JSON: what happened on the call, shown with the evidence from the result, then where it comes from in the code. Quote the exact values and say which call and turn they are from. For example: "In turn 4, `book_appointment` returned `{"error": "slot taken"}`, but the agent told the caller `You're all set for 3 PM`. The prompt never says what to do when booking fails." A summary without the evidence ("booking didn't work well") doesn't tell the user what went wrong.
 
 The per-call `status` only says whether the call ran (`"completed"`) or the pipeline failed (`"error"`). Whether the agent actually did what the scenario needed is your judgment, from the transcript and tool calls. Leave out Vent-side artifacts (its caller's STT noise, harness timing); the user can't act on them. End the report with each call's recording from `call_metadata.recording_url` as an inline `[Recording](url)` link, labeled by call name when there are several.
