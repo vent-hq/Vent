@@ -1,5 +1,12 @@
 # vent-hq
 
+## 0.15.2
+
+### Patch Changes
+
+- 4f1e161: `run` prints the run ID and its stop command on stderr as soon as the run is created, and on Ctrl-C reports whether the stop worked.
+- e0ebd2f: Skill docs: after `init`, the agent tells the user their access token is saved in `~/.vent/credentials`.
+
 ## 0.15.1
 
 ### Patch Changes
