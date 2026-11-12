@@ -3,7 +3,7 @@ import { AccessCredentialsSchema } from "@vent/shared";
 import { detectGitHubToken } from "../lib/github.js";
 import { deviceAuthFlow } from "../lib/auth.js";
 import { printError, printInfo, printSuccess } from "../lib/output.js";
-import { installSkillsAndScaffold } from "../lib/setup.js";
+import { installSkills } from "../lib/setup.js";
 
 export async function initCommand(): Promise<number> {
   const cwd = process.cwd();
@@ -59,8 +59,8 @@ export async function initCommand(): Promise<number> {
     }
   }
 
-  // 2. Detect editors, install skills, scaffold suite
-  await installSkillsAndScaffold(cwd);
+  // 2. Install skill files
+  await installSkills(cwd);
 
   printSuccess(
     "Ready — your coding agent can now run calls with `npx vent-hq run`.",

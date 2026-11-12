@@ -32,10 +32,10 @@ Under the hood, a Claude Haiku 4.5 caller LLM drives the conversation, speaking 
 ### Install
 
 ```bash
-npx vent-hq@latest init                             # Agent auto-setup: auth, skills, config
+npx vent-hq@latest init                             # Agent auto-setup: auth, skills
 ```
 
-The `init` command lets the agent automatically log in via GitHub, generate an access token, install skill files, and scaffold a starter config at `.vent/suite.json`. For access without GitHub, run `login` and then `init`.
+The `init` command lets the agent automatically log in via GitHub, generate an access token, and install skill files. The coding agent then writes the suite for your agent's platform in `.vent/`. For access without GitHub, run `login` and then `init`.
 
 ### Quick Start
 

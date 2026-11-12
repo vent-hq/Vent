@@ -1,27 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { DEFAULT_AGENT_PORT } from "@vent/shared";
 import { printSuccess } from "./output.js";
 import { claudeCodeSkill, codexSkill, cursorSkill, windsurfSkill } from "../skills/index.js";
-
-export const SUITE_SCAFFOLD = JSON.stringify(
-  {
-    connection: {
-      adapter: "websocket",
-      start_command: "TODO: command to start your agent (e.g. npm run start)",
-      agent_port: DEFAULT_AGENT_PORT,
-    },
-    calls: {
-      "happy-path": {
-        caller_prompt:
-          "TODO: describe a realistic caller persona and goal based on your agent's domain",
-        max_turns: 8,
-      },
-    },
-  },
-  null,
-  2,
-);
 
 async function installClaudeCode(cwd: string): Promise<void> {
   const dir = path.join(cwd, ".claude", "skills", "vent");
@@ -78,28 +58,10 @@ async function installCodex(cwd: string): Promise<void> {
   printSuccess("Codex: AGENTS.md", { force: true });
 }
 
-/**
- * Install skill files for every supported editor, then scaffold .vent/suite.json if missing.
- */
-export async function installSkillsAndScaffold(cwd: string): Promise<void> {
-  // Always install skill files for all supported editors
+/** Install skill files for every supported editor. */
+export async function installSkills(cwd: string): Promise<void> {
   await installClaudeCode(cwd);
   await installCursor(cwd);
   await installCodex(cwd);
   await installWindsurf(cwd);
-
-  // Scaffold .vent/suite.json if missing
-  const suitePath = path.join(cwd, ".vent", "suite.json");
-  let suiteExists = false;
-  try {
-    await fs.access(suitePath);
-    suiteExists = true;
-  } catch {
-    // doesn't exist
-  }
-
-  if (!suiteExists) {
-    await fs.mkdir(path.dirname(suitePath), { recursive: true });
-    await fs.writeFile(suitePath, SUITE_SCAFFOLD + "\n");
-  }
 }

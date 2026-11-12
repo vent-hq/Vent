@@ -25,9 +25,8 @@ npx vent-hq@latest init
 `init` will:
 - Authenticate via GitHub (if you have `gh` installed) or open a browser for device-code auth
 - Install skill files for Claude Code (`.claude/skills/vent/SKILL.md`), Cursor (`.cursor/rules/vent.mdc`), Codex (`AGENTS.md`), and Windsurf (`.windsurf/skills/vent/SKILL.md`)
-- Scaffold a starter suite at `.vent/suite.json`
 
-After `init`, your coding agent reads the skill file and takes over from there.
+After `init`, your coding agent reads the skill file, writes a suite for your agent's platform in `.vent/`, and takes over from there.
 
 ## Example suite
 
@@ -58,7 +57,7 @@ Swap `adapter` for `retell`, `livekit`, `elevenlabs`, `bland`, or `websocket` to
 
 | Command                             | Purpose                                                    |
 |-------------------------------------|------------------------------------------------------------|
-| `vent-hq init`                      | One-time setup: auth, skill files, starter suite           |
+| `vent-hq init`                      | One-time setup: auth, skill files                          |
 | `vent-hq run -f <suite.json>`       | Run a call (or all calls) from a suite, stream results     |
 | `vent-hq run -f <s> --call <name>`  | Run a single named call                                    |
 | `vent-hq stop <run-id>`             | Cancel a queued or running call                            |
