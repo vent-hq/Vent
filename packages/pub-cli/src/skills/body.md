@@ -50,6 +50,8 @@ npx vent-hq agent start -f .vent/suite.X.json     # Start a shared local relay s
 npx vent-hq agent stop <session-id>               # Stop a shared local relay session
 ```
 
+Run `npx vent-hq run` on its own: a shell command that runs it contains only `npx vent-hq run` calls. Chaining several with `&` and `wait` to run calls in parallel is fine. Anything else (`cat`, `jq`, `grep`, starting or restarting an agent, waiting) goes in a separate command before or after, never in the same one and never piped into or out of Vent. The one exception is a secrets wrapper, like `doppler run -- npx vent-hq run …`.
+
 If `~/.vent/credentials` is missing and neither `VENT_REFRESH_TOKEN` nor `VENT_ACCESS_TOKEN` is set, run `npx vent-hq init`. After `init` signs the user in, tell them in your first reply that their Vent access token is saved in `~/.vent/credentials` on their machine. For an existing account, run `npx vent-hq login` or set `VENT_REFRESH_TOKEN` to an API key. Access JWTs renew automatically; `VENT_ACCESS_TOKEN` alone is short-lived.
 
 ## Suite Config

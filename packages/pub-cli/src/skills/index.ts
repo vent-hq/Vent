@@ -29,7 +29,7 @@ function assemble(parts: EditorParts): string {
 export const claudeCodeSkill = assemble({
   frontmatter: ["name: vent", `description: ${DESCRIPTION}`, "allowed-tools: Bash(npx vent-hq *)"],
   execution: claudeCodeExecution,
-  liveKitNote: " (See `Claude Code Execution` for how to compose the kill→start→wait→submit as a single foreground command.)",
+  liveKitNote: " (See `Claude Code Execution` for how to run the restart and wait as one foreground command before the run.)",
   parallelExample: " with `&` and `wait`",
 });
 
