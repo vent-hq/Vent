@@ -81,8 +81,7 @@ Platform-direct suite:
 ```json
 {
   "connection": {
-    "adapter": "vapi",
-    "platform": { "provider": "vapi" }
+    "adapter": "vapi"
   },
   "calls": {
     "happy-path": {
