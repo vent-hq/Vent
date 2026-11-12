@@ -11,7 +11,7 @@ import { loadDotenv } from "./lib/dotenv.js";
 const USAGE = `Usage: vent-hq <command> [options]
 
 Commands:
-  init         Set up Vent (auth + skill files + call scaffold)
+  init         Set up Vent (auth + skill files)
   agent        Manage a shared local agent session
   run          Run a call from a suite file
   stop         Cancel a queued or running call
@@ -26,8 +26,7 @@ Run 'npx vent-hq <command> --help' for command-specific help.`;
 const INIT_USAGE = `Usage: vent-hq init
 
 Authenticate (GitHub CLI token or browser sign-in), install the Vent skill
-files for Claude Code, Cursor, Codex and Windsurf, and scaffold
-.vent/suite.json if it does not exist.`;
+files for Claude Code, Cursor, Codex and Windsurf.`;
 
 const RUN_USAGE = `Usage: vent-hq run -f <suite.json> [options]
 

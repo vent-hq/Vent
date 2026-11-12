@@ -169,15 +169,6 @@ export function DeviceAuthContent({ code, isAuthenticated, signInUrl }: Props) {
                 <p className="text-xs text-muted-foreground/60">So your coding agent knows how to run tests</p>
               </div>
             </div>
-            <div className="flex items-start gap-3">
-              <div className="mt-0.5 flex-shrink-0 w-5 h-5 rounded-full bg-foreground/5 border border-foreground/10 flex items-center justify-center">
-                <div className="w-1.5 h-1.5 rounded-full bg-foreground/20" />
-              </div>
-              <div>
-                <p className="text-sm font-medium text-muted-foreground/60">Scaffolding test suite</p>
-                <p className="text-xs text-muted-foreground/40">.vent/suite.json with a starter scenario</p>
-              </div>
-            </div>
           </div>
 
           <p className="text-muted-foreground/40 mt-8 text-xs">
