@@ -1,5 +1,15 @@
 # vent-hq
 
+## 0.16.0
+
+### Minor Changes
+
+- eda3159: `init` no longer creates a placeholder `.vent/suite.json`. The coding agent writes `.vent/suite.<adapter>.json` for the agent's platform before its first call.
+
+### Patch Changes
+
+- 4b46276: Skill docs: two ways to run Vent (a one-off call after a major change, or a loop until the agent works). Cut instructions on how to test and report, and ask for the platform plan before 5+ concurrent calls.
+
 ## 0.15.2
 
 ### Patch Changes
