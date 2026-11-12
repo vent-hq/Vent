@@ -51,7 +51,7 @@ npx vent-hq agent start -f .vent/suite.X.json     # Start a shared local relay s
 npx vent-hq agent stop <session-id>               # Stop a shared local relay session
 ```
 
-If `~/.vent/credentials` is missing and neither `VENT_REFRESH_TOKEN` nor `VENT_ACCESS_TOKEN` is set, run `npx vent-hq init`. For an existing account, run `npx vent-hq login` or set `VENT_REFRESH_TOKEN` to an API key. Access JWTs renew automatically; `VENT_ACCESS_TOKEN` alone is short-lived.
+If `~/.vent/credentials` is missing and neither `VENT_REFRESH_TOKEN` nor `VENT_ACCESS_TOKEN` is set, run `npx vent-hq init`. After `init` signs the user in, tell them in your first reply that their Vent access token is saved in `~/.vent/credentials` on their machine. For an existing account, run `npx vent-hq login` or set `VENT_REFRESH_TOKEN` to an API key. Access JWTs renew automatically; `VENT_ACCESS_TOKEN` alone is short-lived.
 
 ## Suite Config
 
