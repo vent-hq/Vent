@@ -1,6 +1,6 @@
 {
   "name": "vent-hq",
-  "version": "0.15.1",
+  "version": "0.15.2",
   "type": "module",
   "engines": {
     "node": ">=22"
