@@ -1,4 +1,3 @@
-import Image from "next/image";
 import Link from "next/link";
 import { withAuth } from "@workos-inc/authkit-nextjs";
 import { InstallTabs } from "@/components/install-tabs";
@@ -49,7 +48,9 @@ export default async function LandingPage() {
       {/* Header */}
       <header className="relative z-10 px-6 lg:px-12 xl:px-16">
         <div className="flex items-center justify-between h-14">
-            <Image src="/logo.png" alt="Vent" width={32} height={32} className="rounded-lg" priority />
+            <span className="text-xl font-semibold tracking-tight" style={{ fontFamily: "var(--font-heading)" }}>
+              Vent
+            </span>
             <div className="flex items-center gap-4">
               <a
                 href={`https://github.com/${GITHUB_REPO}`}
