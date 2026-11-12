@@ -1,5 +1,12 @@
 # vent-hq
 
+## 0.15.1
+
+### Patch Changes
+
+- 83d880e: Skill docs: when a repo has voice agents on multiple platforms, test one platform at a time.
+- f207178: Skill docs: platform suites only need `connection.adapter`; `platform.provider` is filled in from it.
+
 ## 0.15.0
 
 ### Minor Changes
