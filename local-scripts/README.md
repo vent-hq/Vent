@@ -54,7 +54,7 @@ Copy a suite from `platform-demos/demo-suites/` and give the CLI that platform's
 | `vapi` | `VAPI_API_KEY`, `VAPI_ASSISTANT_ID` |
 
 For a LiveKit agent with named dispatch, add
-`"platform": { "provider": "livekit", "livekit_agent_name": "your-agent" }` under
+`"platform": { "livekit_agent_name": "your-agent" }` under
 `connection`.
 
 ## Logs and stop
