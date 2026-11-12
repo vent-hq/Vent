@@ -2,8 +2,9 @@ import * as fs from "node:fs/promises";
 import type { PlatformConfig } from "@vent/shared";
 import { apiFetch, ApiError } from "../lib/api.js";
 import { submitRun } from "../lib/submit-run.js";
+import { stopRun } from "../lib/stop-run.js";
 import { streamRunEvents } from "../lib/sse.js";
-import { printEvent, printError, printInfo, printRunOutput, printWarn } from "../lib/output.js";
+import { printEvent, printError, printInfo, printRunOutput, printStatus, printWarn } from "../lib/output.js";
 import { saveRunHistory } from "../lib/run-history.js";
 import { resolveRemotePlatformConfig } from "../lib/platform-config.js";
 import type { RunOutput } from "@vent/shared";
@@ -112,32 +113,22 @@ export async function runCommand(args: RunArgs): Promise<number> {
     printError("Server returned no run_id. Response: " + JSON.stringify(submitResult));
     return 2;
   }
-  printInfo(`Run ${run_id} created.`);
+  // Printed now rather than with the result, so an interrupted caller can still stop the run.
+  printStatus(`Run created: ${run_id}`);
+  printStatus(`Stop: npx vent-hq stop ${run_id}`);
 
   // 4. Stream results
-  printInfo(`Streaming results for run ${run_id}…`);
+  printInfo("Streaming results…");
   const abortController = new AbortController();
   let exitCode = 0;
   let runOutput: RunOutput | null = null;
 
-  // Fire-and-forget cancel POST when the user hits Ctrl+C / receives SIGTERM.
-  // Without this, aborting the SSE stream leaves the worker running the call
-  // to completion — the platform keeps billing for a call no one is listening
-  // to. Best-effort: 5s timeout, errors swallowed; if the stop POST fails the
-  // stuck-run cleanup eventually catches it (much later, after the call ends).
-  let stopRequested = false;
-  // Tracked so we can `await` the stop POST before process.exit. Without this,
-  // the SSE abort + immediate exit may kill the request before the TCP
-  // handshake completes, leaving the worker running and the platform billing.
-  let stopPromise: Promise<unknown> | null = null;
+  // Ctrl+C / SIGTERM also stops the run: closing the stream alone would leave
+  // the worker running the call, and the platform billing. Only the handler
+  // sets `stop` (the `as` keeps TypeScript from assuming it stays null).
+  let stop = null as ReturnType<typeof stopRun> | null;
   const onSignal = () => {
-    if (!stopRequested) {
-      stopRequested = true;
-      stopPromise = apiFetch(`/runs/${run_id}/stop`, {
-        method: "POST",
-        signal: AbortSignal.timeout(5_000),
-      }).catch(() => {});
-    }
+    stop ??= stopRun(run_id, AbortSignal.timeout(5_000));
     abortController.abort();
   };
   process.on("SIGINT", onSignal);
@@ -167,7 +158,7 @@ export async function runCommand(args: RunArgs): Promise<number> {
   }
 
   // 5. The stream was lost before the result arrived: read it from the run.
-  if (!runOutput && !stopRequested) {
+  if (!runOutput && !stop) {
     try {
       const res = await apiFetch(`/runs/${run_id}`);
       const stored = (await res.json()) as RunOutput;
@@ -187,16 +178,16 @@ export async function runCommand(args: RunArgs): Promise<number> {
     printRunOutput(runOutput);
     const savedPath = await saveRunHistory(runOutput);
     if (savedPath) printInfo(`Run saved to ${savedPath}`);
+  } else if (stop) {
+    exitCode = 1; // cancelled
   } else if (exitCode === 0) {
     exitCode = 2;
   }
 
-  // If a SIGINT/SIGTERM kicked off a stop POST, wait for it to finish
-  // (or its 5s timeout to fire) before exiting. Without this `await`,
-  // process.exit can race the in-flight TCP handshake and the stop is
-  // never sent — worker keeps running, platform keeps billing.
-  if (stopPromise) {
-    await stopPromise;
+  // 7. Report the stop. Awaiting it also keeps process.exit from cutting the
+  // request off before it reaches the API.
+  if (stop) {
+    printStatus((await stop).message);
   }
 
   // Force exit — the fetch TCP socket from the SSE stream keeps the event loop

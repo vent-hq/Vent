@@ -6,23 +6,28 @@ import type { SSEEvent } from "./sse.js";
 const isTTY = process.stdout.isTTY;
 
 /**
- * Synchronous write to stdout. On POSIX, process.stdout.write() to a pipe is
+ * Synchronous write to stdout or stderr. On POSIX, a stream write to a pipe is
  * ASYNC — if the process exits before the buffer drains, the data is lost and
- * the coding agent sees "undefined". writeFileSync to /dev/stdout bypasses
+ * the coding agent sees "undefined". writeFileSync to the fd bypasses
  * Node's stream buffering and writes synchronously (like shell `echo`).
  */
-function stdoutSync(data: string): void {
-  if (isTTY) {
-    process.stdout.write(data);
+function writeSync(fd: 1 | 2, data: string): void {
+  const stream = fd === 1 ? process.stdout : process.stderr;
+  if (stream.isTTY) {
+    stream.write(data);
   } else {
     try {
-      // Write directly to fd 1 — no path resolution, no new fd.
-      // This is the most reliable synchronous stdout write on POSIX.
-      writeFileSync(1, data);
+      // Write directly to the fd — no path resolution, no new fd.
+      // This is the most reliable synchronous write on POSIX.
+      writeFileSync(fd, data);
     } catch {
-      process.stdout.write(data);
+      stream.write(data);
     }
   }
+}
+
+function stdoutSync(data: string): void {
+  writeSync(1, data);
 }
 
 // ANSI helpers
@@ -106,6 +111,14 @@ export function printRunOutput(output: RunOutput): void {
 export function printError(message: string): void {
   const line = red(bold("error")) + ` ${message}\n`;
   stdoutSync(line);
+}
+
+/**
+ * Run lifecycle messages (run created, stop outcome). Always printed, on stderr,
+ * so coding agents see them while stdout stays the one result.
+ */
+export function printStatus(message: string): void {
+  writeSync(2, message + "\n");
 }
 
 export function printInfo(message: string, { force }: { force?: boolean } = {}): void {
