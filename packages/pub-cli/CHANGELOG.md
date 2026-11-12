@@ -1,5 +1,11 @@
 # vent-hq
 
+## 0.16.3
+
+### Patch Changes
+
+- d0d752e: Skill: share each call's Vent recording when that call finishes (before any rerun), and never a platform recording.
+
 ## 0.16.2
 
 ### Patch Changes
