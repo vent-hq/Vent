@@ -4,8 +4,25 @@
 
 Run Vent in one of two ways, depending on what the user wants:
 
-- **One-off call.** After a major change to the voice agent (a prompt rewrite, a tool or handler change, routing or transfer logic, provider or audio config), place a call to test it, review the result, and report back.
-- **Loop until it works.** When the user wants a fully working voice agent, for example one built from zero, run a loop (a Ralph loop): call, fix what the call shows, call again, until the agent does what it should. Stop and ask the user when you'd be guessing at the next fix, or the same fix has failed twice.
+- **One-off call.** After a major change to the voice agent (a prompt rewrite, a tool or handler change, routing or transfer logic, provider or audio config), place a call to test that change.
+- **Loop until it works.** When the user wants a fully working voice agent, for example one built from zero, keep calling and fixing (a Ralph loop) until it does everything it should.
+
+## Autonomous Iteration
+
+**Default: iterate.** Run a fix → Vent-call → fix → Vent-call loop whenever a call surfaces a fixable issue. Don't report a failure (or a degraded-quality success) back to the user before attempting to fix it — they want the agent working, not a diagnosis. After each call, if the result reveals a problem you can fix with a concrete plan, apply the fix and run again. Fixable issues include: tool schema or registry gaps, missing handlers, prompt phrasing, **STT vocabulary mismatches** (e.g. domain terms misheard — Deepgram `keyterms`, custom vocabulary, prompt-level term lists), **latency tunables** (endpointing thresholds, preemptive generation, model selection), and audio quality config. If you'd be guessing at the next attempt, stop and ask the user instead of trying.
+
+**"Mission success but with quality problems" still requires iteration.** If the call ran end-to-end but had noticeably bad latency, STT mishearing the agent's domain vocabulary, audio artifacts, or any other caller-experience degradation that has a concrete fix, the call is *not done* — apply the fix and re-run. Don't downgrade fixable problems to "observations" or "things worth flagging." The pipeline running cleanly is the floor, not the ceiling.
+
+**Never ask permission to iterate.** "Want me to apply this and re-run?" / "Should I fix it?" / "Let me know if you want me to..." — these are skill violations. If you have a concrete fix, apply it and run the next call. The user opts out by saying so explicitly; silence is not opt-out.
+
+Stop iterating and report when one of:
+
+- The next call confirms the fix worked AND no further fixable issues remain (success — done).
+- The same fix fails twice (your hypothesis is wrong; ask the user).
+- The failure mode shifts between attempts (you're chasing a moving target).
+- You can't justify the next call against its provider cost — each call spends real money and provider quota.
+
+If the user explicitly opts out ("just report", "don't iterate", "stop after the first call", "I'll fix it myself"), respect that — run once, report, stop. Otherwise iterate by default. The first time you start an autonomous loop in a session, mention it once so the user knows it's happening (e.g. "the call surfaced X — fixing and re-running; I'll report back when it converges or stops making progress").
 
 {{EXECUTION}}
 
@@ -186,5 +203,7 @@ After every run, the CLI saves the call result to `.vent/runs/`. Shape:
 `git_sha` ties each saved run to the code it ran against.
 
 ## Reporting Results
+
+Before reporting, read the agent's code to locate where the observed behavior originates. If the issue is small and you can fix it, fix it and explain what you did — don't ask permission first.
 
 The per-call `status` only says whether the call ran (`"completed"`) or the pipeline failed (`"error"`). Whether the agent actually did what the scenario needed is your judgment, from the transcript and tool calls. Leave out Vent-side artifacts (its caller's STT noise, harness timing); the user can't act on them. End the report with each call's recording from `call_metadata.recording_url` as an inline `[Recording](url)` link, labeled by call name when there are several.
