@@ -131,6 +131,8 @@ Use existing provider config when possible: Vapi assistant, Retell agent, Eleven
 
 ### Concurrency
 
+If the repo has voice agents on more than one platform (e.g. one on Retell and one on Vapi), test one platform at a time: wait for one platform's batch of calls to return before starting the next platform's. Parallel calls are fine, but only to one platform at once.
+
 When you fan out multiple Vent calls in parallel against the same provider (for example, running several named calls from one suite at once{{PARALLEL_EXAMPLE}}), respect the provider's per-account concurrency limit. Exceeding it makes calls queue or fail at the provider — Vent does not enforce these caps for you.
 
 Record the limit as `max_concurrency` in the suite's `platform` block so it's visible on future runs. Ask the user which plan they're on if sizing matters; otherwise use the conservative default in bold.
