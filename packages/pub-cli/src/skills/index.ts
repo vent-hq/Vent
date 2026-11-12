@@ -5,7 +5,7 @@ import codexExecution from "./codex.md";
 import windsurfExecution from "./windsurf.md";
 
 const DESCRIPTION =
-  "Place real calls against the user's voice agent to verify recent code changes worked end-to-end. Trigger on test requests or after any non-trivial voice-agent change.";
+  "Place real calls against the user's voice agent to verify code changes work end-to-end. Use on test requests, after a major voice-agent change, or to iterate until a voice agent works.";
 
 interface EditorParts {
   /** YAML frontmatter lines; omitted for Codex, whose skill is appended to AGENTS.md. */
