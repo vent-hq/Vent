@@ -3,7 +3,9 @@
 import { useState } from "react";
 import { Bot, Check, Copy } from "lucide-react";
 
-const AGENT_PROMPT = "Use npx vent-hq@latest init to set up Vent, then run voice agent tests with npx vent-hq run";
+const AGENT_PROMPT =
+  "Run `npx vent-hq@latest init` to set up Vent. It signs in with my GitHub CLI token (or opens a browser sign-in if there isn't one), saves a Vent access token, and installs Vent's skill files for you. " +
+  "You can make test calls to the voice agent using `npx vent-hq@latest run`.";
 const AGENT_DISPLAY = "Copy onboarding prompt for agent auto-setup";
 const TERMINAL_COMMAND = "npx vent-hq@latest init";
 
